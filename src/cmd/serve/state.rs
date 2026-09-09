@@ -325,18 +325,21 @@ mod tests {
     use super::*;
     use crate::cmd::drill::cache::Cache;
     use crate::cmd::drill::state::SessionDbs;
-    use crate::error::ErrorReport;
     use crate::error::Fallible;
     use crate::rng::TinyRng;
     use crate::types::performance::Jitter;
     use crate::types::performance::Scheduling;
 
+    /// A view on the user database at `path`, under a fixed collection id:
+    /// these tests are about session bookkeeping, not about scoping.
+    fn test_db(path: &Path) -> Fallible<crate::db::Database> {
+        Ok(crate::user_db::UserDatabase::open(path)?.collection(
+            crate::types::collection_id::CollectionId::new("test-collection")?,
+        ))
+    }
+
     fn session_started_at(at: &str, dir: &Path) -> Fallible<SharedSession> {
-        let db_path = dir.join("test.db");
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = crate::db::Database::new(db_path_str)?;
+        let db = test_db(&dir.join("test.db"))?;
         let started_at = Timestamp::try_from(at.to_string())?;
         let session_id = db.create_session(started_at)?;
         let mutable = MutableState::new(
@@ -376,11 +379,7 @@ mod tests {
         assert!(sessions.lock().is_empty());
 
         // The DB session row was closed with the eviction time.
-        let db_path = dir.path().join("test.db");
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = crate::db::Database::new(db_path_str)?;
+        let db = test_db(&dir.path().join("test.db"))?;
         let rows = db.get_all_sessions()?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, now);

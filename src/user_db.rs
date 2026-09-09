@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Nothing outside this module's own tests reaches `UserDatabase` yet: the
-// startup merge and the collection view that use it land in the next two
-// commits. `expect` rather than `allow`, so that clippy asks for this line
-// back once they do.
-#![expect(dead_code)]
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +21,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use rusqlite::config::DbConfig;
 
+use crate::db::Database;
 use crate::db::SCHEMA_VERSION;
 use crate::db::ensure_version_table;
 use crate::db::get_schema_version;
@@ -34,6 +29,7 @@ use crate::db::probe_schema_exists;
 use crate::db::set_schema_version;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 
 /// How long a connection waits for a lock held by another connection before
 /// giving up with SQLITE_BUSY. WAL removes most of the contention this was
@@ -50,6 +46,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// deadlocking. One connection behind one mutex has neither problem.
 pub struct UserDatabase {
     conn: Arc<Mutex<Connection>>,
+    /// Which file this is. Production code always already knows — it passed
+    /// the path in — so only tests read it back.
+    #[cfg_attr(not(test), allow(dead_code))]
     path: PathBuf,
 }
 
@@ -82,8 +81,14 @@ impl UserDatabase {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A view of one collection on this database's connection.
+    pub fn collection(&self, id: CollectionId) -> Database {
+        Database::new_view(Arc::clone(&self.conn), id)
     }
 
     /// Run `f` against the connection. The only way in from outside this

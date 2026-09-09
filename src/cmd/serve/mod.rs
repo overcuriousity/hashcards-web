@@ -13,6 +13,7 @@ mod handlers;
 mod href;
 mod landing;
 mod merge;
+mod reviewdb;
 pub mod server;
 mod state;
 mod upload;
@@ -39,13 +40,14 @@ mod tests {
     use crate::cmd::serve::config::DefaultsSection;
     use crate::cmd::serve::config::ResolvedServeConfig;
     use crate::cmd::serve::server::start_serve;
-    use crate::db::Database;
     use crate::error::ErrorReport;
     use crate::error::Fallible;
     use crate::error::fail;
     use crate::types::card_hash::CardHash;
+    use crate::types::collection_id::CollectionId;
     use crate::types::performance::Performance;
     use crate::types::timestamp::Timestamp;
+    use crate::user_db::UserDatabase;
     use crate::utils::CACHE_CONTROL_IMMUTABLE;
     use crate::utils::CACHE_CONTROL_REVALIDATE;
     use crate::utils::wait_for_server;
@@ -59,14 +61,16 @@ mod tests {
     /// The folder name *is* the URL slug: discovery slugifies it, so a name
     /// with a space becomes a slug with a dash.
     ///
-    /// Returns the collection folder and its review database path.
+    /// Returns the collection folder, its owner's review database path, and
+    /// the id that scopes this collection's rows inside it.
     fn card_collection(
         data_dir: &std::path::Path,
         name: &str,
         files: &[(&str, &str)],
-    ) -> Fallible<(PathBuf, PathBuf)> {
+    ) -> Fallible<(PathBuf, PathBuf, CollectionId)> {
         use crate::cmd::serve::cards::CardRoot;
         use crate::cmd::serve::cards::collection_id;
+        use crate::cmd::serve::cards::user_db_path;
 
         let root = CardRoot::for_user(data_dir, None)?;
         let folder = root.path().join(name);
@@ -81,7 +85,7 @@ mod tests {
         let id = collection_id(&folder)?;
         let db_dir = data_dir.join("db");
         std::fs::create_dir_all(&db_dir)?;
-        Ok((folder, db_dir.join(format!("{id}.db"))))
+        Ok((folder, user_db_path(&root, &db_dir)?, id))
     }
 
     /// Serve `data_dir` on `port`, and wait until it answers.
@@ -659,7 +663,7 @@ A: 2
         let port = pick_unused_port().unwrap();
         let dir = tempdir()?;
         let slug = "resume-collection".to_string();
-        let (_folder, db_path) = card_collection(
+        let (_folder, db_path, id) = card_collection(
             dir.path(),
             &slug,
             &[(
@@ -689,10 +693,7 @@ A: 2
 
         // A second start POST must not discard the session: still one DB row.
         start().await?;
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| crate::error::ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = Database::new(db_path_str)?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         assert_eq!(
             db.get_all_sessions()?.len(),
             1,
@@ -709,15 +710,12 @@ A: 2
         let port = pick_unused_port().unwrap();
         let dir = tempdir()?;
         let slug = "dangling-collection".to_string();
-        let (_folder, db_path) =
+        let (_folder, db_path, id) =
             card_collection(dir.path(), &slug, &[("Deck.md", "Q: What is 1+1?\nA: 2\n")])?;
 
         // Simulate a crash: a session row that was never closed.
         {
-            let db_path_str = db_path
-                .to_str()
-                .ok_or_else(|| crate::error::ErrorReport::new("non-UTF-8 temp path"))?;
-            let db = Database::new(db_path_str)?;
+            let db = UserDatabase::open(&db_path)?.collection(id);
             let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
             db.create_session(t0)?;
         }
@@ -1017,12 +1015,9 @@ A: 2
         let folder = dir.path().join("cards").join("default").join("Spanish");
         let id = crate::cmd::serve::cards::existing_collection_id(&folder)?
             .ok_or_else(|| ErrorReport::new("the collection has no id"))?;
-        let db_path = dir.path().join("db").join(format!("{id}.db"));
-        let db_str = match db_path.to_str() {
-            Some(p) => p,
-            None => return fail("temp path is not UTF-8"),
-        };
-        let db = Database::new(db_str)?;
+        let root = crate::cmd::serve::cards::CardRoot::open(dir.path(), None)?;
+        let db_path = crate::cmd::serve::cards::user_db_path(&root, &dir.path().join("db"))?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         let hash = CardHash::from_hex(&new_hash)?;
         assert!(db.card_exists(hash)?, "the edited card has no row");
         match db.get_card_performance_opt(hash)? {

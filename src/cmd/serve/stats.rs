@@ -9,6 +9,7 @@ use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::handlers::collection_exists;
 use crate::cmd::serve::handlers::find_collection;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::stats_page::gather_stats;
 use crate::cmd::stats_page::render_stats_page;
@@ -56,7 +57,7 @@ pub async fn collection_stats_handler(
 fn stats_inner(state: &AppState, slug: &str, owner: Option<&str>) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone())?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
     let stats = gather_stats(&collection.db, &collection.cards, Date::today())?;
     let back = format!("/collection/{slug}");
     let body = render_stats_page(&rc.name, &stats, Some(&back));

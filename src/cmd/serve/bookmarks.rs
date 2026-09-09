@@ -16,6 +16,7 @@ use crate::cmd::drill::template::page_template;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::handlers::find_collection;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::collection::Collection;
 use crate::db::Bookmark;
@@ -52,7 +53,7 @@ fn bookmark_list_inner(
 ) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone())?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
     let bookmarks = collection.db.list_bookmarks()?;
     let cards_by_hash: HashMap<CardHash, &Card> =
         collection.cards.iter().map(|c| (c.hash(), c)).collect();
@@ -208,7 +209,7 @@ fn bookmark_delete_inner(
 ) -> Fallible<()> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::with_db_path(rc.coll_dir, rc.db_path)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
     let hash = CardHash::from_hex(hash_hex)?;
     collection.db.delete_bookmark(hash)?;
     Ok(())
@@ -250,7 +251,7 @@ fn bookmark_note_inner(
 ) -> Fallible<()> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::with_db_path(rc.coll_dir, rc.db_path)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
     let hash = CardHash::from_hex(hash_hex)?;
     let note = if note.trim().is_empty() {
         None

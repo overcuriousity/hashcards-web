@@ -26,6 +26,7 @@ use crate::cmd::drill::template::page_template;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::files::collections_for_user;
 use crate::cmd::serve::handlers::current_user_for;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::collection::Collection;
 use crate::error::Fallible;
@@ -192,13 +193,14 @@ pub(super) struct DeckChoices {
 pub(super) fn deck_choices(collections: &[ResolvedCollection]) -> Vec<DeckChoices> {
     let mut out = Vec::new();
     for rc in collections {
-        let collection = match Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("skipping collection '{}' while listing decks: {e}", rc.name);
-                continue;
-            }
-        };
+        let collection =
+            match open_collection_db(rc).and_then(|db| Collection::open(rc.coll_dir.clone(), db)) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("skipping collection '{}' while listing decks: {e}", rc.name);
+                    continue;
+                }
+            };
         let mut deck_names: Vec<String> = collection
             .cards
             .iter()
@@ -542,6 +544,7 @@ pub async fn deck_delete_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::collection_id::CollectionId;
 
     fn entry(name: &str, owner: Option<&str>, members: &[&str]) -> CustomDeckEntry {
         CustomDeckEntry {
@@ -668,6 +671,7 @@ mod tests {
             slug: decks[0].slug.clone(),
             coll_dir: std::path::PathBuf::from("/tmp/a"),
             db_path: std::path::PathBuf::from("/tmp/a.db"),
+            collection_id: CollectionId::new("test-collection").expect("a non-empty id"),
             owner: None,
             overrides: Default::default(),
         }];

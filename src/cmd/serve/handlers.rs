@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -45,12 +46,12 @@ use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
 use crate::cmd::serve::decks::find_custom_deck;
 use crate::cmd::serve::files::existing_collections_for_user;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::DrillSession;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
 use crate::collection::Collection;
-use crate::db::Database;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
@@ -61,6 +62,7 @@ use crate::types::card::Card;
 use crate::types::card_hash::CardHash;
 use crate::types::date::Date;
 use crate::types::timestamp::Timestamp;
+use crate::user_db::UserDatabase;
 
 /// Run blocking filesystem/SQLite work on tokio's blocking thread pool.
 ///
@@ -144,14 +146,11 @@ fn collection_get_inner(
         // No active session: show the deck browser.
         let rc = find_collection(state, slug, owner)
             .ok_or_else(|| crate::error::ErrorReport::new(format!("Unknown collection: {slug}")))?;
-        let browse = build_deck_tree(&rc.coll_dir, &rc.db_path)?;
-        let db_path = rc.db_path.to_str().ok_or_else(|| {
-            crate::error::ErrorReport::new(format!(
-                "Database path is not valid UTF-8: {}",
-                rc.db_path.display()
-            ))
-        })?;
-        let db = Database::new(db_path)?;
+        // Two views, because `build_deck_tree` consumes the one it is
+        // given. They share the user's connection, so this is not a second
+        // writer on the file.
+        let browse = build_deck_tree(&rc.coll_dir, open_collection_db(&rc)?)?;
+        let db = open_collection_db(&rc)?;
         // FEAT-03: report the session rows the startup sweep closed. The
         // sweep itself runs once, at startup: it cannot tell a crashed
         // session from a live one, and a second server may share the same
@@ -501,6 +500,11 @@ pub(super) fn create_session_from_sources(
     let session_started_at = Timestamp::now();
     let today: Date = session_started_at.date();
 
+    // Every collection a deck can draw on belongs to one user, so they all
+    // name one file — but keyed by path rather than assumed, so a deck that
+    // one day spanned two users would still be correct rather than silently
+    // routed to the wrong database.
+    let mut opened: HashMap<PathBuf, UserDatabase> = HashMap::new();
     let mut session_dbs: Vec<SessionDb> = Vec::new();
     let mut routes: HashMap<CardHash, usize> = HashMap::new();
     let mut due_cards: Vec<Card> = Vec::new();
@@ -510,7 +514,14 @@ pub(super) fn create_session_from_sources(
 
     for (index, spec) in sources.into_iter().enumerate() {
         let rc = spec.collection;
-        let collection = Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone())?;
+        let user_db = match opened.entry(rc.db_path.clone()) {
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(slot) => slot.insert(UserDatabase::open(&rc.db_path)?),
+        };
+        let collection = Collection::open(
+            rc.coll_dir.clone(),
+            user_db.collection(rc.collection_id.clone()),
+        )?;
         // Canonical, as every card's file path is: media is resolved by
         // stripping this prefix off the file the card was parsed from.
         let coll_dir = collection.directory.clone();
@@ -646,9 +657,9 @@ pub(super) fn deck_card_counts(sources: &[SessionSourceSpec]) -> Fallible<(usize
     let mut due_total = 0;
     let mut card_total = 0;
     for spec in sources {
-        let collection = Collection::with_db_path(
+        let collection = Collection::open(
             spec.collection.coll_dir.clone(),
-            spec.collection.db_path.clone(),
+            open_collection_db(&spec.collection)?,
         )?;
         let due: HashSet<CardHash> = collection.db.due_today(today)?;
         let wanted: HashSet<&str> = spec.decks.iter().map(|d| d.as_str()).collect();
@@ -986,13 +997,14 @@ mod tests {
     use crate::cmd::drill::state::MutableState;
     use crate::cmd::drill::state::SessionDbs;
     use crate::cmd::serve::config::ResolvedCollection;
+    use crate::cmd::serve::reviewdb::open_collection_db;
     use crate::cmd::serve::state::AppState;
     use crate::cmd::serve::state::DrillSession;
     use crate::cmd::serve::state::SessionKey;
-    use crate::db::Database;
     use crate::error::ErrorReport;
     use crate::error::Fallible;
     use crate::rng::TinyRng;
+    use crate::types::collection_id::CollectionId;
     use crate::types::performance::Jitter;
     use crate::types::performance::Scheduling;
     use crate::types::timestamp::Timestamp;
@@ -1090,13 +1102,8 @@ mod tests {
 
         let (state, rc) = test_state(&data_dir)?;
         let slug = rc.slug.clone();
-        let db_path = rc.db_path.clone();
-        let db_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-utf8 db path"))?;
-
         let started_at = Timestamp::now();
-        let db = Database::new(db_str)?;
+        let db = open_collection_db(&rc)?;
         let session_id = db.create_session(started_at)?;
         let mutable = MutableState::new(
             SessionDbs::single(
@@ -1287,17 +1294,8 @@ mod tests {
         }
 
         // Each collection's own database recorded exactly its own review.
-        let alpha_db = crate::db::Database::new(
-            alpha
-                .db_path
-                .to_str()
-                .ok_or_else(|| ErrorReport::new("non-utf8 path"))?,
-        )?;
-        let beta_db = crate::db::Database::new(
-            beta.db_path
-                .to_str()
-                .ok_or_else(|| ErrorReport::new("non-utf8 path"))?,
-        )?;
+        let alpha_db = open_collection_db(&alpha)?;
+        let beta_db = open_collection_db(&beta)?;
         let alpha_reviews: usize = alpha_db
             .get_all_sessions()?
             .iter()
@@ -1384,6 +1382,7 @@ mod tests {
             slug: "one".to_string(),
             coll_dir: one_dir.path().to_path_buf(),
             db_path: one_dir.path().join("one.db"),
+            collection_id: CollectionId::new("one")?,
             owner: None,
             overrides: Default::default(),
         };
@@ -1392,6 +1391,7 @@ mod tests {
             slug: "two".to_string(),
             coll_dir: two_dir.path().to_path_buf(),
             db_path: two_dir.path().join("two.db"),
+            collection_id: CollectionId::new("two")?,
             owner: None,
             overrides: Default::default(),
         };

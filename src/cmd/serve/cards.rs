@@ -367,6 +367,7 @@ pub fn discover_local_collections(
     if !root.path().exists() {
         return Ok(collections);
     }
+    let db_path = user_db_path(root, db_dir)?;
     let mut names = Vec::new();
     for entry in read_dir(root.path())? {
         let entry = entry?;
@@ -404,11 +405,26 @@ pub fn discover_local_collections(
             name,
             overrides: collection_overrides(&path),
             coll_dir: path,
-            db_path: db_dir.join(format!("{id}.db")),
+            db_path: db_path.clone(),
+            collection_id: id,
             owner: owner.map(|o| o.to_lowercase()),
         });
     }
     Ok(collections)
+}
+
+/// The review database of the user whose tree this is.
+///
+/// One file per tree, named for the tree's own directory — which is
+/// `default` or `{email-slug}-{8 hex}`, and so can never collide with a
+/// collection id, which is eight hex characters.
+pub fn user_db_path(root: &CardRoot, db_dir: &Path) -> Fallible<PathBuf> {
+    let name = root
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| ErrorReport::new("the card folder has no readable name"))?;
+    Ok(db_dir.join(format!("{name}.db")))
 }
 
 /// Every collection in every user's tree under `{data_dir}/cards`.
@@ -648,8 +664,11 @@ mod tests {
         Ok(())
     }
 
+    /// The database is the *user's*, named for their card tree; which rows
+    /// in it belong to this collection is its stable id, not its slug. A
+    /// rename therefore changes neither.
     #[test]
-    fn discovered_db_path_is_named_from_the_id_not_the_slug() -> Fallible<()> {
+    fn discovered_db_path_is_the_users_file_not_the_collections() -> Fallible<()> {
         let (dir, root) = fixture()?;
         let folder = root.path().join("Spanish");
         std::fs::create_dir_all(&folder)?;
@@ -657,7 +676,9 @@ mod tests {
 
         let db_dir = dir.join("db");
         let found = discover_local_collections(&root, &db_dir, None, IdPolicy::CreateMissing)?;
-        assert_eq!(found[0].db_path, db_dir.join(format!("{id}.db")));
+        assert_eq!(found[0].db_path, user_db_path(&root, &db_dir)?);
+        assert_ne!(found[0].db_path, db_dir.join(format!("{id}.db")));
+        assert_eq!(found[0].collection_id, id);
         Ok(())
     }
 
@@ -731,7 +752,7 @@ mod tests {
         let found =
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
-        assert_eq!(found[0].db_path, dir.join("db").join(format!("{id}.db")));
+        assert_eq!(found[0].collection_id, id);
         let scheduling = found[0].scheduling(Scheduling::default());
         assert_eq!(scheduling.retention.into_inner(), DesiredRetention::DEFAULT);
         assert_eq!(scheduling.max_interval.into_inner(), MaxInterval::DEFAULT);
@@ -780,9 +801,8 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(
-            found[0].db_path,
-            dir.join("db").join(format!("{id}.db")),
-            "the salvaged id must still name the same review database"
+            found[0].collection_id, id,
+            "the salvaged id must still scope the same review rows"
         );
         assert_eq!(
             std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,

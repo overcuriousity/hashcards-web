@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::cmd::drill::render::AnswerControls;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::Jitter;
 use crate::types::performance::MaxInterval;
@@ -239,7 +240,11 @@ pub struct ResolvedCollection {
     pub name: String,
     pub slug: String,
     pub coll_dir: PathBuf,
+    /// The owning user's review database, shared by every collection in
+    /// their card tree. Which rows in it belong to this collection is
+    /// `collection_id`, not the file name.
     pub db_path: PathBuf,
+    pub collection_id: CollectionId,
     /// Owning user's email (lowercased), when `[oidc]` is configured.
     pub owner: Option<String>,
     /// Scheduling this collection asks for in place of the instance's.

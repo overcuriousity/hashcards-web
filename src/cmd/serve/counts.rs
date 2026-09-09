@@ -7,8 +7,10 @@
 use std::path::Path;
 
 use crate::cmd::serve::config::ResolvedCollection;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::CollectionInfo;
 use crate::collection::Collection;
+use crate::db::Database;
 use crate::error::Fallible;
 use crate::types::date::Date;
 use crate::types::timestamp::Timestamp;
@@ -19,7 +21,9 @@ use crate::types::timestamp::Timestamp;
 pub fn refresh_collection_info(collections: &[ResolvedCollection]) -> Vec<CollectionInfo> {
     let mut infos = Vec::new();
     for rc in collections {
-        let (total_cards, due_today) = match compute_collection_counts(&rc.coll_dir, &rc.db_path) {
+        let counts =
+            open_collection_db(rc).and_then(|db| compute_collection_counts(&rc.coll_dir, db));
+        let (total_cards, due_today) = match counts {
             Ok(counts) => counts,
             Err(e) => {
                 log::warn!("Failed to load collection '{}': {e}", rc.name);
@@ -41,12 +45,12 @@ pub fn refresh_collection_info(collections: &[ResolvedCollection]) -> Vec<Collec
 /// `(total cards, cards due today)`, inserting any card the database has
 /// not seen before so a freshly written card is counted from the moment it
 /// exists.
-pub fn compute_collection_counts(coll_dir: &Path, db_path: &Path) -> Fallible<(usize, usize)> {
+pub fn compute_collection_counts(coll_dir: &Path, db: Database) -> Fallible<(usize, usize)> {
     if !coll_dir.exists() {
         return Ok((0, 0));
     }
 
-    let collection = Collection::with_db_path(coll_dir.to_path_buf(), db_path.to_path_buf())?;
+    let collection = Collection::open(coll_dir.to_path_buf(), db)?;
     let total_cards = collection.cards.len();
 
     let today: Date = Timestamp::now().date();
@@ -77,6 +81,7 @@ mod tests {
     use super::refresh_collection_info;
     use crate::cmd::serve::config::ResolvedCollection;
     use crate::error::Fallible;
+    use crate::types::collection_id::CollectionId;
 
     #[test]
     fn test_refresh_collection_info_carries_owner() -> Fallible<()> {
@@ -86,6 +91,7 @@ mod tests {
             slug: "japanese".to_string(),
             coll_dir: dir.path().to_path_buf(),
             db_path: dir.path().join("hashcards.db"),
+            collection_id: CollectionId::new("test-collection")?,
             owner: Some("me@example.com".to_string()),
             overrides: Default::default(),
         };

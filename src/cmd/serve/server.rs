@@ -65,6 +65,7 @@ use crate::cmd::serve::handlers::collection_post_handler;
 use crate::cmd::serve::handlers::collection_script_handler;
 use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
@@ -73,8 +74,6 @@ use crate::cmd::serve::stats::collection_stats_handler;
 use crate::cmd::serve::upload::MAX_UPLOAD_BYTES;
 use crate::cmd::serve::upload::media_upload_handler;
 use crate::cmd::signals::terminate_signal;
-use crate::db::Database;
-use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::timestamp::Timestamp;
@@ -114,16 +113,8 @@ fn sweep_dangling_sessions(data_dir: &Path) -> HashMap<PathBuf, usize> {
             .iter()
             .map(|rc| {
                 scope.spawn(move || {
-                    let closed = (|| {
-                        let db_path = rc.db_path.to_str().ok_or_else(|| {
-                            ErrorReport::new(format!(
-                                "Database path is not valid UTF-8: {}",
-                                rc.db_path.display()
-                            ))
-                        })?;
-                        Database::new(db_path)
-                            .and_then(|db| db.close_dangling_sessions(stale_before))
-                    })();
+                    let closed = open_collection_db(rc)
+                        .and_then(|db| db.close_dangling_sessions(stale_before));
                     (rc.db_path.clone(), closed)
                 })
             })
@@ -448,6 +439,7 @@ mod tests {
     use super::*;
     use crate::cmd::serve::cards::collection_id;
     use crate::helper::create_tmp_directory;
+    use crate::user_db::UserDatabase;
 
     /// Two users may each have a collection called "Spanish". They slugify
     /// alike, so a notice keyed by slug would be shown to whichever of them
@@ -464,12 +456,8 @@ mod tests {
             let folder = data_dir.join("cards").join(user).join("Spanish");
             std::fs::create_dir_all(&folder)?;
             let id = collection_id(&folder)?;
-            let db_path = db_dir.join(format!("{id}.db"));
-            let db_str = match db_path.to_str() {
-                Some(p) => p,
-                None => return fail("temp path is not UTF-8"),
-            };
-            let db = Database::new(db_str)?;
+            let db_path = db_dir.join(format!("{user}.db"));
+            let db = UserDatabase::open(&db_path)?.collection(id);
             // A session row opened long ago and never closed: exactly what a
             // crash leaves behind.
             let started = Timestamp::now().minus_minutes(SESSION_STALE_MINUTES * 2);

@@ -33,6 +33,7 @@ use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::handlers::collection_exists;
 use crate::cmd::serve::handlers::find_collection;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::collection::Collection;
 use crate::db::ReviewRow;
@@ -114,7 +115,7 @@ fn download_name(slug: &str) -> String {
 fn export_inner(state: &AppState, slug: &str, owner: Option<&str>) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone())?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
     let export = get_export(collection)?;
     Ok(serde_json::to_string_pretty(&export)?)
 }

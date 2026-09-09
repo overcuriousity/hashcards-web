@@ -21,6 +21,7 @@ use crate::cmd::serve::cards::IdPolicy;
 use crate::cmd::serve::cards::collection_id;
 use crate::cmd::serve::cards::discover_local_collections;
 use crate::cmd::serve::cards::existing_collection_id;
+use crate::cmd::serve::cards::user_db_path;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::config::slugify;
 use crate::cmd::serve::edit::build_card_migration;
@@ -48,6 +49,7 @@ use crate::types::card::Card;
 use crate::types::collection_id::CollectionId;
 use crate::types::performance::Performance;
 use crate::types::timestamp::Timestamp;
+use crate::user_db::UserDatabase;
 use crate::utils::ensure_dir;
 
 /// Seed content for a new card file, also offered for copying on the
@@ -626,12 +628,18 @@ pub fn collection_folder(root: &CardRoot, rel: &str) -> Fallible<PathBuf> {
     Ok(folder)
 }
 
-/// The review database of the local collection at `coll_dir`.
+/// Where a save to the local collection at `coll_dir` writes: the owning
+/// user's review database, and the id that scopes this collection's rows
+/// inside it.
 ///
-/// Named from the folder's stable id rather than its slug, so renaming a
-/// collection keeps its history.
-pub fn db_path_for(coll_dir: &Path, db_dir: &Path) -> Fallible<PathBuf> {
-    Ok(db_dir.join(format!("{}.db", collection_id(coll_dir)?)))
+/// The id comes from the folder's `.hashcards.toml` rather than its slug, so
+/// renaming a collection keeps its history.
+pub fn db_target_for(
+    root: &CardRoot,
+    coll_dir: &Path,
+    db_dir: &Path,
+) -> Fallible<(PathBuf, CollectionId)> {
+    Ok((user_db_path(root, db_dir)?, collection_id(coll_dir)?))
 }
 
 /// Parse an unsaved buffer as the file at `rel` would be parsed on disk.
@@ -844,19 +852,8 @@ fn save_file(
         None => return fail("No data directory is configured."),
     };
     ensure_dir(&db_dir, "review database directory")?;
-    let db_path = db_path_for(&coll_dir, &db_dir)?;
-    // `Database::new` takes a &str; a non-UTF-8 data directory cannot be
-    // named to SQLite at all, so say so rather than lossily converting.
-    let db_path_str = match db_path.to_str() {
-        Some(p) => p,
-        None => {
-            return fail(format!(
-                "Not saved — the database path is not valid UTF-8: {}",
-                db_path.display()
-            ));
-        }
-    };
-    let mut db = Database::new(db_path_str)?;
+    let (db_path, id) = db_target_for(&root, &coll_dir, &db_dir)?;
+    let db = UserDatabase::open(&db_path)?.collection(id);
 
     write_atomic(&path, &form.content)?;
     let new_cards = match parse_buffer_at(rel, &path, &form.content) {
@@ -866,7 +863,7 @@ fn save_file(
             return fail(format!("Not saved — {}", e.message()));
         }
     };
-    // `Collection::with_db_path` validates media when it loads, so a
+    // `Collection::open` validates media when it loads, so a
     // reference to a file that is not there does not merely render as a
     // broken image: it fails the whole collection, taking its page, its
     // deck tree, its stats and the landing count down with it. Refused
@@ -894,7 +891,7 @@ fn save_file(
     // Only mention unmatched cards when there was history to lose: on a file
     // nobody has drilled, every card is "unmatched" and saying so is noise.
     let skipped = plan.skipped + counts.collided;
-    let worth_reporting = skipped > 0 && any_card_has_history(db_path_str, &old_cards)?;
+    let worth_reporting = skipped > 0 && any_card_has_history(&db, &old_cards)?;
     let mut message = if worth_reporting {
         format!(
             "Saved {} cards. {skipped} could not be matched to their old review history and start fresh.",
@@ -956,8 +953,7 @@ pub async fn preview_handler(
 /// Note the predicate is `Reviewed`, not "a row exists": loading a
 /// collection inserts a row per card, so `get_card_performance_opt` returns
 /// `Some(Performance::New)` for cards nobody has ever seen.
-fn any_card_has_history(db_path: &str, cards: &[Card]) -> Fallible<bool> {
-    let db = Database::new(db_path)?;
+fn any_card_has_history(db: &Database, cards: &[Card]) -> Fallible<bool> {
     for card in cards {
         if let Some(Performance::Reviewed(_)) = db.get_card_performance_opt(card.hash())? {
             return Ok(true);
@@ -1026,6 +1022,8 @@ mod tests {
     use super::*;
     use crate::cmd::serve::cards::CardRoot;
     use crate::helper::create_tmp_directory;
+    use crate::types::collection_id::CollectionId;
+    use crate::user_db::UserDatabase;
 
     #[test]
     fn tree_lists_folders_before_files_depth_first() -> Fallible<()> {
@@ -1109,8 +1107,11 @@ mod tests {
         Ok(())
     }
 
+    /// The database a save writes into is the *user's*, and which rows in it
+    /// the save touches is the collection's id. Renaming the folder still
+    /// changes neither.
     #[test]
-    fn db_path_comes_from_the_top_level_folder_id() -> Fallible<()> {
+    fn a_save_targets_the_users_database_and_the_folders_id() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let root = CardRoot::for_user(&dir, None)?;
         let folder = root.path().join("Spanish");
@@ -1119,8 +1120,13 @@ mod tests {
         let id = crate::cmd::serve::cards::collection_id(&folder)?;
 
         let db_dir = dir.join("db");
-        let path = db_path_for(&collection_folder(&root, "Spanish/verbs.md")?, &db_dir)?;
-        assert_eq!(path, db_dir.join(format!("{id}.db")));
+        let (path, found) = db_target_for(
+            &root,
+            &collection_folder(&root, "Spanish/verbs.md")?,
+            &db_dir,
+        )?;
+        assert_eq!(path, db_dir.join("default.db"));
+        assert_eq!(found, id);
         Ok(())
     }
 
@@ -1185,25 +1191,20 @@ mod tests {
         // Replacing the seeded template's cards on a file nobody has drilled
         // must not warn about review history: there was none to lose.
         let dir = create_tmp_directory()?;
-        let db_path = dir.join("empty.db");
-        let db_str = db_path.to_str().expect("temp path is UTF-8");
-        let db = crate::db::Database::new(db_str)?;
-        drop(db);
+        let db = UserDatabase::open(&dir.join("empty.db"))?
+            .collection(CollectionId::new("test-collection")?);
 
         let old = parse_buffer("Spanish/verbs.md", CARD_TEMPLATE)?.cards;
 
         // A row exists per card once a collection is loaded, but nobody has
         // reviewed them, so there is no history to lose.
-        let db = crate::db::Database::new(db_str)?;
         let now = crate::types::timestamp::Timestamp::now();
         for card in &old {
             db.insert_card(card.hash(), now)?;
         }
-        drop(db);
-        assert!(!any_card_has_history(db_str, &old)?);
+        assert!(!any_card_has_history(&db, &old)?);
 
         // Once one is actually reviewed, the warning must fire again.
-        let db = crate::db::Database::new(db_str)?;
         db.update_card_performance(
             old[0].hash(),
             Performance::Reviewed(crate::types::performance::ReviewedPerformance {
@@ -1216,8 +1217,7 @@ mod tests {
                 review_count: 1,
             }),
         )?;
-        drop(db);
-        assert!(any_card_has_history(db_str, &old)?);
+        assert!(any_card_has_history(&db, &old)?);
         Ok(())
     }
 
@@ -1436,13 +1436,10 @@ mod tests {
 
         let db_dir = data_dir.join("db");
         ensure_dir(&db_dir, "review database directory")?;
-        let db_path = db_path_for(folder, &db_dir)?;
-        let db_str = match db_path.to_str() {
-            Some(p) => p,
-            None => return fail("temp path is not UTF-8"),
-        };
+        let root = CardRoot::for_user(data_dir, None)?;
+        let (db_path, id) = db_target_for(&root, folder, &db_dir)?;
         let started_at = Timestamp::now();
-        let db = Database::new(db_str)?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         let session_id = db.create_session(started_at)?;
         let mutable = MutableState::new(
             SessionDbs::single(
@@ -1493,13 +1490,10 @@ mod tests {
 
         let db_dir = data_dir.join("db");
         ensure_dir(&db_dir, "review database directory")?;
-        let db_path = db_path_for(folder, &db_dir)?;
-        let db_str = match db_path.to_str() {
-            Some(p) => p,
-            None => return fail("temp path is not UTF-8"),
-        };
+        let root = CardRoot::for_user(data_dir, None)?;
+        let (db_path, id) = db_target_for(&root, folder, &db_dir)?;
         let started_at = Timestamp::now();
-        let db = Database::new(db_str)?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         let session_id = db.create_session(started_at)?;
         let dbs = SessionDbs::routed(
             vec![SessionDb {
@@ -1626,7 +1620,7 @@ mod tests {
         Ok(())
     }
 
-    /// `Collection::with_db_path` validates media when it loads, so an
+    /// `Collection::open` validates media when it loads, so an
     /// image reference to a file that is not there does not render as a
     /// broken image — it fails the whole collection, and its page, deck
     /// tree, stats and landing count all go with it. The editor must not be
@@ -1788,7 +1782,11 @@ mod tests {
         )?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
-        let db_path = db_path_for(&folder, &dir.join("db"))?;
+        // The file `remove_collection_database` acts on: the collection's
+        // own legacy database, not the user's.
+        let db_path = dir
+            .join("db")
+            .join(format!("{}.db", collection_id(&folder)?));
         ensure_dir(&dir.join("db"), "review database directory")?;
         std::fs::write(&db_path, "")?;
 
@@ -2065,7 +2063,11 @@ mod tests {
         )?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
-        let db_path = db_path_for(&folder, &dir.join("db"))?;
+        // The file `remove_collection_database` acts on: the collection's
+        // own legacy database, not the user's.
+        let db_path = dir
+            .join("db")
+            .join(format!("{}.db", collection_id(&folder)?));
         ensure_dir(&dir.join("db"), "review database directory")?;
         std::fs::write(&db_path, "")?;
 

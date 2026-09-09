@@ -10,6 +10,7 @@ use maud::html;
 use crate::cmd::drill::template::page_template;
 use crate::cmd::serve::href::encoded_path;
 use crate::collection::Collection;
+use crate::db::Database;
 use crate::error::Fallible;
 use crate::flash::Flash;
 use crate::parser::DuplicateCard;
@@ -80,8 +81,8 @@ pub struct BrowseData {
 }
 
 /// Build a deck tree from a collection, computing per-deck due/total counts.
-pub fn build_deck_tree(coll_dir: &Path, db_path: &Path) -> Fallible<BrowseData> {
-    let collection = Collection::with_db_path(coll_dir.to_path_buf(), db_path.to_path_buf())?;
+pub fn build_deck_tree(coll_dir: &Path, db: Database) -> Fallible<BrowseData> {
+    let collection = Collection::open(coll_dir.to_path_buf(), db)?;
     let session_started_at = Timestamp::now();
     let today: Date = session_started_at.date();
 
@@ -461,6 +462,14 @@ function updateDrillButton() {
 mod tests {
     use super::*;
     use crate::helper::create_tmp_directory;
+    use crate::types::collection_id::CollectionId;
+    use crate::user_db::UserDatabase;
+
+    /// A one-collection view on a database of its own, which is all these
+    /// tests need: they are about what the page renders, not about scoping.
+    fn open_test_db(path: &Path) -> Fallible<Database> {
+        Ok(UserDatabase::open(path)?.collection(CollectionId::new("test-collection")?))
+    }
 
     /// The link points at the file the topic's cards actually live in, not
     /// at its name: a file's frontmatter `name:` renames the topic without
@@ -473,7 +482,7 @@ mod tests {
             dir.join("grammar").join("particles.md"),
             "---\nname = \"Little words\"\n---\n\nQ: wa\nA: topic marker\n",
         )?;
-        let browse = build_deck_tree(&dir, &dir.join("test.db"))?;
+        let browse = build_deck_tree(&dir, open_test_db(&dir.join("test.db"))?)?;
         let html = render_browse_page("My Cards", "My-Cards", &browse, 0, 0, None).into_string();
         assert!(
             html.contains("/files/edit/My%20Cards/grammar/particles.md"),
@@ -491,9 +500,7 @@ mod tests {
         let dir = create_tmp_directory()?;
         std::fs::write(dir.join("One.md"), "Q: Same?\nA: Yes.\n")?;
         std::fs::write(dir.join("Two.md"), "Q: Same?\nA: Yes.\n")?;
-        let db_path = dir.join("hashcards.db");
-
-        let browse = build_deck_tree(&dir, &db_path)?;
+        let browse = build_deck_tree(&dir, open_test_db(&dir.join("hashcards.db"))?)?;
         assert_eq!(
             browse.duplicates.len(),
             1,

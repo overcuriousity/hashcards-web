@@ -130,7 +130,7 @@ pub fn handle_action(
             // If the session had finished, its DB row was closed; reopen it
             // in the same transaction as the void (BUG-04).
             let finished = mutable.finished_at;
-            let entry = mutable.dbs.for_card_mut(hash);
+            let entry = mutable.dbs.for_card(hash);
             let reopen_session: Option<i64> = finished.map(|_| entry.session_id);
             // Void the review and restore prior performance atomically, and
             // commit BEFORE mutating any in-memory state. If this fails, the
@@ -242,7 +242,7 @@ pub fn handle_action(
             // BEFORE mutating any in-memory state. If this fails, the
             // queue, cache, undo stack, and reveal state are untouched
             // and the grade can simply be retried.
-            let entry = mutable.dbs.for_card_mut(hash);
+            let entry = mutable.dbs.for_card(hash);
             let review_id = entry.db.insert_review_and_update_performance(
                 entry.session_id,
                 &record,
@@ -299,7 +299,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_mutable() -> MutableState {
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let session_id = db.create_session(Timestamp::now()).unwrap();
         MutableState {
             reveal: false,
@@ -331,7 +331,7 @@ mod tests {
 
     /// A session whose cards exist in the queue, the cache, AND the cards table.
     fn make_state_with_cards(cards: Vec<Card>) -> MutableState {
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let now = Timestamp::now();
         let mut cache = Cache::new();
         for card in &cards {
@@ -431,7 +431,7 @@ mod tests {
         // inserting its review fails the foreign-key check: an injected DB
         // write failure inside the grade transaction.
         let card = make_card("Q1");
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let session_id = db.create_session(Timestamp::now()).unwrap();
         let mut cache = Cache::new();
         cache.insert(card.hash(), Performance::New).unwrap();
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn test_undo_after_finish_reopens_session_row() {
         let card = make_card("Q1");
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let started_at = Timestamp::new(
             NaiveDateTime::parse_from_str("2020-01-01T00:00:00.000", "%Y-%m-%dT%H:%M:%S%.3f")
                 .unwrap(),

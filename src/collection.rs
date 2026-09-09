@@ -19,13 +19,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::db::Database;
-use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::media::validate::validate_media_files;
 use crate::parser::DuplicateCard;
 use crate::parser::parse_deck;
 use crate::types::card::Card;
+#[cfg(test)]
+use crate::types::collection_id::CollectionId;
+#[cfg(test)]
+use crate::user_db::UserDatabase;
 
 pub struct Collection {
     pub directory: PathBuf,
@@ -38,8 +41,8 @@ pub struct Collection {
 
 impl Collection {
     /// Load a collection from `directory`, using the `hashcards.db` inside
-    /// it. Test-only: the server resolves each collection's database path
-    /// from the config and uses `with_db_path`.
+    /// it. Test-only: the server resolves each collection's database from
+    /// the config and uses `open`.
     #[cfg(test)]
     pub fn new(directory: Option<String>) -> Fallible<Self> {
         let directory: PathBuf = match directory {
@@ -51,22 +54,22 @@ impl Collection {
         } else {
             return fail("directory does not exist.");
         };
-
-        let db_path: PathBuf = directory.join("hashcards.db");
-        Self::with_db_path(directory, db_path)
+        let db = UserDatabase::open(&directory.join("hashcards.db"))?
+            .collection(CollectionId::new("test-collection")?);
+        Self::open(directory, db)
     }
 
-    pub fn with_db_path(directory: PathBuf, db_path: PathBuf) -> Fallible<Self> {
+    /// Load a collection from `directory`, reading its schedule out of `db`.
+    ///
+    /// The database is passed in rather than opened here: a session drawing
+    /// on several collections shares one connection across all of them, and
+    /// only the caller knows which.
+    pub fn open(directory: PathBuf, db: Database) -> Fallible<Self> {
         let directory: PathBuf = if directory.exists() {
             directory.canonicalize()?
         } else {
             return fail("directory does not exist.");
         };
-
-        let db_path: &str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("invalid path"))?;
-        let db: Database = Database::new(db_path)?;
 
         let macros: Vec<(String, String)> = {
             let macros_path = directory.join("macros.tex");
