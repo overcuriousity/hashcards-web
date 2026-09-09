@@ -94,8 +94,9 @@ session_timeout_minutes = 1440      # 0 disables eviction
 `data_dir` is where the server keeps the card trees (`{data_dir}/cards/{user}`)
 and the review databases (`{data_dir}/db`). A collection is a top-level folder
 in one of those trees — discovered by reading the directory, not declared in
-this file — and its review database is named from the stable id in the
-folder's `.hashcards.toml`, so renaming a folder keeps its history.
+this file — and its rows in its owner's review database are scoped by the
+stable id in the folder's `.hashcards.toml`, so renaming a folder keeps its
+history.
 
 Ownership is structural: with `[oidc]` configured a user's collections are the
 folders in `{data_dir}/cards/{their-email-slug}-{hash}/`, and without it they
@@ -261,8 +262,8 @@ cards as hashcards parses them. A file that does not parse is never saved —
 you get the error and its line number instead.
 
 Renaming a folder is safe. Each one keeps a `.hashcards.toml` holding a stable
-id, and review databases are named from that id rather than from the folder
-name, so your history follows the rename.
+id, and review rows are scoped by that id rather than by the folder name, so
+your history follows the rename.
 
 A collection folder cannot take the URL slug of a saved deck: both are
 addressed through `/collection/{slug}` and routing prefers the collection, so
@@ -272,8 +273,9 @@ the first by name order wins and the other is left out of the list with a
 warning in the log, rather than making the URL mean whichever the filesystem
 happened to yield first.
 
-Deleting a collection folder deletes its review database with it. Folders that
-still hold files are refused, so this only happens once you have emptied one.
+Deleting a collection folder erases its review history with it — its rows, not
+the file, which belongs to every collection you own. Folders that still hold
+files are refused, so this only happens once you have emptied one.
 
 ### Images
 
@@ -538,18 +540,53 @@ Principles of Neural Science/
 
 ## Database
 
-Each collection has an SQLite database at `{data_dir}/db/{id}.db`, where `id`
-is the stable id in the collection folder's `.hashcards.toml` — not the folder
-name, so renaming a folder keeps its history. Reviews are written as they
-happen and in the same transaction as the card's performance, so an
-interrupted session keeps its progress. Undo marks a review `voided` rather
-than deleting it, and read paths filter on `voided = 0`.
+Each **user** has one SQLite database at `{data_dir}/db/{tree}.db`, where
+`tree` is the name of their card tree under `{data_dir}/cards/` — `default`
+without `[oidc]`, and `{email-slug}-{hash}` with it. Every row carries the
+`collection_id` of the collection it belongs to: the stable id in that
+collection folder's `.hashcards.toml`, not the folder name, so renaming a
+folder keeps its history.
+
+Identical cards in two collections keep two schedules. That is what two
+files necessarily meant, and it is now stated as the primary key
+`(collection_id, card_hash)`.
+
+Reviews are written as they happen and in the same transaction as the card's
+performance, so an interrupted session keeps its progress. Undo marks a
+review `voided` rather than deleting it, and read paths filter on
+`voided = 0`.
+
+Databases are opened with write-ahead logging where the filesystem supports
+it. Where it does not — some NFS and SMB mounts — hashcards logs a line and
+carries on in rollback-journal mode.
+
+### Upgrading from per-collection databases
+
+Before this release, each *collection* had its own database at
+`{data_dir}/db/{id}.db`. On the first start after upgrading, those are
+merged into one database per user, in a single transaction per user, and the
+originals are **moved** — not deleted — into `{data_dir}/db/legacy/`.
+
+A user whose merge fails is refused, loudly: their collections show the
+error and point at the startup log, rather than being served from an empty
+database. Every other user is served, and the server starts.
+
+**The upgrade is one way.** An older binary will not look at
+`db/{tree}.db`; it will look for `db/{id}.db`, find nothing, and quietly
+create empty per-collection databases, so every session starts from zero
+with no error at all. If you need to go back: stop the server, move the
+files in `db/legacy/` back into `db/`, and delete the `db/{tree}.db` files
+the newer binary wrote. The originals are kept precisely so that this is
+possible — and moved rather than left where they were, because an older
+binary writing into a file that has already been merged would have those
+reviews skipped by the next upgrade and lost without a word.
 
 The `cards` table:
 
 | Column             | Type               | Description                                                                        |
 |--------------------|--------------------|------------------------------------------------------------------------------------|
-| `card_hash`        | `text primary key` | The hash of the card.                                                              |
+| `collection_id`    | `text not null`    | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
+| `card_hash`        | `text not null`    | The hash of the card.                                                              |
 | `added_at`         | `text not null`    | When the card was first added to the database.                                     |
 | `last_reviewed_at` | `text`             | When the card was most recently reviewed. `null` if the card is new.               |
 | `stability`        | `real`             | The card's stability. `null` if the card is new.                                   |
@@ -564,6 +601,7 @@ The `sessions` table:
 | Column         | Type                  | Description                                                                     |
 |----------------|-----------------------|---------------------------------------------------------------------------------|
 | `session_id`   | `integer primary key` | The ID of the session.                                                          |
+| `collection_id` | `text not null`      | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
 | `started_at`   | `text not null`       | When the session started.                                                       |
 | `ended_at`     | `text not null`       | When the session ended.                                                         |
 | `last_seen_at` | `text`                | Stamped as the owning process serves the session, so the startup sweep can tell a session abandoned by a crash from one still live elsewhere. |
@@ -575,6 +613,7 @@ The `reviews` table:
 |-----------------|-----------------------|---------------------------------------------------------------------------------|
 | `review_id`     | `integer primary key` | The review ID.                                                                  |
 | `session_id`    | `integer not null`    | The session this review was performed in, a foreign key.                        |
+| `collection_id` | `text not null`       | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
 | `card_hash`     | `text not null`       | The card that was reviewed, a foreign key.                                      |
 | `reviewed_at`   | `text not null`       | When the grade was submitted.                                                   |
 | `grade`         | `text not null`       | One of `forgot`, `hard`, `good`, or `easy`.                                     |
@@ -591,7 +630,8 @@ The `bookmarks` table:
 
 | Column       | Type               | Description                                                    |
 |--------------|--------------------|----------------------------------------------------------------|
-| `card_hash`  | `text primary key` | The bookmarked card, a foreign key that cascades on rename.    |
+| `collection_id` | `text not null` | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
+| `card_hash`  | `text not null`    | The bookmarked card, a foreign key that cascades on rename.    |
 | `note`       | `text`             | The note attached to the bookmark, if any.                     |
 | `created_at` | `text not null`    | When the bookmark was made.                                    |
 

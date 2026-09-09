@@ -1,6 +1,50 @@
 <changelog>
     <unreleased>
-        </unreleased>
+        <changed>
+            <change author="claude">
+            **One review database per user, instead of one per collection.**
+            A collection's schedule lived in `{data_dir}/db/{id}.db`, a grain
+            inherited from the CLI this server was forked from, where a
+            collection was the directory you ran the tool in. Nothing about a
+            multi-user server wanted it: `db/` was flat and shared, so which
+            user owned a database could only be discovered by walking every
+            tree and reading every `.hashcards.toml`; a folder deleted from
+            outside the application orphaned its database for ever, with
+            nothing able to collect it or even attribute it; the landing page
+            opened one connection per collection on every request, and the
+            startup sweep spawned a thread per database. Every row now
+            carries the `collection_id` it belongs to, and one file holds
+            everything one user has. Identical cards in two collections still
+            keep two schedules — that is what two files necessarily meant,
+            and it is now the primary key. Databases are opened with
+            write-ahead logging where the filesystem allows it, so the stats
+            page reading while a drill session writes no longer waits out a
+            busy timeout; where it does not, hashcards logs a line and
+            carries on in rollback-journal mode, because an optimisation must
+            not refuse to start the server.
+            </change>
+        </changed>
+        <breaking>
+            <change author="claude">
+            **Existing review databases are merged at first start, and the
+            upgrade is one way.** Each user's per-collection databases are
+            folded into one, in a single transaction per user, and the
+            originals are moved — never deleted — into
+            `{data_dir}/db/legacy/`. A user whose merge fails is refused with
+            an error naming the startup log, and every other user is served:
+            silently starting someone from an empty database is the one
+            outcome this change exists to prevent. Downgrading afterwards
+            fails *quietly* — an older binary looks for `db/{id}.db`, finds
+            nothing, and creates empty per-collection databases with no error
+            at all. To go back: stop the server, move `db/legacy/` back into
+            `db/`, and delete the `db/{tree}.db` files. The originals are kept
+            precisely so that this is possible, and are moved rather than
+            left in place because an older binary writing into a file that
+            has already been merged would have its reviews skipped by the
+            next upgrade and lost without a word.
+            </change>
+        </breaking>
+    </unreleased>
     <releases>
         <release version="0.4.11" date="2026-09-07">
             <added>

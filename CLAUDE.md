@@ -11,6 +11,10 @@ a local CLI tool; the CLI is gone.
 # Design and Internals
 
 - Cards are content addressed.
+- One review database per user, at `{data_dir}/db/{tree}.db`. Every row
+  carries its `collection_id`. `Database` is a *view* of one collection on a
+  `UserDatabase`'s shared connection, and that mutex is not reentrant: a
+  method takes the lock once and calls only free functions under it.
 - Media files are referenced in markdown using standard image syntax: `![](path/to/file.ext)`. Standard image and AV formats are supported.
 - We use `pulldown-cmark` to parse/process/render Markdown.
 - In `markdown.rs`: URLs are rewritten to `/file/{url}` endpoints for serving.
@@ -22,8 +26,8 @@ a local CLI tool; the CLI is gone.
 
 - One binary, one job: `hashcards-web [--config <path>]`, defaulting to
   `hashcards.toml`. There are no subcommands. A config file is mandatory.
-- `src/cmd/serve/` is the server: routing, handlers, auth, config, git,
-  HedgeDoc, editing, decks, export.
+- `src/cmd/serve/` is the server: routing, handlers, auth, config, editing,
+  decks, export, and the startup merge of pre-consolidation databases.
 - `src/cmd/drill/` is the drill engine the server embeds — rendering
   (`get.rs`), actions (`post.rs`), session state, cache, templates and
   static assets. The directory names predate the fork; there is no drill
