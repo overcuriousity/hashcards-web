@@ -273,9 +273,26 @@ the first by name order wins and the other is left out of the list with a
 warning in the log, rather than making the URL mean whichever the filesystem
 happened to yield first.
 
-Deleting a collection folder erases its review history with it — its rows, not
-the file, which belongs to every collection you own. Folders that still hold
-files are refused, so this only happens once you have emptied one.
+Deleting anything moves it to the **trash** rather than destroying it, so a
+folder full of topics can go in one action — you no longer have to empty it
+first.
+
+### Trash
+
+`/trash` holds everything you have deleted, from the file manager or through
+the MCP endpoint. Restoring puts it back where it was; if something has taken
+the same name since, the restore is refused and the copy stays in the trash
+rather than overwriting what is there now.
+
+A deleted collection keeps its review history for as long as it is in the
+trash. Card hashes are content addresses, so a restored folder finds its own
+rows again and its whole schedule comes back — nothing is replayed, because
+nothing was thrown away.
+
+**Emptying the trash is the only thing in hashcards that destroys anything.**
+It removes the files *and* erases the review history of any collection in
+there, which is also what stops a collection recreated under an old name
+inheriting a stale schedule. Disk space is not reclaimed until you do it.
 
 ### Images
 
@@ -537,6 +554,54 @@ Principles of Neural Science/
   Ch1.md
   Ch2.md
 ```
+
+## MCP
+
+hashcards speaks [MCP](https://modelcontextprotocol.io) at `/mcp`, so an AI
+assistant can read and write your cards, decks and collections — writing
+cards from your notes, reorganising a collection, or telling you what is
+waiting to be reviewed.
+
+Mint a token for yourself at `/tokens`. It is shown once, when it is created,
+and only its digest is stored, so nobody can read it back out of the server —
+including you. Give one to software you trust, over a connection you trust:
+every token can write, and anyone holding one can do anything to your cards
+that you can. Revoke it from the same page the moment you no longer want it
+to work.
+
+The endpoint is on by default and needs no configuration to reach from the
+same machine. An instance served under a real hostname must name it:
+
+```toml
+[mcp]
+allowed_hosts = ["cards.example.com"]
+```
+
+Without that, every MCP request is refused and nothing in the log explains
+why. The check is not ours — it is the MCP SDK's protection against a web
+page in a browser driving a local MCP server by pointing its own hostname at
+`127.0.0.1` — and its default of loopback-only is right for an MCP server
+running on a desktop and wrong for one on a server. `enabled = false` turns
+the endpoint off entirely.
+
+What an assistant can and cannot do:
+
+- **Cards, decks, collections and saved decks are writable.** So are a
+  collection's scheduling settings.
+- **The schedule itself is not.** There is no way to make a card be
+  forgotten, set its due date, or suspend it. Reading a card's history and
+  statistics is fine; rewriting them is not on offer.
+- **Nothing it deletes is destroyed.** Everything goes to your trash, and
+  there is no tool that empties it — that is a human action, in the web
+  interface. This is the reason a write token is a reasonable thing to hand
+  out at all.
+
+One thing worth knowing: your cards are text, and an assistant reading them
+is reading text you may not have written. A collection imported from
+somewhere else could contain something shaped like an instruction. That is
+worth a thought before pointing an assistant with a write token at a
+collection you did not write yourself — the trash is what bounds the damage,
+not prevention.
 
 ## Database
 

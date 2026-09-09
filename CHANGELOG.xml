@@ -1,5 +1,51 @@
 <changelog>
     <unreleased>
+        <added>
+            <change author="claude">
+            **An MCP endpoint at `/mcp`,** so an AI assistant can read and
+            write your cards, decks and collections through the same code
+            the web interface runs. Mint a token for yourself at `/tokens`:
+            it is shown once and stored only as a digest, so nobody can read
+            it back out of the server. Every token can write, and anyone
+            holding one can do anything to your cards that you can. Cards,
+            decks, collections, saved decks and a collection's scheduling
+            settings are writable; the schedule itself is not, so there is
+            no way to make a card be forgotten, set its due date or suspend
+            it. Nothing an assistant deletes is destroyed: it goes to the
+            trash, and there is no tool that empties it. The endpoint is on
+            by default and needs no configuration to reach from the same
+            machine, but an instance served under a real hostname **must**
+            name it in `[mcp].allowed_hosts` or every request is refused
+            with nothing in the log to explain it -- the MCP SDK validates
+            the `Host` header against a loopback-only default, as protection
+            against a browser page driving a local MCP server by rebinding
+            DNS at it.
+            </change>
+            <change author="claude">
+            **A trash.** Deleting a file, a folder or a whole collection
+            moves it to `{data_dir}/trash/` instead of destroying it, and
+            `/trash` lists what is in there and restores it. A deleted
+            collection keeps its review history for as long as it is in the
+            trash: card hashes are content addresses, so a restored folder
+            finds its own rows again and its whole schedule comes back with
+            nothing replayed.
+            </change>
+        </added>
+        <breaking>
+            <change author="claude">
+            **Deleting no longer takes effect immediately.** Anything
+            deleted from My Cards goes to the trash and keeps its review
+            rows until you empty it, and emptying the trash is now the only
+            thing in hashcards that destroys anything -- including the
+            review history of any collection in there, which is what still
+            stops a collection recreated under an old name inheriting a
+            stale schedule. Disk space is not reclaimed until you empty it.
+            The refusal of a non-empty folder is gone with the same change:
+            it existed because a misclick was unrecoverable, and it is not
+            any more, so a collection full of topics can be deleted in one
+            action.
+            </change>
+        </breaking>
         <changed>
             <change author="claude">
             **One review database per user, instead of one per collection.**

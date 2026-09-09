@@ -21,6 +21,15 @@ a local CLI tool; the CLI is gone.
 - In `media.rs`: Image references are extracted and validated during collection loading.
 - Files are served via `/file/*path` endpoint, resolved relative to collection directory.
 - Path validation (in `src/media/load.rs`) prevents directory traversal attacks.
+- Deleting moves to `{data_dir}/trash/{tree}/` and leaves the collection's
+  review rows behind as orphans, which every read path ignores. A restore
+  finds them again by content address. Emptying the trash is the only thing
+  that erases them, and the only thing that destroys anything.
+- The MCP tools are adapters over the same functions the web handlers call.
+  Never reimplement one there: the guards (`refuse_if_drilling`, the
+  slug-collision check, the migration gate, `CardRoot`'s path checking) apply
+  to a model only because it is the same code.
+- The MCP has no purge tool, by design, and a test enforces it.
 
 # Layout
 
@@ -28,6 +37,11 @@ a local CLI tool; the CLI is gone.
   `hashcards.toml`. There are no subcommands. A config file is mandatory.
 - `src/cmd/serve/` is the server: routing, handlers, auth, config, editing,
   decks, export, and the startup merge of pre-consolidation databases.
+- `src/cmd/serve/mcp/` is the MCP endpoint at `/mcp`: routing, the bearer
+  middleware, and the tools. `src/auth_db.rs` is its token store, at
+  `{data_dir}/auth.db`. Tokens are minted from `/tokens`
+  (`src/cmd/serve/tokens.rs`).
+- `src/cmd/serve/trash.rs` is the trash; `trash_ui.rs` is its page.
 - `src/cmd/drill/` is the drill engine the server embeds — rendering
   (`get.rs`), actions (`post.rs`), session state, cache, templates and
   static assets. The directory names predate the fork; there is no drill
