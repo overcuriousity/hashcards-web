@@ -552,8 +552,6 @@ fn delete_entry(
 ///
 /// Rows rather than a file: one database holds every collection this user
 /// has, so deleting the file would take all of them.
-// Called by the /trash page's purge, which lands in the next commit.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn erase_collection_rows(
     state: &AppState,
     root: &CardRoot,

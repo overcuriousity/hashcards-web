@@ -17,6 +17,7 @@ mod reviewdb;
 pub mod server;
 mod state;
 mod trash;
+mod trash_ui;
 mod upload;
 
 pub mod stats;

@@ -34,6 +34,7 @@ pub fn render_tree_page(tree: &[TreeEntry], flash: Option<Flash>) -> Markup {
             div.browse-header {
                 a.back-link href="/" { "← Collections" }
                 h1 { "My Cards" }
+                a.back-link href="/trash" { "Trash" }
             }
 
             p.hint {

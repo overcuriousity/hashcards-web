@@ -72,6 +72,10 @@ use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
 use crate::cmd::serve::state::evict_idle_sessions;
 use crate::cmd::serve::stats::collection_stats_handler;
+use crate::cmd::serve::trash_ui::trash_empty_handler;
+use crate::cmd::serve::trash_ui::trash_get_handler;
+use crate::cmd::serve::trash_ui::trash_purge_handler;
+use crate::cmd::serve::trash_ui::trash_restore_handler;
 use crate::cmd::serve::upload::MAX_UPLOAD_BYTES;
 use crate::cmd::serve::upload::media_upload_handler;
 use crate::cmd::signals::terminate_signal;
@@ -281,6 +285,10 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
             "/files/media/{*path}",
             post(media_upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/trash", get(trash_get_handler))
+        .route("/trash/restore", post(trash_restore_handler))
+        .route("/trash/purge", post(trash_purge_handler))
+        .route("/trash/empty", post(trash_empty_handler))
         .route("/decks", get(decks_manage_handler))
         .route("/decks/add", post(deck_add_handler))
         .route("/decks/delete", post(deck_delete_handler))

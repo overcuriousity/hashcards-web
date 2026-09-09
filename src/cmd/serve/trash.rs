@@ -11,11 +11,6 @@
 //! trash is what erases them, and it is the only thing in hashcards that
 //! destroys anything.
 
-// Nothing outside the tests reaches this module yet: `delete_entry` starts
-// trashing, and the /trash page starts restoring and emptying, in the two
-// commits after this one. The attribute comes off with them.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cmp::Reverse;
 use std::fs::read_dir;
 use std::path::Path;
