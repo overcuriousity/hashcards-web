@@ -36,6 +36,8 @@ use crate::cmd::serve::href::encoded_path;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::migrate_sessions;
 use crate::cmd::serve::state::sessions_touching;
+use crate::cmd::serve::trash::TrashKind;
+use crate::cmd::serve::trash::move_to_trash;
 use crate::cmd::serve::upload::MEDIA_DIR;
 use crate::db::Database;
 use crate::error::Fallible;
@@ -170,11 +172,11 @@ fn validate_name(name: &str) -> Fallible<String> {
 /// Refuse a folder that would take the name hashcards keeps a collection's
 /// pasted images under.
 ///
-/// `read_tree` hides such a folder and `non_empty_children` does not count
-/// it, both on the understanding that it is ours. A folder of the user's own
-/// under that name would therefore be invisible in the tree *and* invisible
-/// to the "refuse a non-empty folder" guard, so deleting the collection
-/// would take the decks inside it — and their review database — with it.
+/// `read_tree` hides such a folder, on the understanding that it is ours. A
+/// folder of the user's own under that name would therefore be invisible in
+/// the tree, so deleting the collection would take the decks inside it away
+/// with no sign that anything was in there — which is why `delete_entry`
+/// refuses a collection whose `media` holds card files.
 ///
 /// Only folders, and only directly inside a collection: a deck called
 /// `media.md` is fine, and a collection of the user's own called `media` is
@@ -214,29 +216,6 @@ fn check_media_name(name: &str, is_dir: bool, parent_is_collection_root: bool) -
     }
     Ok(())
 }
-
-/// Names in `dir` that belong to the user, ignoring hashcards' own
-/// bookkeeping. A folder holding only bookkeeping counts as empty.
-///
-/// `is_collection_root` says whether a `media` folder here is ours: the
-/// images belong to the cards, so a collection whose decks are all gone is
-/// empty even while their pictures are still on disk.
-fn non_empty_children(dir: &Path, is_collection_root: bool) -> Fallible<Vec<String>> {
-    let mut kept = Vec::new();
-    for entry in read_dir(dir)? {
-        let name = entry?.file_name().into_string().unwrap_or_default();
-        if name.starts_with('.') || name == COLLECTION_META_FILE {
-            continue;
-        }
-        if is_collection_root && name == MEDIA_DIR {
-            continue;
-        }
-        kept.push(name);
-    }
-    kept.sort();
-    Ok(kept)
-}
-
 /// The local tree belonging to the caller, created if it is not there yet.
 pub fn user_root(state: &AppState, user: Option<&CurrentUser>) -> Fallible<CardRoot> {
     let data_dir = data_dir(state)?;
@@ -523,66 +502,63 @@ fn delete_entry(
         return fail(format!("`{rel}` does not exist."));
     }
     // A live session drills the cards it cached when it started and writes
-    // its grades to the collection's database. Deleting either underneath it
-    // strands those grades — the database file is unlinked while the session
-    // still holds it open — so the same guard `save_file` uses applies here.
+    // its grades to the collection's database. Moving either underneath it
+    // strands those grades, so the same guard `save_file` uses applies here
+    // -- the trash makes a deletion undoable, not invisible to a session
+    // that is mid-drill.
     refuse_if_drilling(state, &root, &rel)?;
-    if target.is_dir() {
+
+    let data_dir = data_dir(state)?;
+    let (kind, id) = if target.is_dir() {
         let is_collection_root = !rel.contains('/');
         // `media` does not make a collection count as non-empty, and it is
-        // hidden from the tree — both because hashcards put it there. One
+        // hidden from the tree -- both because hashcards put it there. One
         // made by hand before that name was reserved can hold decks, and
         // those would go with the collection having never been listed at
-        // all. Say where they are instead of deleting them.
+        // all. Say where they are instead of moving them somewhere else
+        // the person who made them will not think to look.
         if is_collection_root && holds_decks(&target.join(MEDIA_DIR))? {
             return fail(format!(
                 "`{rel}/{MEDIA_DIR}` holds card files. That folder is where hashcards keeps a \
-                 collection's pasted images, so it is not shown here — move the files out of it \
+                 collection's pasted images, so it is not shown here -- move the files out of it \
                  from outside hashcards before deleting this collection."
             ));
         }
-        // Refuse a non-empty folder: deleting a whole collection on a
-        // misclick would take its review history with it.
-        let kept = non_empty_children(&target, is_collection_root)?;
-        if !kept.is_empty() {
-            return fail(format!(
-                "`{rel}` is not empty — it still holds {}. Delete those first.",
-                kept.join(", ")
-            ));
-        }
-        // A top-level folder is a collection: its `.hashcards.toml` goes
-        // with it, so leaving its rows behind would orphan a history that
-        // nothing can ever address again — and a folder recreated under the
-        // same name would silently start its history over.
-        //
-        // The id is read first because it lives in the folder, but the rows
-        // are erased *after* it: if `remove_dir_all` fails, the collection
-        // is still there and must still have its history.
-        let id = if is_collection_root {
-            existing_collection_id(&target)?
+        if is_collection_root {
+            (TrashKind::Collection, existing_collection_id(&target)?)
         } else {
-            None
-        };
-        std::fs::remove_dir_all(&target)?;
-        if let Some(id) = id {
-            remove_collection_rows(state, &root, &id)?;
+            (TrashKind::Folder, None)
         }
     } else {
-        std::fs::remove_file(&target)?;
-    }
-    Ok(format!("Deleted `{rel}`."))
+        (TrashKind::File, None)
+    };
+
+    // The rows stay behind. A card hash is a content address, so restoring
+    // this folder addresses its own rows again and the whole review history
+    // comes back with nothing to replay; until then they are orphans, which
+    // every read path already ignores. Emptying the trash is what erases
+    // them -- which is also where "a collection recreated under an old name
+    // must start fresh" now lives.
+    move_to_trash(&data_dir, &root, &rel, kind, id, Timestamp::now())?;
+    Ok(format!("Moved `{rel}` to the trash."))
 }
 
 /// Erase the review history of the collection whose id is `id`.
 ///
-/// Called after the folder itself is gone: a folder with no id never had
-/// rows to begin with, and one whose removal failed still needs its history.
+/// Called when a trashed collection is purged -- never on deletion, which
+/// leaves the rows behind on purpose so a restore can find them. This is
+/// the only path that erases them, and purging is the only thing in
+/// hashcards that destroys anything.
 ///
 /// Rows rather than a file: one database holds every collection this user
-/// has, so deleting the file would take all of them — and deleting nothing,
-/// which is what the old path-based removal did after consolidation, left
-/// rows nothing could ever address again.
-fn remove_collection_rows(state: &AppState, root: &CardRoot, id: &CollectionId) -> Fallible<()> {
+/// has, so deleting the file would take all of them.
+// Called by the /trash page's purge, which lands in the next commit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn erase_collection_rows(
+    state: &AppState,
+    root: &CardRoot,
+    id: &CollectionId,
+) -> Fallible<()> {
     let db_dir = match &state.config.data_dir {
         Some(d) => d.join("db"),
         None => return Ok(()),
@@ -1032,6 +1008,10 @@ fn collections_for(
 mod tests {
     use super::*;
     use crate::cmd::serve::cards::CardRoot;
+    use crate::cmd::serve::trash::TrashKind;
+    use crate::cmd::serve::trash::list_trash;
+    use crate::cmd::serve::trash::purge_entry;
+    use crate::cmd::serve::trash::restore_from_trash;
     use crate::helper::create_tmp_directory;
     use crate::types::collection_id::CollectionId;
     use crate::user_db::UserDatabase;
@@ -1086,26 +1066,6 @@ mod tests {
         assert!(validate_name("..").is_err());
         assert!(validate_name("").is_err());
         assert!(validate_name(COLLECTION_META_FILE).is_err());
-    }
-
-    #[test]
-    fn a_non_empty_folder_is_not_deleted() -> Fallible<()> {
-        let dir = create_tmp_directory()?;
-        let root = CardRoot::for_user(&dir, None)?;
-        let folder = root.path().join("Spanish");
-        std::fs::create_dir_all(&folder)?;
-        std::fs::write(folder.join("verbs.md"), "Q: a\nA: b\n")?;
-        // The metadata file alone must not count as "non-empty".
-        std::fs::write(folder.join(COLLECTION_META_FILE), "id = \"x\"\n")?;
-
-        assert_eq!(
-            non_empty_children(&folder, true)?,
-            vec!["verbs.md".to_string()]
-        );
-
-        std::fs::remove_file(folder.join("verbs.md"))?;
-        assert!(non_empty_children(&folder, true)?.is_empty());
-        Ok(())
     }
 
     #[test]
@@ -1393,52 +1353,6 @@ mod tests {
         };
         save_file(&state, None, "Spanish/verbs.md", &form)?;
         assert_eq!(std::fs::read_to_string(&path)?, fixed);
-        Ok(())
-    }
-
-    #[test]
-    fn deleting_a_collection_folder_removes_its_review_database() -> Fallible<()> {
-        // Otherwise the collection's rows are orphaned in the user's
-        // database while a folder recreated under the same name silently
-        // starts its history over.
-        let dir = create_tmp_directory()?;
-        let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
-        let root = user_root(&state, None)?;
-        let id = collection_id(&root.path().join("Spanish"))?;
-        let db_dir = dir.join("db");
-        ensure_dir(&db_dir, "review database directory")?;
-        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
-        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
-        user.collection(id.clone())
-            .insert_card(hash, Timestamp::now())?;
-
-        // The seeded template has to go: a non-empty collection is refused.
-        for entry in std::fs::read_dir(root.path().join("Spanish"))?.flatten() {
-            if entry.path().is_file() && entry.file_name() != COLLECTION_META_FILE {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
-        assert!(!root.path().join("Spanish").exists());
-        assert!(
-            user.collection(id).card_hashes()?.is_empty(),
-            "the collection's review history is orphaned"
-        );
         Ok(())
     }
 
@@ -1843,9 +1757,11 @@ mod tests {
     }
 
     /// Deleting a collection folder used to delete its database file. One
-    /// file per user means deleting its rows instead — and only its rows.
+    /// file per user means erasing its rows instead — and only its rows.
+    /// Deleting no longer erases anything, so the scoping this guards now
+    /// belongs to the purge.
     #[test]
-    fn deleting_a_collection_erases_its_rows_and_no_others() -> Fallible<()> {
+    fn purging_a_collection_erases_its_rows_and_no_others() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = crate::cmd::serve::state::test_support::state_with_data_dir(dir.clone());
         let root = CardRoot::for_user(&dir, None)?;
@@ -1865,8 +1781,6 @@ mod tests {
         user.collection(bio.clone()).insert_card(hash, now)?;
         user.collection(esp.clone()).insert_card(hash, now)?;
 
-        // Empty the folder first: a non-empty collection is refused.
-        std::fs::remove_file(root.path().join("Biology").join("Deck.md"))?;
         delete_entry(
             &state,
             None,
@@ -1874,9 +1788,20 @@ mod tests {
                 path: "Biology".to_string(),
             },
         )?;
+        // Still there: deleting trashes, and a restore needs these.
+        assert!(user.collection(bio.clone()).card_hashes()?.contains(&hash));
+
+        let trashed = list_trash(&dir, "default")?;
+        assert_eq!(trashed.len(), 1);
+        let erased = purge_entry(&dir, "default", &trashed[0].id)?;
+        assert_eq!(erased.as_ref(), Some(&bio));
+        erase_collection_rows(&state, &root, &bio)?;
 
         assert!(user.collection(bio).card_hashes()?.is_empty());
-        assert!(user.collection(esp).card_hashes()?.contains(&hash));
+        assert!(
+            user.collection(esp).card_hashes()?.contains(&hash),
+            "purging one collection took another's rows with it"
+        );
         Ok(())
     }
 
@@ -1899,12 +1824,10 @@ mod tests {
         Ok(())
     }
 
-    /// `read_tree` hides a `media` folder inside a collection and
-    /// `non_empty_children` does not count it, both because it is ours. A
-    /// folder of the user's own under that name would be invisible to the
-    /// tree *and* to the "refuse a non-empty folder" guard, so deleting the
-    /// collection would silently take the decks inside it — and their review
-    /// history — with it.
+    /// `read_tree` hides a `media` folder inside a collection, because it
+    /// is ours. A folder of the user's own under that name would be
+    /// invisible in the tree, so deleting the collection would carry the
+    /// decks inside it off with no sign they were ever there.
     #[test]
     fn a_user_folder_inside_a_collection_may_not_be_called_media() -> Fallible<()> {
         let dir = create_tmp_directory()?;
@@ -2109,7 +2032,11 @@ mod tests {
 
     /// `CardRoot::resolve` normalizes a path while the collection checks
     /// used to split the raw one, so `./Spanish` was deleted as if it were
-    /// nested: no id read, and its review rows left orphaned.
+    /// nested: no id read, and its review rows left orphaned with nothing
+    /// able to address them. Now that deleting trashes rather than erases,
+    /// the manifest is where that mistake would show: a collection taken
+    /// for a nested folder is trashed without an id, and no restore could
+    /// ever reunite it with its history.
     #[test]
     fn a_dotted_path_is_still_recognized_as_a_collection_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
@@ -2156,9 +2083,17 @@ mod tests {
             },
         )?;
         assert!(!folder.exists());
+        // The id proves the dotted path was recognised as a collection
+        // root: only that branch reads one, and a folder taken for a nested
+        // one would be trashed as a plain folder with no id at all -- so a
+        // later restore could never find its rows again.
+        let trashed = list_trash(&dir, "default")?;
+        assert_eq!(trashed.len(), 1);
+        assert!(matches!(trashed[0].kind, TrashKind::Collection));
+        assert_eq!(trashed[0].collection_id.as_ref(), Some(&id));
         assert!(
-            user.collection(id).card_hashes()?.is_empty(),
-            "the collection's review history is orphaned"
+            user.collection(id).card_hashes()?.contains(&hash),
+            "the rows a restore would need are gone"
         );
         Ok(())
     }
@@ -2188,6 +2123,171 @@ mod tests {
             },
         )?;
         assert!(!folder.exists());
+        Ok(())
+    }
+
+    /// Deleting a collection no longer erases its rows: they stay as
+    /// orphans, which is what lets a restore bring the review history back
+    /// with nothing to replay. Purging is what erases them.
+    #[test]
+    fn deleting_a_collection_trashes_it_and_keeps_its_rows() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = state_for(&dir);
+        create_entry(
+            &state,
+            None,
+            &NewEntryForm {
+                parent: String::new(),
+                name: "Spanish".to_string(),
+            },
+            true,
+        )?;
+        let root = user_root(&state, None)?;
+        let id = collection_id(&root.path().join("Spanish"))?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
+
+        delete_entry(
+            &state,
+            None,
+            &DeleteForm {
+                path: "Spanish".to_string(),
+            },
+        )?;
+
+        assert!(!root.path().join("Spanish").exists());
+        assert_eq!(
+            user.collection(id).card_hashes()?.len(),
+            1,
+            "the rows a restore would need are gone"
+        );
+        let trashed = list_trash(&dir, "default")?;
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].original_path, "Spanish");
+        assert!(matches!(trashed[0].kind, TrashKind::Collection));
+        Ok(())
+    }
+
+    /// The whole point of leaving the rows behind.
+    #[test]
+    fn restoring_a_collection_brings_its_review_history_back() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = state_for(&dir);
+        create_entry(
+            &state,
+            None,
+            &NewEntryForm {
+                parent: String::new(),
+                name: "Spanish".to_string(),
+            },
+            true,
+        )?;
+        let root = user_root(&state, None)?;
+        let id = collection_id(&root.path().join("Spanish"))?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
+
+        delete_entry(
+            &state,
+            None,
+            &DeleteForm {
+                path: "Spanish".to_string(),
+            },
+        )?;
+        let trashed = list_trash(&dir, "default")?;
+        restore_from_trash(&dir, &root, &trashed[0].id)?;
+
+        assert!(root.path().join("Spanish").exists());
+        let back = collection_id(&root.path().join("Spanish"))?;
+        assert_eq!(back, id, "the restored folder has a different id");
+        assert!(
+            user.collection(back).card_hashes()?.contains(&hash),
+            "the review history did not come back"
+        );
+        Ok(())
+    }
+
+    /// Purging is where the concern the old behaviour served now lives: a
+    /// collection recreated after a purge must start fresh.
+    #[test]
+    fn purging_a_trashed_collection_erases_its_rows() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = state_for(&dir);
+        create_entry(
+            &state,
+            None,
+            &NewEntryForm {
+                parent: String::new(),
+                name: "Spanish".to_string(),
+            },
+            true,
+        )?;
+        let root = user_root(&state, None)?;
+        let id = collection_id(&root.path().join("Spanish"))?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
+
+        delete_entry(
+            &state,
+            None,
+            &DeleteForm {
+                path: "Spanish".to_string(),
+            },
+        )?;
+        let trashed = list_trash(&dir, "default")?;
+        let erased = purge_entry(&dir, "default", &trashed[0].id)?;
+        assert_eq!(erased.as_ref(), Some(&id));
+        erase_collection_rows(&state, &root, &id)?;
+
+        assert!(user.collection(id).card_hashes()?.is_empty());
+        Ok(())
+    }
+
+    /// The refusal that was lifted. A collection full of decks goes to the
+    /// trash in one move, because getting it back is now one click.
+    #[test]
+    fn a_non_empty_collection_can_be_deleted() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = state_for(&dir);
+        create_entry(
+            &state,
+            None,
+            &NewEntryForm {
+                parent: String::new(),
+                name: "Spanish".to_string(),
+            },
+            true,
+        )?;
+        let root = user_root(&state, None)?;
+        std::fs::write(
+            root.path().join("Spanish").join("verbs.md"),
+            "Q: hablar\nA: to speak\n",
+        )?;
+
+        delete_entry(
+            &state,
+            None,
+            &DeleteForm {
+                path: "Spanish".to_string(),
+            },
+        )?;
+        assert!(!root.path().join("Spanish").exists());
+
+        let trashed = list_trash(&dir, "default")?;
+        restore_from_trash(&dir, &root, &trashed[0].id)?;
+        assert!(root.path().join("Spanish/verbs.md").is_file());
         Ok(())
     }
 }
