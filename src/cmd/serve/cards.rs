@@ -16,6 +16,7 @@ use crate::cmd::serve::config::slugify;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::MaxInterval;
 use crate::utils::ensure_dir;
@@ -252,7 +253,7 @@ fn override_number(value: &toml::Value, what: &str, meta_path: &Path) -> Option<
 /// slug, so renaming a folder keeps its review history. Ids are derived from
 /// the clock and the process id rather than from the name, precisely so that
 /// a rename cannot change them.
-pub fn collection_id(folder: &Path) -> Fallible<String> {
+pub fn collection_id(folder: &Path) -> Fallible<CollectionId> {
     if let Some(id) = existing_collection_id(folder)? {
         return Ok(id);
     }
@@ -264,7 +265,7 @@ pub fn collection_id(folder: &Path) -> Fallible<String> {
         max_interval_days: None,
     };
     write(&meta_path, toml::to_string(&meta)?)?;
-    Ok(id)
+    CollectionId::new(id)
 }
 
 /// Eight hex characters derived from the clock, the process id and the
@@ -297,7 +298,7 @@ pub enum IdPolicy {
 /// one a user is invited to hand-edit. Only a file with no recognisable id
 /// at all is an error — and it has to be, because the alternative is minting
 /// a fresh id and writing over whatever the user was in the middle of.
-pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
+pub fn existing_collection_id(folder: &Path) -> Fallible<Option<CollectionId>> {
     let meta_path = folder.join(COLLECTION_META_FILE);
     if !meta_path.exists() {
         return Ok(None);
@@ -324,7 +325,7 @@ pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
     if meta.id.is_empty() {
         return Ok(None);
     }
-    Ok(Some(meta.id))
+    Ok(Some(CollectionId::new(meta.id)?))
 }
 
 /// The `id` of a metadata file the TOML parser has rejected.
@@ -333,7 +334,7 @@ pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
 /// legible however badly the rest of the file has been mangled. Nothing else
 /// is recovered this way: the overrides are preferences and can wait for the
 /// file to be fixed, whereas the id cannot be guessed again.
-fn salvage_id(text: &str) -> Option<String> {
+fn salvage_id(text: &str) -> Option<CollectionId> {
     text.lines().find_map(|line| {
         let value = line.trim_start().strip_prefix("id")?.trim_start();
         let value = value.strip_prefix('=')?.trim();
@@ -342,7 +343,7 @@ fn salvage_id(text: &str) -> Option<String> {
             return None;
         }
         let id = value[quote.len_utf8()..].split(quote).next()?;
-        (!id.is_empty()).then(|| id.to_string())
+        CollectionId::new(id).ok()
     })
 }
 
@@ -445,7 +446,7 @@ pub fn discover_all_collections(data_dir: &Path) -> Vec<ResolvedCollection> {
 
 /// The id of one folder under `policy`. `None` means "no id yet, and this
 /// caller may not create one".
-fn folder_id(path: &Path, policy: IdPolicy) -> Fallible<Option<String>> {
+fn folder_id(path: &Path, policy: IdPolicy) -> Fallible<Option<CollectionId>> {
     match policy {
         IdPolicy::CreateMissing => Ok(Some(collection_id(path)?)),
         IdPolicy::ExistingOnly => existing_collection_id(path),
@@ -594,7 +595,7 @@ mod tests {
         let first = collection_id(&folder)?;
         let second = collection_id(&folder)?;
         assert_eq!(first, second);
-        assert_eq!(first.len(), 8);
+        assert_eq!(first.as_str().len(), 8);
         assert!(folder.join(COLLECTION_META_FILE).exists());
         Ok(())
     }

@@ -45,6 +45,7 @@ use crate::parser::ParsedFile;
 use crate::parser::Parser;
 use crate::parser::strip_frontmatter_with_offset;
 use crate::types::card::Card;
+use crate::types::collection_id::CollectionId;
 use crate::types::performance::Performance;
 use crate::types::timestamp::Timestamp;
 use crate::utils::ensure_dir;
@@ -575,7 +576,7 @@ fn delete_entry(
 /// Called after the folder itself is gone: a folder with no id never had a
 /// database to begin with, and one whose removal failed still needs its
 /// history.
-fn remove_collection_database(state: &AppState, id: &str) -> Fallible<()> {
+fn remove_collection_database(state: &AppState, id: &CollectionId) -> Fallible<()> {
     let db_dir = match &state.config.data_dir {
         Some(d) => d.join("db"),
         None => return Ok(()),
