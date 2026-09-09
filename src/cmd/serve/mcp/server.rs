@@ -76,7 +76,7 @@ impl HashcardsMcp {
             state,
             // Groups are added here as later commits land:
             //   Self::read_router() + Self::card_router() + ...
-            tool_router: Self::read_router(),
+            tool_router: Self::read_router() + Self::card_router(),
         }
     }
 
