@@ -53,7 +53,7 @@ fn bookmark_list_inner(
 ) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(state, &rc)?)?;
     let bookmarks = collection.db.list_bookmarks()?;
     let cards_by_hash: HashMap<CardHash, &Card> =
         collection.cards.iter().map(|c| (c.hash(), c)).collect();
@@ -209,7 +209,7 @@ fn bookmark_delete_inner(
 ) -> Fallible<()> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(state, &rc)?)?;
     let hash = CardHash::from_hex(hash_hex)?;
     collection.db.delete_bookmark(hash)?;
     Ok(())
@@ -251,7 +251,7 @@ fn bookmark_note_inner(
 ) -> Fallible<()> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(state, &rc)?)?;
     let hash = CardHash::from_hex(hash_hex)?;
     let note = if note.trim().is_empty() {
         None

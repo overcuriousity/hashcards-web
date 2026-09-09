@@ -57,7 +57,7 @@ pub async fn collection_stats_handler(
 fn stats_inner(state: &AppState, slug: &str, owner: Option<&str>) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(state, &rc)?)?;
     let stats = gather_stats(&collection.db, &collection.cards, Date::today())?;
     let back = format!("/collection/{slug}");
     let body = render_stats_page(&rc.name, &stats, Some(&back));

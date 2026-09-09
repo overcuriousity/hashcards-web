@@ -65,7 +65,7 @@ use crate::cmd::serve::handlers::collection_post_handler;
 use crate::cmd::serve::handlers::collection_script_handler;
 use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
-use crate::cmd::serve::reviewdb::open_collection_db;
+use crate::cmd::serve::merge::merge_legacy_databases;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
@@ -77,6 +77,7 @@ use crate::cmd::signals::terminate_signal;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::timestamp::Timestamp;
+use crate::user_db::UserDatabase;
 use crate::utils::ensure_dir;
 
 /// How long a session's heartbeat must have been silent before the startup
@@ -101,7 +102,10 @@ const SESSION_STALE_MINUTES: i64 = 60;
 /// browser's problem to report, not a reason to refuse to serve everything
 /// else. Each database is independent, so the sweeps run on their own
 /// threads rather than one after another.
-fn sweep_dangling_sessions(data_dir: &Path) -> HashMap<PathBuf, usize> {
+fn sweep_dangling_sessions(
+    data_dir: &Path,
+    failures: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, usize> {
     // Only sessions whose heartbeat has been silent this long are presumed
     // dead. A session in another process stamps its heartbeat as the user
     // works, so a live one is never swept out from under it.
@@ -113,8 +117,18 @@ fn sweep_dangling_sessions(data_dir: &Path) -> HashMap<PathBuf, usize> {
             .iter()
             .map(|rc| {
                 scope.spawn(move || {
-                    let closed = open_collection_db(rc)
-                        .and_then(|db| db.close_dangling_sessions(stale_before));
+                    if failures.contains_key(&rc.db_path) {
+                        // Already reported at startup, and the file is not
+                        // what it should be. Do not write to it.
+                        return (rc.db_path.clone(), Ok(0));
+                    }
+                    // Not `open_collection_db`: the sweep runs before
+                    // `AppState` exists, so it consults the failure map
+                    // directly, just above.
+                    let closed = UserDatabase::open(&rc.db_path).and_then(|user| {
+                        user.collection(rc.collection_id.clone())
+                            .close_dangling_sessions(stale_before)
+                    });
                     (rc.db_path.clone(), closed)
                 })
             })
@@ -186,13 +200,31 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
     let bind = format!("{}:{}", config.host, config.port);
 
     let config = Arc::new(config);
+
+    // The upgrade: fold any pre-consolidation per-collection databases into
+    // one database per user. Before the sweep, which opens the databases
+    // this produces. A tree whose merge failed is recorded rather than
+    // fatal: one broken file must not take an instance down for everybody.
+    let migration_failures = match &config.data_dir {
+        Some(data_dir) => merge_legacy_databases(data_dir),
+        None => HashMap::new(),
+    };
+    for (path, why) in &migration_failures {
+        log::error!(
+            "The review database at {} was not consolidated ({why}). The collections that use it \
+             will refuse to open until this is fixed; their previous databases have not been \
+             deleted.",
+            path.display()
+        );
+    }
+
     // FEAT-03: close session rows left open by a crash or restart, once, at
     // startup. They cannot be resumed (the card queue lives only in memory),
     // so they are closed with all persisted reviews kept. This must not run
     // per request: the predicate cannot distinguish a crashed session from a
-    // live one, and a CLI `drill` may be running against the same database.
+    // live one, and a second server may share the same database.
     let interrupted_closed = match &config.data_dir {
-        Some(data_dir) => sweep_dangling_sessions(data_dir),
+        Some(data_dir) => sweep_dangling_sessions(data_dir, &migration_failures),
         None => HashMap::new(),
     };
 
@@ -218,6 +250,7 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         custom_decks: Arc::new(Mutex::new(custom_decks)),
         config_path,
         interrupted_closed: Arc::new(Mutex::new(interrupted_closed)),
+        migration_failures: Arc::new(migration_failures),
         session_key: session_key(config.oidc.as_ref())?,
         oidc,
     };
@@ -465,7 +498,7 @@ mod tests {
             db_paths.push(db_path);
         }
 
-        let counts = sweep_dangling_sessions(&data_dir);
+        let counts = sweep_dangling_sessions(&data_dir, &HashMap::new());
         assert_eq!(counts.len(), 2, "each user's collection swept separately");
         for db_path in &db_paths {
             assert_eq!(counts.get(db_path), Some(&1), "{}", db_path.display());

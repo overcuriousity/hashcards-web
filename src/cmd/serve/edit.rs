@@ -377,7 +377,7 @@ fn edit_post_inner(
 
     let plan = plan_hash_migration(&old_cards, &new_at_block);
 
-    let db = open_collection_db(&rc)?;
+    let db = open_collection_db(state, &rc)?;
     let now = Timestamp::now();
 
     // One transaction, so a failure part-way through cannot leave the
@@ -812,7 +812,7 @@ mod tests {
         let old_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(old_cards.len(), 2);
         {
-            let db = open_collection_db(&rc)?;
+            let db = open_collection_db(&state, &rc)?;
             let now = Timestamp::now();
             for c in &old_cards {
                 db.insert_card_if_new(c.hash(), now)?;
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(outcome.skipped, 1);
 
         // The second card keeps its history, and nothing was left dangling.
-        let db = open_collection_db(&rc)?;
+        let db = open_collection_db(&state, &rc)?;
         assert!(db.card_exists(old_cards[1].hash())?);
         Ok(())
     }
@@ -866,7 +866,7 @@ mod tests {
         let hash_hex = old_hash.to_hex();
 
         {
-            let db = open_collection_db(&rc)?;
+            let db = open_collection_db(&state, &rc)?;
             db.insert_card_if_new(old_hash, Timestamp::now())?;
         }
 
@@ -891,7 +891,7 @@ mod tests {
 
         let new_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(new_cards.len(), 1);
-        let db = open_collection_db(&rc)?;
+        let db = open_collection_db(&state, &rc)?;
         assert!(
             db.card_exists(new_cards[0].hash())?,
             "history must have followed the card to its new hash"
@@ -916,7 +916,7 @@ mod tests {
 
         // Seed the DB with both pre-edit cards.
         {
-            let db = open_collection_db(&rc)?;
+            let db = open_collection_db(&state, &rc)?;
             let now = Timestamp::now();
             for c in &old_cards {
                 db.insert_card_if_new(c.hash(), now)?;
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(outcome.skipped, 0);
 
         // Every post-edit hash is in the DB; no pre-edit hash remains.
-        let db = open_collection_db(&rc)?;
+        let db = open_collection_db(&state, &rc)?;
         let new_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(new_cards.len(), 2);
         for c in &new_cards {

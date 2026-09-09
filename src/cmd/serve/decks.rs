@@ -190,17 +190,21 @@ pub(super) struct DeckChoices {
 ///
 /// A collection that fails to load is skipped rather than failing the page:
 /// one broken markdown file should not make every other deck unpickable.
-pub(super) fn deck_choices(collections: &[ResolvedCollection]) -> Vec<DeckChoices> {
+pub(super) fn deck_choices(
+    state: &AppState,
+    collections: &[ResolvedCollection],
+) -> Vec<DeckChoices> {
     let mut out = Vec::new();
     for rc in collections {
-        let collection =
-            match open_collection_db(rc).and_then(|db| Collection::open(rc.coll_dir.clone(), db)) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("skipping collection '{}' while listing decks: {e}", rc.name);
-                    continue;
-                }
-            };
+        let collection = match open_collection_db(state, rc)
+            .and_then(|db| Collection::open(rc.coll_dir.clone(), db))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("skipping collection '{}' while listing decks: {e}", rc.name);
+                continue;
+            }
+        };
         let mut deck_names: Vec<String> = collection
             .cards
             .iter()
@@ -347,7 +351,7 @@ pub async fn decks_manage_handler(
     let state2 = state.clone();
     let owner2 = owner.clone();
     let choices = match tokio::task::spawn_blocking(move || {
-        deck_choices(&owned_collections(&state2, owner2.as_deref()))
+        deck_choices(&state2, &owned_collections(&state2, owner2.as_deref()))
     })
     .await
     {

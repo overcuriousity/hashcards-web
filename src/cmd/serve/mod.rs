@@ -702,6 +702,70 @@ A: 2
         Ok(())
     }
 
+    /// A server started on a data directory seeded with pre-consolidation
+    /// databases serves the review history they hold. This is the upgrade,
+    /// end to end.
+    #[tokio::test]
+    async fn test_legacy_databases_are_merged_at_startup() -> Fallible<()> {
+        let port = pick_unused_port().unwrap();
+        let dir = tempdir()?;
+        let slug = "legacy-collection".to_string();
+        let (folder, _db_path, id) =
+            card_collection(dir.path(), &slug, &[("Deck.md", "Q: What is 1+1?\nA: 2\n")])?;
+
+        // The card, hashed exactly as the old database would have had it.
+        let parsed = crate::parser::parse_deck(&folder)?;
+        let hash = parsed.cards[0].hash().to_hex();
+
+        // A pre-consolidation database for that collection, with one review
+        // and a due date far in the future.
+        {
+            let legacy = crate::db::test_support::create_legacy_v7(
+                &dir.path().join("db").join(format!("{id}.db")),
+            )?;
+            legacy.execute(
+                "insert into cards (card_hash, added_at, due_date, review_count) \
+                 values (?, '2026-01-01T09:00:00.000', '2099-01-01', 1);",
+                rusqlite::params![hash],
+            )?;
+            legacy.execute(
+                "insert into sessions (session_id, started_at, ended_at) \
+                 values (1, '2026-01-01T09:00:00.000', '2026-01-01T09:30:00.000');",
+                [],
+            )?;
+            legacy.execute(
+                "insert into reviews (session_id, card_hash, reviewed_at, grade, stability, \
+                 difficulty, interval_raw, interval_days, due_date) values \
+                 (1, ?, '2026-01-01T09:00:00.000', 'good', 2.0, 5.0, 2.0, 2, '2099-01-01');",
+                rusqlite::params![hash],
+            )?;
+        }
+
+        serve_data_dir(dir.path(), port).await?;
+
+        // The card is scheduled far in the future, so the collection page
+        // must report nothing due — which it can only know from the merged
+        // history. Without the merge it would be a brand-new card, and due.
+        let body = reqwest::get(format!("http://{TEST_HOST}:{port}/collection/{slug}"))
+            .await?
+            .text()
+            .await?;
+        assert!(
+            !body.contains("1 due"),
+            "the merged review history must be in force: {body}"
+        );
+        // And the source is kept.
+        assert!(
+            dir.path()
+                .join("db")
+                .join("legacy")
+                .join(format!("{id}.db"))
+                .exists(),
+            "the source database must be kept, not deleted"
+        );
+        Ok(())
+    }
+
     /// FEAT-03: a dangling DB session row (left by a crash/restart) is closed
     /// and reported on the deck browser page. It cannot be rehydrated: the
     /// card queue only exists in memory.

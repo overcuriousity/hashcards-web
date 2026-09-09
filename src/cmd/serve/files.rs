@@ -853,6 +853,16 @@ fn save_file(
     };
     ensure_dir(&db_dir, "review database directory")?;
     let (db_path, id) = db_target_for(&root, &coll_dir, &db_dir)?;
+    // The same gate the read paths use. Writing card rows into a database
+    // whose startup merge failed would collide with the rows the next merge
+    // still has to import, and leave the tree stuck unmerged.
+    if let Some(why) = state.migration_failures.get(&db_path) {
+        return fail(format!(
+            "Not saved — this account's review databases could not be consolidated when the \
+             server started: {why}. Nothing has been lost; ask whoever runs this server to check \
+             the startup log."
+        ));
+    }
     let db = UserDatabase::open(&db_path)?.collection(id);
 
     write_atomic(&path, &form.content)?;

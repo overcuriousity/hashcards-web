@@ -140,7 +140,7 @@ fn collection_get_inner(
         // rather than the collection's deck tree.
         if let Some(deck) = find_custom_deck(&state.custom_decks.lock(), slug, owner) {
             let sources = deck_sources(state, &deck, owner);
-            let due = due_card_count(&sources)?;
+            let due = due_card_count(state, &sources)?;
             return Ok(render_custom_deck_page(&deck, &sources, due, flash).into_string());
         }
         // No active session: show the deck browser.
@@ -149,8 +149,8 @@ fn collection_get_inner(
         // Two views, because `build_deck_tree` consumes the one it is
         // given. They share the user's connection, so this is not a second
         // writer on the file.
-        let browse = build_deck_tree(&rc.coll_dir, open_collection_db(&rc)?)?;
-        let db = open_collection_db(&rc)?;
+        let browse = build_deck_tree(&rc.coll_dir, open_collection_db(state, &rc)?)?;
+        let db = open_collection_db(state, &rc)?;
         // FEAT-03: report the session rows the startup sweep closed. The
         // sweep itself runs once, at startup: it cannot tell a crashed
         // session from a live one, and a second server may share the same
@@ -643,8 +643,8 @@ pub(super) fn create_session_from_sources(
 
 /// How many of a custom deck's cards are due today, across every collection
 /// it draws on.
-fn due_card_count(sources: &[SessionSourceSpec]) -> Fallible<usize> {
-    Ok(deck_card_counts(sources)?.0)
+fn due_card_count(state: &AppState, sources: &[SessionSourceSpec]) -> Fallible<usize> {
+    Ok(deck_card_counts(state, sources)?.0)
 }
 
 /// `(due today, total)` over the topics a custom deck names.
@@ -652,14 +652,17 @@ fn due_card_count(sources: &[SessionSourceSpec]) -> Fallible<usize> {
 /// A deck is a selection, not a collection, so its counts cannot be cached
 /// alongside the collection counts: they are recomputed from the member
 /// collections each time they are shown.
-pub(super) fn deck_card_counts(sources: &[SessionSourceSpec]) -> Fallible<(usize, usize)> {
+pub(super) fn deck_card_counts(
+    state: &AppState,
+    sources: &[SessionSourceSpec],
+) -> Fallible<(usize, usize)> {
     let today = Timestamp::now().date();
     let mut due_total = 0;
     let mut card_total = 0;
     for spec in sources {
         let collection = Collection::open(
             spec.collection.coll_dir.clone(),
-            open_collection_db(&spec.collection)?,
+            open_collection_db(state, &spec.collection)?,
         )?;
         let due: HashSet<CardHash> = collection.db.due_today(today)?;
         let wanted: HashSet<&str> = spec.decks.iter().map(|d| d.as_str()).collect();
@@ -1103,7 +1106,7 @@ mod tests {
         let (state, rc) = test_state(&data_dir)?;
         let slug = rc.slug.clone();
         let started_at = Timestamp::now();
-        let db = open_collection_db(&rc)?;
+        let db = open_collection_db(&state, &rc)?;
         let session_id = db.create_session(started_at)?;
         let mutable = MutableState::new(
             SessionDbs::single(
@@ -1294,8 +1297,8 @@ mod tests {
         }
 
         // Each collection's own database recorded exactly its own review.
-        let alpha_db = open_collection_db(&alpha)?;
-        let beta_db = open_collection_db(&beta)?;
+        let alpha_db = open_collection_db(&state, &alpha)?;
+        let beta_db = open_collection_db(&state, &beta)?;
         let alpha_reviews: usize = alpha_db
             .get_all_sessions()?
             .iter()

@@ -72,6 +72,15 @@ pub struct AppState {
     /// Keyed by database path, not by slug: two users may each own a
     /// collection called "Spanish".
     pub interrupted_closed: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    /// Users whose startup merge failed, keyed by their review database's
+    /// path and holding the error to show them.
+    ///
+    /// Their collections refuse to open rather than starting from an empty
+    /// database. A merge that half-succeeded is a transaction that rolled
+    /// back, so no rows were lost — but the sources are still in place and
+    /// the target is not what it should be, and serving that as though it
+    /// were a fresh account is how a person concludes their history is gone.
+    pub migration_failures: Arc<HashMap<PathBuf, String>>,
     /// Signs the OIDC session and login-flow cookies. When `[oidc]` is not
     /// configured this key is generated randomly at startup and never used
     /// — keeping it non-optional avoids threading `Option` through every
@@ -310,6 +319,7 @@ pub mod test_support {
             custom_decks: Arc::new(Mutex::new(Vec::new())),
             config_path: Arc::new(Mutex::new(None)),
             interrupted_closed: Arc::new(Mutex::new(HashMap::new())),
+            migration_failures: Arc::new(HashMap::new()),
             session_key: Key::generate(),
             oidc: None,
         }

@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::reviewdb::open_collection_db;
+use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::CollectionInfo;
 use crate::collection::Collection;
 use crate::db::Database;
@@ -18,11 +19,14 @@ use crate::types::timestamp::Timestamp;
 /// Count every collection, reporting a failure as zero rather than taking
 /// the whole listing down: one unreadable collection must not empty the
 /// page for the others.
-pub fn refresh_collection_info(collections: &[ResolvedCollection]) -> Vec<CollectionInfo> {
+pub fn refresh_collection_info(
+    state: &AppState,
+    collections: &[ResolvedCollection],
+) -> Vec<CollectionInfo> {
     let mut infos = Vec::new();
     for rc in collections {
-        let counts =
-            open_collection_db(rc).and_then(|db| compute_collection_counts(&rc.coll_dir, db));
+        let counts = open_collection_db(state, rc)
+            .and_then(|db| compute_collection_counts(&rc.coll_dir, db));
         let (total_cards, due_today) = match counts {
             Ok(counts) => counts,
             Err(e) => {
@@ -95,7 +99,9 @@ mod tests {
             owner: Some("me@example.com".to_string()),
             overrides: Default::default(),
         };
-        let infos = refresh_collection_info(&[rc]);
+        let state =
+            crate::cmd::serve::state::test_support::state_with_data_dir(dir.path().to_path_buf());
+        let infos = refresh_collection_info(&state, &[rc]);
         assert_eq!(infos[0].owner.as_deref(), Some("me@example.com"));
         Ok(())
     }

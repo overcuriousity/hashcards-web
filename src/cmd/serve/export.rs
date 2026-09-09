@@ -115,7 +115,7 @@ fn download_name(slug: &str) -> String {
 fn export_inner(state: &AppState, slug: &str, owner: Option<&str>) -> Fallible<String> {
     let rc = find_collection(state, slug, owner)
         .ok_or_else(|| ErrorReport::new(format!("Unknown collection: {slug}")))?;
-    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(&rc)?)?;
+    let collection = Collection::open(rc.coll_dir.clone(), open_collection_db(state, &rc)?)?;
     let export = get_export(collection)?;
     Ok(serde_json::to_string_pretty(&export)?)
 }
