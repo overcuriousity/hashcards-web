@@ -551,13 +551,13 @@ fn delete_entry(
             ));
         }
         // A top-level folder is a collection: its `.hashcards.toml` goes
-        // with it, so leaving `{id}.db` behind would orphan a database that
+        // with it, so leaving its rows behind would orphan a history that
         // nothing can ever address again — and a folder recreated under the
         // same name would silently start its history over.
         //
-        // The id is read first because it lives in the folder, but the
-        // database is removed *after* it: if `remove_dir_all` fails, the
-        // collection is still there and must still have its history.
+        // The id is read first because it lives in the folder, but the rows
+        // are erased *after* it: if `remove_dir_all` fails, the collection
+        // is still there and must still have its history.
         let id = if is_collection_root {
             existing_collection_id(&target)?
         } else {
@@ -565,7 +565,7 @@ fn delete_entry(
         };
         std::fs::remove_dir_all(&target)?;
         if let Some(id) = id {
-            remove_collection_database(state, &id)?;
+            remove_collection_rows(state, &root, &id)?;
         }
     } else {
         std::fs::remove_file(&target)?;
@@ -573,25 +573,26 @@ fn delete_entry(
     Ok(format!("Deleted `{rel}`."))
 }
 
-/// Delete the review database of the collection whose id is `id`.
+/// Erase the review history of the collection whose id is `id`.
 ///
-/// Called after the folder itself is gone: a folder with no id never had a
-/// database to begin with, and one whose removal failed still needs its
-/// history.
-fn remove_collection_database(state: &AppState, id: &CollectionId) -> Fallible<()> {
+/// Called after the folder itself is gone: a folder with no id never had
+/// rows to begin with, and one whose removal failed still needs its history.
+///
+/// Rows rather than a file: one database holds every collection this user
+/// has, so deleting the file would take all of them — and deleting nothing,
+/// which is what the old path-based removal did after consolidation, left
+/// rows nothing could ever address again.
+fn remove_collection_rows(state: &AppState, root: &CardRoot, id: &CollectionId) -> Fallible<()> {
     let db_dir = match &state.config.data_dir {
         Some(d) => d.join("db"),
         None => return Ok(()),
     };
-    // SQLite leaves the write-ahead log and shared-memory files beside the
-    // database; removing only the database would strand them.
-    for suffix in ["", "-wal", "-shm"] {
-        let path = db_dir.join(format!("{id}.db{suffix}"));
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
+    let path = user_db_path(root, &db_dir)?;
+    if !path.is_file() {
+        // Nothing has ever been drilled in this tree.
+        return Ok(());
     }
-    Ok(())
+    UserDatabase::open(&path)?.collection(id.clone()).erase()
 }
 
 /// Why a file directly in the user's root can be neither drilled nor
@@ -1397,8 +1398,9 @@ mod tests {
 
     #[test]
     fn deleting_a_collection_folder_removes_its_review_database() -> Fallible<()> {
-        // Otherwise `{id}.db` is orphaned in `db/` while a folder recreated
-        // under the same name silently starts its history over.
+        // Otherwise the collection's rows are orphaned in the user's
+        // database while a folder recreated under the same name silently
+        // starts its history over.
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         create_entry(
@@ -1412,10 +1414,19 @@ mod tests {
         )?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
-        let db_path = dir.join("db").join(format!("{id}.db"));
-        std::fs::create_dir_all(dir.join("db"))?;
-        std::fs::write(&db_path, "")?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
 
+        // The seeded template has to go: a non-empty collection is refused.
+        for entry in std::fs::read_dir(root.path().join("Spanish"))?.flatten() {
+            if entry.path().is_file() && entry.file_name() != COLLECTION_META_FILE {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
         delete_entry(
             &state,
             None,
@@ -1424,7 +1435,10 @@ mod tests {
             },
         )?;
         assert!(!root.path().join("Spanish").exists());
-        assert!(!db_path.exists(), "the review database is orphaned");
+        assert!(
+            user.collection(id).card_hashes()?.is_empty(),
+            "the collection's review history is orphaned"
+        );
         Ok(())
     }
 
@@ -1792,13 +1806,13 @@ mod tests {
         )?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
-        // The file `remove_collection_database` acts on: the collection's
-        // own legacy database, not the user's.
-        let db_path = dir
-            .join("db")
-            .join(format!("{}.db", collection_id(&folder)?));
-        ensure_dir(&dir.join("db"), "review database directory")?;
-        std::fs::write(&db_path, "")?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let id = collection_id(&folder)?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
 
         // A read-only parent makes unlinking the folder fail while leaving
         // everything readable, which is exactly the shape of the failure
@@ -1821,10 +1835,48 @@ mod tests {
         if outcome.is_err() {
             assert!(folder.exists(), "the folder survived, as set up");
             assert!(
-                db_path.exists(),
+                user.collection(id).card_hashes()?.contains(&hash),
                 "the folder is still there but its review history is gone"
             );
         }
+        Ok(())
+    }
+
+    /// Deleting a collection folder used to delete its database file. One
+    /// file per user means deleting its rows instead — and only its rows.
+    #[test]
+    fn deleting_a_collection_erases_its_rows_and_no_others() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(dir.clone());
+        let root = CardRoot::for_user(&dir, None)?;
+        for name in ["Biology", "Spanish"] {
+            let folder = root.path().join(name);
+            std::fs::create_dir_all(&folder)?;
+            std::fs::write(folder.join("Deck.md"), "Q: a\nA: b\n")?;
+        }
+        let bio = collection_id(&root.path().join("Biology"))?;
+        let esp = collection_id(&root.path().join("Spanish"))?;
+
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let now = Timestamp::now();
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(bio.clone()).insert_card(hash, now)?;
+        user.collection(esp.clone()).insert_card(hash, now)?;
+
+        // Empty the folder first: a non-empty collection is refused.
+        std::fs::remove_file(root.path().join("Biology").join("Deck.md"))?;
+        delete_entry(
+            &state,
+            None,
+            &DeleteForm {
+                path: "Biology".to_string(),
+            },
+        )?;
+
+        assert!(user.collection(bio).card_hashes()?.is_empty());
+        assert!(user.collection(esp).card_hashes()?.contains(&hash));
         Ok(())
     }
 
@@ -2057,7 +2109,7 @@ mod tests {
 
     /// `CardRoot::resolve` normalizes a path while the collection checks
     /// used to split the raw one, so `./Spanish` was deleted as if it were
-    /// nested: no id read, and `{id}.db` left orphaned in `db/`.
+    /// nested: no id read, and its review rows left orphaned.
     #[test]
     fn a_dotted_path_is_still_recognized_as_a_collection_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
@@ -2073,13 +2125,13 @@ mod tests {
         )?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
-        // The file `remove_collection_database` acts on: the collection's
-        // own legacy database, not the user's.
-        let db_path = dir
-            .join("db")
-            .join(format!("{}.db", collection_id(&folder)?));
-        ensure_dir(&dir.join("db"), "review database directory")?;
-        std::fs::write(&db_path, "")?;
+        let db_dir = dir.join("db");
+        ensure_dir(&db_dir, "review database directory")?;
+        let id = collection_id(&folder)?;
+        let user = UserDatabase::open(&user_db_path(&root, &db_dir)?)?;
+        let hash = crate::types::card_hash::CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
 
         // The same dotted path must also find the session keyed by `Spanish`.
         start_session(&state, &dir, &folder, "Spanish")?;
@@ -2104,7 +2156,10 @@ mod tests {
             },
         )?;
         assert!(!folder.exists());
-        assert!(!db_path.exists(), "the review database is orphaned");
+        assert!(
+            user.collection(id).card_hashes()?.is_empty(),
+            "the collection's review history is orphaned"
+        );
         Ok(())
     }
 
