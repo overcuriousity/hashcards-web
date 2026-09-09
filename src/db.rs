@@ -835,7 +835,6 @@ impl Database {
 /// Only the startup merge calls this. Nothing else may write to these files:
 /// after they have been merged they are moved into `db/legacy/`, and an older
 /// binary writing into one would strand every review it recorded there.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn open_legacy_source(path: &Path) -> Fallible<Connection> {
     let mut conn = Connection::open(path)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;

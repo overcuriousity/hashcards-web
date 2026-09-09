@@ -42,8 +42,6 @@ struct Source {
 /// confined to its own tree: every other user is served normally and the
 /// server starts, because the alternative — refusing to start — takes an
 /// instance down for everybody over one broken file.
-// Wired into start_serve two commits from here.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn merge_legacy_databases(data_dir: &Path) -> HashMap<PathBuf, String> {
     let db_dir = data_dir.join("db");
     let trees_dir = data_dir.join("cards");
