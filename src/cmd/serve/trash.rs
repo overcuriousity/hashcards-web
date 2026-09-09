@@ -284,6 +284,65 @@ fn read_entry(dir: &Path, id: TrashId) -> Fallible<TrashEntry> {
     })
 }
 
+/// Put a trashed entry back where it came from, and return the path it
+/// went to.
+///
+/// The original path is re-resolved through `CardRoot::resolve_entry`
+/// rather than joined raw: it has been sitting on disk in a file somebody
+/// could have edited, so it is checked exactly as hard as a path arriving
+/// from a browser.
+pub fn restore_from_trash(data_dir: &Path, root: &CardRoot, id: &TrashId) -> Fallible<String> {
+    let tree = root.tree_name()?;
+    let dir = entry_dir(data_dir, tree, id);
+    if !dir.is_dir() {
+        return fail("That item is not in the trash any more.");
+    }
+    let entry = read_entry(&dir, id.clone())?;
+    let target = root.resolve_entry(&entry.original_path)?;
+    if target.path.exists() {
+        return fail(format!(
+            "`{}` already exists, so the deleted copy was left in the trash. Rename or move \
+             what is there now, then restore again.",
+            target.rel
+        ));
+    }
+    // The collection this belonged to may itself have been deleted since.
+    if let Some(parent) = target.path.parent() {
+        ensure_dir(parent, "card folder")?;
+    }
+    move_path(&dir.join(CONTENT), &target.path)?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(target.rel)
+}
+
+/// Destroy one trashed entry.
+///
+/// The only thing in hashcards that destroys anything. Returns the
+/// collection whose review rows are now unreachable and must be erased by
+/// the caller -- which cannot happen here, because the trash knows nothing
+/// about databases.
+pub fn purge_entry(data_dir: &Path, tree: &str, id: &TrashId) -> Fallible<Option<CollectionId>> {
+    let dir = entry_dir(data_dir, tree, id);
+    if !dir.is_dir() {
+        return fail("That item is not in the trash any more.");
+    }
+    let entry = read_entry(&dir, id.clone())?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(entry.collection_id)
+}
+
+/// Destroy everything in one user's trash, and name every collection whose
+/// rows the caller must now erase.
+pub fn purge_all(data_dir: &Path, tree: &str) -> Fallible<Vec<CollectionId>> {
+    let mut erased = Vec::new();
+    for entry in list_trash(data_dir, tree)? {
+        if let Some(id) = purge_entry(data_dir, tree, &entry.id)? {
+            erased.push(id);
+        }
+    }
+    Ok(erased)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +503,163 @@ mod tests {
         assert!(TrashId::parse("a/b").is_err());
         assert!(TrashId::parse("").is_err());
         assert!(TrashId::parse("20260909T120000-Spanish").is_ok());
+    }
+
+    #[test]
+    fn a_restored_file_comes_back_where_it_was() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish/verbs.md",
+            TrashKind::File,
+            None,
+            Timestamp::now(),
+        )?;
+        let rel = restore_from_trash(&data_dir, &root, &id)?;
+        assert_eq!(rel, "Spanish/verbs.md");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("Spanish/verbs.md"))?,
+            "Q: hablar\nA: to speak\n"
+        );
+        assert!(list_trash(&data_dir, "default")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_restored_collection_brings_its_id_back_with_it() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        std::fs::write(
+            root.path().join("Spanish/.hashcards.toml"),
+            "id = \"abc12345\"\n",
+        )?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish",
+            TrashKind::Collection,
+            Some(CollectionId::new("abc12345")?),
+            Timestamp::now(),
+        )?;
+        restore_from_trash(&data_dir, &root, &id)?;
+        let meta = std::fs::read_to_string(root.path().join("Spanish/.hashcards.toml"))?;
+        assert!(meta.contains("abc12345"), "{meta}");
+        Ok(())
+    }
+
+    /// The restore must not overwrite whatever took the name in the
+    /// meantime -- that would delete something without trashing it.
+    #[test]
+    fn restoring_onto_an_occupied_path_is_refused() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish/verbs.md",
+            TrashKind::File,
+            None,
+            Timestamp::now(),
+        )?;
+        std::fs::write(root.path().join("Spanish/verbs.md"), "something else\n")?;
+        let err = restore_from_trash(&data_dir, &root, &id).unwrap_err();
+        assert!(err.message().contains("already"), "{}", err.message());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("Spanish/verbs.md"))?,
+            "something else\n"
+        );
+        assert_eq!(list_trash(&data_dir, "default")?.len(), 1);
+        Ok(())
+    }
+
+    /// The parent may have gone too -- restoring a deck into a collection
+    /// that was itself deleted has to recreate the folder.
+    #[test]
+    fn restoring_recreates_a_missing_parent() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish/verbs.md",
+            TrashKind::File,
+            None,
+            Timestamp::now(),
+        )?;
+        std::fs::remove_dir_all(root.path().join("Spanish"))?;
+        restore_from_trash(&data_dir, &root, &id)?;
+        assert!(root.path().join("Spanish/verbs.md").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_something_that_is_not_there_is_refused() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = TrashId::parse("20260909T120000-nothing")?;
+        assert!(restore_from_trash(&data_dir, &root, &id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn purging_removes_the_bytes_and_names_the_collection() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish",
+            TrashKind::Collection,
+            Some(CollectionId::new("abc12345")?),
+            Timestamp::now(),
+        )?;
+        let erased = purge_entry(&data_dir, "default", &id)?;
+        assert_eq!(erased.as_ref().map(|c| c.as_str()), Some("abc12345"));
+        assert!(!entry_dir(&data_dir, "default", &id).exists());
+        assert!(list_trash(&data_dir, "default")?.is_empty());
+        Ok(())
+    }
+
+    /// A trashed deck has no rows of its own to erase: its cards belong to
+    /// the collection, which is still there.
+    #[test]
+    fn purging_a_deck_names_no_collection() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        let id = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish/verbs.md",
+            TrashKind::File,
+            None,
+            Timestamp::now(),
+        )?;
+        assert_eq!(purge_entry(&data_dir, "default", &id)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn emptying_the_trash_names_every_collection_it_held() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        std::fs::create_dir_all(root.path().join("German"))?;
+        move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish",
+            TrashKind::Collection,
+            Some(CollectionId::new("abc12345")?),
+            Timestamp::now(),
+        )?;
+        move_to_trash(
+            &data_dir,
+            &root,
+            "German",
+            TrashKind::Collection,
+            Some(CollectionId::new("def67890")?),
+            Timestamp::now(),
+        )?;
+        let mut erased: Vec<String> = purge_all(&data_dir, "default")?
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        erased.sort();
+        assert_eq!(erased, vec!["abc12345", "def67890"]);
+        assert!(list_trash(&data_dir, "default")?.is_empty());
+        Ok(())
     }
 }
