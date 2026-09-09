@@ -247,7 +247,7 @@ fn render_edit_form(
 // ── POST handler ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-pub struct EditForm {
+pub(crate) struct EditForm {
     pub new_text: String,
     pub mtime_ms: String,
     #[serde(default)]
@@ -255,7 +255,7 @@ pub struct EditForm {
 }
 
 /// What a successful edit did, for user-facing reporting.
-pub struct EditOutcome {
+pub(crate) struct EditOutcome {
     /// Cards whose review history was migrated to a new hash.
     pub migrated: usize,
     /// New cards that could not be matched to prior history and start fresh.
@@ -308,7 +308,7 @@ pub async fn edit_post_handler(
     }
 }
 
-fn edit_post_inner(
+pub(crate) fn edit_post_inner(
     state: &AppState,
     slug: &str,
     hash_hex: &str,

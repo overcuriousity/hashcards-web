@@ -283,7 +283,18 @@ pub async fn files_folder_handler(
     current_user: Option<CurrentUser>,
     Form(form): Form<NewEntryForm>,
 ) -> Redirect {
-    flash_for(run_blocking(move || create_entry(&state, current_user.as_ref(), &form, true)).await)
+    flash_for(
+        run_blocking(move || {
+            create_entry(
+                &state,
+                current_user.as_ref(),
+                &form.parent,
+                &form.name,
+                true,
+            )
+        })
+        .await,
+    )
 }
 
 pub async fn files_file_handler(
@@ -291,7 +302,18 @@ pub async fn files_file_handler(
     current_user: Option<CurrentUser>,
     Form(form): Form<NewEntryForm>,
 ) -> Redirect {
-    flash_for(run_blocking(move || create_entry(&state, current_user.as_ref(), &form, false)).await)
+    flash_for(
+        run_blocking(move || {
+            create_entry(
+                &state,
+                current_user.as_ref(),
+                &form.parent,
+                &form.name,
+                false,
+            )
+        })
+        .await,
+    )
 }
 
 pub async fn files_rename_handler(
@@ -299,7 +321,10 @@ pub async fn files_rename_handler(
     current_user: Option<CurrentUser>,
     Form(form): Form<RenameForm>,
 ) -> Redirect {
-    flash_for(run_blocking(move || rename_entry(&state, current_user.as_ref(), &form)).await)
+    flash_for(
+        run_blocking(move || rename_entry(&state, current_user.as_ref(), &form.path, &form.name))
+            .await,
+    )
 }
 
 pub async fn files_delete_handler(
@@ -307,7 +332,7 @@ pub async fn files_delete_handler(
     current_user: Option<CurrentUser>,
     Form(form): Form<DeleteForm>,
 ) -> Redirect {
-    flash_for(run_blocking(move || delete_entry(&state, current_user.as_ref(), &form)).await)
+    flash_for(run_blocking(move || delete_entry(&state, current_user.as_ref(), &form.path)).await)
 }
 
 /// Every file-manager mutation reports back on `/files` the same way.
@@ -375,18 +400,25 @@ fn check_collection_slug(
     Ok(())
 }
 
-fn create_entry(
+/// Create a file or folder in the caller's tree.
+///
+/// Takes what it reads rather than the form it used to be handed: the web
+/// handler unpacks the form, and the MCP tools call this directly, so both
+/// doors run the same rules -- the name validation, the slug-collision
+/// check, and `CardRoot`'s path checking.
+pub(crate) fn create_entry(
     state: &AppState,
     user: Option<&CurrentUser>,
-    form: &NewEntryForm,
+    parent: &str,
+    name: &str,
     is_dir: bool,
 ) -> Fallible<String> {
     let root = user_root(state, user)?;
-    let mut name = validate_name(&form.name)?;
+    let mut name = validate_name(name)?;
     if !is_dir && !name.ends_with(".md") {
         name.push_str(".md");
     }
-    let parent = form.parent.trim().trim_matches('/');
+    let parent = parent.trim().trim_matches('/');
     // Normalized here, so `parent` and the path that is actually created
     // cannot disagree about which collection the new entry lands in.
     let entry = root.resolve_entry(&join_rel(parent, &name))?;
@@ -449,13 +481,15 @@ fn create_entry(
     }
 }
 
-fn rename_entry(
+/// Rename or move something in the caller's tree.
+pub(crate) fn rename_entry(
     state: &AppState,
     user: Option<&CurrentUser>,
-    form: &RenameForm,
+    path: &str,
+    name: &str,
 ) -> Fallible<String> {
     let root = user_root(state, user)?;
-    let entry = root.resolve_entry(&form.path)?;
+    let entry = root.resolve_entry(path)?;
     let from_rel = entry.rel;
     let from = entry.path;
     if !from.exists() {
@@ -464,7 +498,7 @@ fn rename_entry(
     // Renaming a deck rewrites nothing, but renaming its *collection* moves
     // the folder a live session is reading its cards and its database from.
     refuse_if_drilling(state, &root, &from_rel)?;
-    let mut name = validate_name(&form.name)?;
+    let mut name = validate_name(name)?;
     if from.is_file() && !name.ends_with(".md") {
         name.push_str(".md");
     }
@@ -489,13 +523,14 @@ fn rename_entry(
     Ok(format!("Renamed to `{to_rel}`."))
 }
 
-fn delete_entry(
+/// Move something in the caller's tree to their trash.
+pub(crate) fn delete_entry(
     state: &AppState,
     user: Option<&CurrentUser>,
-    form: &DeleteForm,
+    path: &str,
 ) -> Fallible<String> {
     let root = user_root(state, user)?;
-    let entry = root.resolve_entry(&form.path)?;
+    let entry = root.resolve_entry(path)?;
     let rel = entry.rel;
     let target = entry.path;
     if !target.exists() {
@@ -742,7 +777,13 @@ pub async fn editor_post_handler(
     // message says.
     let outcome = run_blocking(move || {
         Ok(
-            match save_file(&state, current_user.as_ref(), &rel2, &form) {
+            match save_file(
+                &state,
+                current_user.as_ref(),
+                &rel2,
+                &form.content,
+                form.mtime,
+            ) {
                 Ok(msg) => Ok(msg),
                 Err(e) => {
                     let mtime = user_root(&state, current_user.as_ref())
@@ -778,11 +819,15 @@ pub async fn editor_post_handler(
 
 /// Write the buffer, reparse it, and migrate card hashes so a reworded card
 /// keeps its schedule. A buffer that does not parse never stays on disk.
-fn save_file(
+/// Write a card file, reparse it, and migrate card hashes so a reworded
+/// card keeps its schedule. A buffer that does not parse never stays on
+/// disk.
+pub(crate) fn save_file(
     state: &AppState,
     user: Option<&CurrentUser>,
     rel: &str,
-    form: &SaveForm,
+    content: &str,
+    mtime: u64,
 ) -> Fallible<String> {
     let root = user_root(state, user)?;
     // Normalized before anything is asked of it: the slug below decides
@@ -797,7 +842,7 @@ fn save_file(
 
     let coll_dir = collection_folder(&root, rel)?;
 
-    if file_mtime_ms(&path)? != form.mtime {
+    if file_mtime_ms(&path)? != mtime {
         return fail(
             "This file changed since you opened it, so it was not saved. Your edit is still \
              here — check it against the other change, then save again to overwrite that one.",
@@ -840,8 +885,8 @@ fn save_file(
     }
     let db = UserDatabase::open(&db_path)?.collection(id);
 
-    write_atomic(&path, &form.content)?;
-    let new_cards = match parse_buffer_at(rel, &path, &form.content) {
+    write_atomic(&path, content)?;
+    let new_cards = match parse_buffer_at(rel, &path, content) {
         Ok(parsed) => parsed.cards,
         Err(e) => {
             revert_file(&path, &original)?;
@@ -1222,12 +1267,7 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        let form = NewEntryForm {
-            parent: String::new(),
-            name: taken.clone(),
-        };
-
-        let error = match create_entry(&state, None, &form, true) {
+        let error = match create_entry(&state, None, "", &taken, true) {
             Ok(_) => return fail("expected a slug collision error"),
             Err(e) => e.to_string(),
         };
@@ -1243,17 +1283,8 @@ mod tests {
     fn a_new_folder_may_not_shadow_another_local_folder_slug() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        let first = NewEntryForm {
-            parent: String::new(),
-            name: "Verbs 1".to_string(),
-        };
-        create_entry(&state, None, &first, true)?;
-
-        let second = NewEntryForm {
-            parent: String::new(),
-            name: "Verbs-1".to_string(),
-        };
-        assert!(create_entry(&state, None, &second, true).is_err());
+        create_entry(&state, None, "", "Verbs 1", true)?;
+        assert!(create_entry(&state, None, "", "Verbs-1", true).is_err());
         Ok(())
     }
 
@@ -1264,24 +1295,8 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Languages".to_string(),
-            },
-            true,
-        )?;
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: "Languages".to_string(),
-                name: taken,
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Languages", true)?;
+        create_entry(&state, None, "Languages", &taken, true)?;
         Ok(())
     }
 
@@ -1290,27 +1305,14 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Espanol".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Espanol", true)?;
 
-        let form = RenameForm {
-            path: "Espanol".to_string(),
-            name: taken,
-        };
-        assert!(rename_entry(&state, None, &form).is_err());
+        assert!(rename_entry(&state, None, "Espanol", &taken).is_err());
         // Renaming a folder to its own name is not a collision with itself.
-        let same = RenameForm {
-            path: "Espanol".to_string(),
-            name: "Espanol".to_string(),
-        };
-        assert!(rename_entry(&state, None, &same).is_err(), "already exists");
+        assert!(
+            rename_entry(&state, None, "Espanol", "Espanol").is_err(),
+            "already exists"
+        );
         Ok(())
     }
 
@@ -1328,7 +1330,7 @@ mod tests {
             content: "Q: replaced\nA: replaced\n".to_string(),
             mtime: file_mtime_ms(&path)?,
         };
-        assert!(save_file(&state, None, "loose.md", &form).is_err());
+        assert!(save_file(&state, None, "loose.md", &form.content, form.mtime).is_err());
         assert_eq!(std::fs::read_to_string(&path)?, "Q: a\nA: b\n");
         Ok(())
     }
@@ -1349,7 +1351,7 @@ mod tests {
             content: fixed.to_string(),
             mtime: file_mtime_ms(&path)?,
         };
-        save_file(&state, None, "Spanish/verbs.md", &form)?;
+        save_file(&state, None, "Spanish/verbs.md", &form.content, form.mtime)?;
         assert_eq!(std::fs::read_to_string(&path)?, fixed);
         Ok(())
     }
@@ -1482,14 +1484,7 @@ mod tests {
         start_deck_session(&state, &dir, &folder, "deck-exam-0badc0de")?;
 
         assert!(
-            delete_entry(
-                &state,
-                None,
-                &DeleteForm {
-                    path: "Spanish".to_string(),
-                },
-            )
-            .is_err(),
+            delete_entry(&state, None, "Spanish").is_err(),
             "a deck session drawing on this collection must block the delete"
         );
         assert!(folder.exists());
@@ -1509,15 +1504,7 @@ mod tests {
         start_deck_session(&state, &dir, &folder, "deck-exam-0badc0de")?;
 
         assert!(
-            rename_entry(
-                &state,
-                None,
-                &RenameForm {
-                    path: "Spanish".to_string(),
-                    name: "Espanol".to_string(),
-                },
-            )
-            .is_err(),
+            rename_entry(&state, None, "Spanish", "Espanol").is_err(),
             "a deck session drawing on this collection must block the rename"
         );
         assert!(folder.exists());
@@ -1543,10 +1530,8 @@ mod tests {
             &state,
             None,
             "Spanish/verbs.md",
-            &SaveForm {
-                content: "Q: the cat\nA: el gato (masc.)\n".to_string(),
-                mtime: file_mtime_ms(&path)?,
-            },
+            "Q: the cat\nA: el gato (masc.)\n",
+            file_mtime_ms(&path)?,
         )?;
         assert!(saved.starts_with("Saved"), "got: {saved}");
         assert!(
@@ -1576,7 +1561,7 @@ mod tests {
             content: "Q: the cat\nA: ![](nope.png)\n".to_string(),
             mtime: file_mtime_ms(&path)?,
         };
-        assert!(save_file(&state, None, "Spanish/verbs.md", &form).is_err());
+        assert!(save_file(&state, None, "Spanish/verbs.md", &form.content, form.mtime).is_err());
         assert_eq!(
             std::fs::read_to_string(&path)?,
             original,
@@ -1589,7 +1574,7 @@ mod tests {
             content: "Q: the cat\nA: ![](nope.png)\n".to_string(),
             mtime: file_mtime_ms(&path)?,
         };
-        save_file(&state, None, "Spanish/verbs.md", &form)?;
+        save_file(&state, None, "Spanish/verbs.md", &form.content, form.mtime)?;
         Ok(())
     }
 
@@ -1642,19 +1627,11 @@ mod tests {
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
 
-        let form = NewEntryForm {
-            parent: taken.clone(),
-            name: "verbs".to_string(),
-        };
-        assert!(create_entry(&state, None, &form, false).is_err());
+        assert!(create_entry(&state, None, &taken, "verbs", false).is_err());
         assert!(!user_root(&state, None)?.path().join(&taken).exists());
 
         // Nested folders are checked by their top-level ancestor too.
-        let nested = NewEntryForm {
-            parent: format!("{taken}/Unit 2"),
-            name: "verbs".to_string(),
-        };
-        assert!(create_entry(&state, None, &nested, false).is_err());
+        assert!(create_entry(&state, None, &format!("{taken}/Unit 2"), "verbs", false).is_err());
         Ok(())
     }
 
@@ -1664,15 +1641,7 @@ mod tests {
     fn a_file_creates_its_collection_with_an_id() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: "Spanish/Unit 2".to_string(),
-                name: "verbs".to_string(),
-            },
-            false,
-        )?;
+        create_entry(&state, None, "Spanish/Unit 2", "verbs", false)?;
         let root = user_root(&state, None)?;
         assert!(root.path().join("Spanish/Unit 2/verbs.md").is_file());
         assert!(existing_collection_id(&root.path().join("Spanish"))?.is_some());
@@ -1707,15 +1676,7 @@ mod tests {
 
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let db_dir = dir.join("db");
@@ -1733,13 +1694,7 @@ mod tests {
         let mut locked = original.clone();
         locked.set_mode(0o555);
         std::fs::set_permissions(root.path(), locked)?;
-        let outcome = delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        );
+        let outcome = delete_entry(&state, None, "Spanish");
         std::fs::set_permissions(root.path(), original)?;
 
         // Running as root defeats the permission bits; the ordering is only
@@ -1779,13 +1734,7 @@ mod tests {
         user.collection(bio.clone()).insert_card(hash, now)?;
         user.collection(esp.clone()).insert_card(hash, now)?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Biology".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Biology")?;
         // Still there: deleting trashes, and a restore needs these.
         assert!(user.collection(bio.clone()).card_hashes()?.contains(&hash));
 
@@ -1830,68 +1779,22 @@ mod tests {
     fn a_user_folder_inside_a_collection_may_not_be_called_media() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
 
-        let form = NewEntryForm {
-            parent: "Spanish".to_string(),
-            name: MEDIA_DIR.to_string(),
-        };
-        let error = match create_entry(&state, None, &form, true) {
+        let error = match create_entry(&state, None, "Spanish", MEDIA_DIR, true) {
             Ok(_) => return fail("expected `media` to be refused inside a collection"),
             Err(e) => e.to_string(),
         };
         assert!(error.contains("pasted images"), "got: {error}");
 
         // Renaming onto the same name is the same hazard.
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: "Spanish".to_string(),
-                name: "Unit 2".to_string(),
-            },
-            true,
-        )?;
-        assert!(
-            rename_entry(
-                &state,
-                None,
-                &RenameForm {
-                    path: "Spanish/Unit 2".to_string(),
-                    name: MEDIA_DIR.to_string(),
-                },
-            )
-            .is_err()
-        );
+        create_entry(&state, None, "Spanish", "Unit 2", true)?;
+        assert!(rename_entry(&state, None, "Spanish/Unit 2", MEDIA_DIR).is_err());
 
         // A deck called `media.md` is not a folder and stays allowed, and so
         // does a collection of the user's own called `media`.
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: "Spanish".to_string(),
-                name: MEDIA_DIR.to_string(),
-            },
-            false,
-        )?;
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: MEDIA_DIR.to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "Spanish", MEDIA_DIR, false)?;
+        create_entry(&state, None, "", MEDIA_DIR, true)?;
         Ok(())
     }
 
@@ -1902,27 +1805,13 @@ mod tests {
     fn a_collection_whose_media_folder_holds_decks_is_not_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let folder = user_root(&state, None)?.path().join("Spanish");
         let hidden = folder.join(MEDIA_DIR).join("Unit 2");
         std::fs::create_dir_all(&hidden)?;
         std::fs::write(hidden.join("verbs.md"), "Q: the cat\nA: el gato\n")?;
 
-        let error = match delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        ) {
+        let error = match delete_entry(&state, None, "Spanish") {
             Ok(_) => return fail("expected hidden card files to refuse the delete"),
             Err(e) => e.to_string(),
         };
@@ -1939,15 +1828,7 @@ mod tests {
     fn a_collection_is_not_deleted_or_renamed_while_a_session_drills_it() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let path = folder.join("verbs.md");
@@ -1956,51 +1837,20 @@ mod tests {
 
         // The deck inside it, first: deleting that is what empties the
         // folder out for the delete below.
-        let error = match delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish/verbs.md".to_string(),
-            },
-        ) {
+        let error = match delete_entry(&state, None, "Spanish/verbs.md") {
             Ok(_) => return fail("expected an active session to refuse the delete"),
             Err(e) => e.to_string(),
         };
         assert!(error.contains("drill session"), "got: {error}");
         assert!(path.exists());
 
-        assert!(
-            delete_entry(
-                &state,
-                None,
-                &DeleteForm {
-                    path: "Spanish".to_string(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            rename_entry(
-                &state,
-                None,
-                &RenameForm {
-                    path: "Spanish".to_string(),
-                    name: "Espanol".to_string(),
-                },
-            )
-            .is_err()
-        );
+        assert!(delete_entry(&state, None, "Spanish").is_err());
+        assert!(rename_entry(&state, None, "Spanish", "Espanol").is_err());
         assert!(folder.exists());
 
         // Once the session is over, both go through.
         state.sessions.lock().clear();
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish/verbs.md".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish/verbs.md")?;
         Ok(())
     }
 
@@ -2012,11 +1862,7 @@ mod tests {
     fn a_card_file_cannot_be_created_directly_in_the_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        let form = NewEntryForm {
-            parent: String::new(),
-            name: "notes".to_string(),
-        };
-        let error = match create_entry(&state, None, &form, false) {
+        let error = match create_entry(&state, None, "", "notes", false) {
             Ok(_) => return fail("expected a root-level file to be refused"),
             Err(e) => e.to_string(),
         };
@@ -2039,15 +1885,7 @@ mod tests {
     fn a_dotted_path_is_still_recognized_as_a_collection_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let db_dir = dir.join("db");
@@ -2061,25 +1899,12 @@ mod tests {
         // The same dotted path must also find the session keyed by `Spanish`.
         start_session(&state, &dir, &folder, "Spanish")?;
         assert!(
-            delete_entry(
-                &state,
-                None,
-                &DeleteForm {
-                    path: "./Spanish".to_string(),
-                },
-            )
-            .is_err(),
+            delete_entry(&state, None, "./Spanish").is_err(),
             "a dotted path must not slip past the active-session guard"
         );
         state.sessions.lock().clear();
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "./Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "./Spanish")?;
         assert!(!folder.exists());
         // The id proves the dotted path was recognised as a collection
         // root: only that branch reads one, and a folder taken for a nested
@@ -2100,26 +1925,12 @@ mod tests {
     fn a_collection_holding_only_pasted_images_can_still_be_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let folder = user_root(&state, None)?.path().join("Spanish");
         std::fs::create_dir_all(folder.join("media"))?;
         std::fs::write(folder.join("media").join("a.png"), "x")?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish")?;
         assert!(!folder.exists());
         Ok(())
     }
@@ -2131,15 +1942,7 @@ mod tests {
     fn deleting_a_collection_trashes_it_and_keeps_its_rows() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -2149,13 +1952,7 @@ mod tests {
         user.collection(id.clone())
             .insert_card(hash, Timestamp::now())?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish")?;
 
         assert!(!root.path().join("Spanish").exists());
         assert_eq!(
@@ -2175,15 +1972,7 @@ mod tests {
     fn restoring_a_collection_brings_its_review_history_back() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -2193,13 +1982,7 @@ mod tests {
         user.collection(id.clone())
             .insert_card(hash, Timestamp::now())?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish")?;
         let trashed = list_trash(&dir, "default")?;
         restore_from_trash(&dir, &root, &trashed[0].id)?;
 
@@ -2219,15 +2002,7 @@ mod tests {
     fn purging_a_trashed_collection_erases_its_rows() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -2237,13 +2012,7 @@ mod tests {
         user.collection(id.clone())
             .insert_card(hash, Timestamp::now())?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish")?;
         let trashed = list_trash(&dir, "default")?;
         let erased = purge_entry(&dir, "default", &trashed[0].id)?;
         assert_eq!(erased.as_ref(), Some(&id));
@@ -2259,28 +2028,14 @@ mod tests {
     fn a_non_empty_collection_can_be_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(
-            &state,
-            None,
-            &NewEntryForm {
-                parent: String::new(),
-                name: "Spanish".to_string(),
-            },
-            true,
-        )?;
+        create_entry(&state, None, "", "Spanish", true)?;
         let root = user_root(&state, None)?;
         std::fs::write(
             root.path().join("Spanish").join("verbs.md"),
             "Q: hablar\nA: to speak\n",
         )?;
 
-        delete_entry(
-            &state,
-            None,
-            &DeleteForm {
-                path: "Spanish".to_string(),
-            },
-        )?;
+        delete_entry(&state, None, "Spanish")?;
         assert!(!root.path().join("Spanish").exists());
 
         let trashed = list_trash(&dir, "default")?;
