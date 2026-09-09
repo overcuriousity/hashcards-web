@@ -12,6 +12,7 @@ mod files_ui;
 mod handlers;
 mod href;
 mod landing;
+mod merge;
 pub mod server;
 mod state;
 mod upload;
