@@ -15,6 +15,7 @@ blake3 = "1.8.3"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.10"
+getrandom = "0.3"
 log = "0.4.29"
 maud = "0.27.0"
 openidconnect = "4"

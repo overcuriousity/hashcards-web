@@ -979,6 +979,7 @@ dependencies = [
  "chrono",
  "clap",
  "env_logger",
+ "getrandom 0.3.4",
  "jsonwebtoken",
  "log",
  "maud",
