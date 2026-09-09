@@ -14,6 +14,7 @@ use crate::cmd::drill::state::MutableState;
 use crate::cmd::serve::auth::OidcRuntime;
 use crate::cmd::serve::config::ResolvedServeConfig;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
+use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
 
 /// A drill session shared behind a per-session lock. Handlers clone the
@@ -69,9 +70,10 @@ pub struct AppState {
     /// the first time it renders, so the notice is shown once rather than on
     /// every visit (see `sweep_dangling_sessions`).
     ///
-    /// Keyed by database path, not by slug: two users may each own a
-    /// collection called "Spanish".
-    pub interrupted_closed: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    /// Keyed by collection id — not by slug, and no longer by database path:
+    /// two users may each own a collection called "Spanish", and after
+    /// consolidation every collection in one tree shares a database file.
+    pub interrupted_closed: Arc<Mutex<HashMap<CollectionId, usize>>>,
     /// Users whose startup merge failed, keyed by their review database's
     /// path and holding the error to show them.
     ///

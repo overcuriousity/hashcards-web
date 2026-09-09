@@ -160,7 +160,7 @@ fn collection_get_inner(
         let interrupted_closed = state
             .interrupted_closed
             .lock()
-            .remove(&rc.db_path)
+            .remove(&rc.collection_id)
             .unwrap_or(0);
         let bookmark_count = db.count_bookmarks()?;
         let html = render_browse_page(

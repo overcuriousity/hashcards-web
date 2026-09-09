@@ -570,36 +570,6 @@ impl Database {
         Ok(())
     }
 
-    /// Close sessions left dangling by a crash or restart.
-    ///
-    /// A row is dangling when it has not been closed and its heartbeat has
-    /// been silent since before `stale_before`. Each such row is closed at
-    /// the time of its last surviving (non-voided) review, or left at
-    /// `started_at` if no review was recorded, and marked `closed`. Returns
-    /// the number of rows closed.
-    ///
-    /// The heartbeat is what makes this safe to run while other processes are
-    /// working: `serve` and a CLI `drill` share one database file, and
-    /// nothing in the row itself distinguishes a session abandoned by a crash
-    /// from one that is simply mid-drill elsewhere. Stamping `ended_at` on a
-    /// live session left it appending reviews to a row claiming to have
-    /// ended. Callers should pass a generous cutoff.
-    ///
-    /// `closed` is the marker rather than `ended_at <> started_at`, because a
-    /// session whose reviews were all undone is rewritten back to
-    /// `started_at` and would otherwise be re-detected on every sweep,
-    /// forever.
-    pub fn close_dangling_sessions(&self, stale_before: Timestamp) -> Fallible<usize> {
-        let conn = self.conn.lock();
-        let sql = "update sessions set ended_at = coalesce((select max(reviewed_at) from reviews \
-                   where reviews.session_id = sessions.session_id and reviews.voided = 0), \
-                   started_at), closed = 1 \
-                   where collection_id = ? and closed = 0 \
-                   and coalesce(last_seen_at, started_at) < ?;";
-        let rows = conn.execute(sql, params![self.collection, stale_before])?;
-        Ok(rows)
-    }
-
     /// Apply a web edit's hash migration in a single transaction.
     ///
     /// Each rename moves a card row in place; its reviews and bookmarks
@@ -2030,101 +2000,6 @@ mod tests {
         db.insert_card_if_new(hash, now)?;
         db.insert_card_if_new(hash, now)?; // no error on second call
         assert_eq!(db.card_hashes()?.len(), 1);
-        Ok(())
-    }
-
-    /// FEAT-03: sessions whose `ended_at` still equals the `create_session`
-    /// placeholder are dangling; closing them uses the last surviving
-    /// review's time, or the start time when no review was recorded.
-    #[test]
-    fn test_close_dangling_sessions() -> Fallible<()> {
-        let db = Database::memory()?;
-        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
-        let t1 = Timestamp::try_from("2026-01-01T10:05:00.000".to_string())?;
-
-        // A properly closed session must be left untouched.
-        let closed = db.create_session(t0)?;
-        db.close_session(closed, t1)?;
-
-        // A dangling session with one review.
-        let card_hash = CardHash::hash_bytes(b"a");
-        db.insert_card(card_hash, t0)?;
-        let dangling = db.create_session(t0)?;
-        let review = sample_review(card_hash, t1, 2.0);
-        db.insert_review_immediately(dangling, &review)?;
-
-        // A dangling session with no reviews at all.
-        let empty_dangling = db.create_session(t1)?;
-
-        // A cutoff after every heartbeat above, so all stale rows qualify.
-        let cutoff = Timestamp::try_from("2026-01-01T11:00:00.000".to_string())?;
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 2);
-
-        let sessions = db.get_all_sessions()?;
-        let find = |id: i64| {
-            sessions
-                .iter()
-                .find(|s| s.session_id == id)
-                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
-        };
-        assert_eq!(
-            find(dangling)?.ended_at,
-            t1,
-            "closed at its last review time"
-        );
-        assert_eq!(
-            find(empty_dangling)?.ended_at,
-            t1,
-            "closed at its start time"
-        );
-        assert_eq!(find(closed)?.ended_at, t1, "already-closed row untouched");
-
-        // Running it again closes nothing: the sweep marks rows `closed`
-        // rather than inferring it from `ended_at <> started_at`. A session
-        // closed at its own start time — one with no reviews, or one whose
-        // reviews were all undone — used to be indistinguishable from the
-        // placeholder and was re-detected on every single sweep, forever.
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 0);
-        assert_eq!(find(empty_dangling)?.ended_at, t1);
-        Ok(())
-    }
-
-    /// A session whose heartbeat is recent is still running somewhere —
-    /// `serve` and a CLI `drill` share one database file — and must not be
-    /// closed. Stamping `ended_at` on it left the live session appending
-    /// reviews to a row claiming to have ended.
-    #[test]
-    fn test_live_session_is_not_swept() -> Fallible<()> {
-        let db = Database::memory()?;
-        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
-        let crashed = db.create_session(t0)?;
-        let live = db.create_session(t0)?;
-
-        // The live session has just checked in; the crashed one never did.
-        let now = Timestamp::try_from("2026-01-01T12:00:00.000".to_string())?;
-        db.touch_session(live, now)?;
-
-        // Anything silent for over an hour is presumed dead.
-        let cutoff = now.minus_minutes(60);
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 1);
-
-        let sessions = db.get_all_sessions()?;
-        let find = |id: i64| {
-            sessions
-                .iter()
-                .find(|s| s.session_id == id)
-                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
-        };
-        assert_eq!(find(crashed)?.ended_at, t0, "the crashed session is closed");
-        assert_eq!(
-            find(live)?.ended_at,
-            t0,
-            "the live session's row is left open"
-        );
-        // It is not protected forever: once its heartbeat falls behind a
-        // later cutoff, it is swept like any other abandoned session.
-        let much_later = Timestamp::try_from("2026-01-01T14:00:00.000".to_string())?;
-        assert_eq!(db.close_dangling_sessions(much_later.minus_minutes(60))?, 1);
         Ok(())
     }
 

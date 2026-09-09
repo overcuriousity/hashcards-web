@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use rusqlite::config::DbConfig;
+use rusqlite::params;
 
 use crate::db::Database;
 use crate::db::SCHEMA_VERSION;
@@ -30,6 +32,7 @@ use crate::db::set_schema_version;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::collection_id::CollectionId;
+use crate::types::timestamp::Timestamp;
 
 /// How long a connection waits for a lock held by another connection before
 /// giving up with SQLITE_BUSY. WAL removes most of the contention this was
@@ -89,6 +92,55 @@ impl UserDatabase {
     /// A view of one collection on this database's connection.
     pub fn collection(&self, id: CollectionId) -> Database {
         Database::new_view(Arc::clone(&self.conn), id)
+    }
+
+    /// Close session rows left dangling by a crash or restart, across every
+    /// collection in this database, and return how many were closed in each.
+    ///
+    /// A row is dangling when it has not been closed and its heartbeat has
+    /// been silent since before `stale_before`. Each is closed at the time
+    /// of its last surviving (non-voided) review, or left at `started_at` if
+    /// no review was recorded.
+    ///
+    /// The heartbeat is what makes this safe to run while other processes
+    /// are working: nothing in the row itself distinguishes a session
+    /// abandoned by a crash from one that is simply mid-drill elsewhere.
+    /// `closed` is the marker rather than `ended_at <> started_at`, because a
+    /// session whose reviews were all undone is rewritten back to
+    /// `started_at` and would otherwise be re-detected on every sweep,
+    /// forever.
+    ///
+    /// The counts are collected inside the same transaction as the update,
+    /// because afterwards there is nothing left to count.
+    pub fn close_dangling_sessions(
+        &self,
+        stale_before: Timestamp,
+    ) -> Fallible<HashMap<CollectionId, usize>> {
+        self.with_connection(|conn| {
+            let tx = conn.transaction()?;
+            let mut counts = HashMap::new();
+            {
+                let sql = "select collection_id, count(*) from sessions \
+                           where closed = 0 and coalesce(last_seen_at, started_at) < ? \
+                           group by collection_id;";
+                let mut stmt = tx.prepare(sql)?;
+                let mut rows = stmt.query(params![stale_before])?;
+                while let Some(row) = rows.next()? {
+                    let id: CollectionId = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    counts.insert(id, n as usize);
+                }
+            }
+            tx.execute(
+                "update sessions set ended_at = coalesce((select max(reviewed_at) from reviews \
+                 where reviews.session_id = sessions.session_id and reviews.voided = 0), \
+                 started_at), closed = 1 \
+                 where closed = 0 and coalesce(last_seen_at, started_at) < ?;",
+                params![stale_before],
+            )?;
+            tx.commit()?;
+            Ok(counts)
+        })
     }
 
     /// Run `f` against the connection. The only way in from outside this
@@ -160,6 +212,9 @@ fn prepare_schema(conn: &mut Connection, path: &Path) -> Fallible<()> {
 mod tests {
     use super::*;
     use crate::db::LEGACY_SCHEMA_VERSION;
+    use crate::db::ReviewRecord;
+    use crate::fsrs::Grade;
+    use crate::types::card_hash::CardHash;
 
     fn version_of(path: &Path) -> Fallible<i64> {
         let conn = Connection::open(path)?;
@@ -215,6 +270,151 @@ mod tests {
         };
         assert!(message.contains("999"), "unhelpful error: {message}");
         assert!(message.contains("upgrade"), "unhelpful error: {message}");
+        Ok(())
+    }
+
+    /// The sweep runs once per user, but the notice is shown on a collection
+    /// page — so it has to come back split by collection. Keyed by database
+    /// path it could not be: every collection in a tree shares one file.
+    #[test]
+    fn dangling_sessions_are_closed_and_counted_per_collection() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let bio = CollectionId::new("bio")?;
+        let esp = CollectionId::new("esp")?;
+        let old = Timestamp::try_from("2026-01-01T09:00:00.000".to_string())?;
+        user.collection(bio.clone()).create_session(old)?;
+        user.collection(bio.clone()).create_session(old)?;
+        user.collection(esp.clone()).create_session(old)?;
+
+        let cutoff = Timestamp::try_from("2026-06-01T09:00:00.000".to_string())?;
+        let closed = user.close_dangling_sessions(cutoff)?;
+        assert_eq!(closed.get(&bio), Some(&2));
+        assert_eq!(closed.get(&esp), Some(&1));
+
+        // A second sweep finds nothing: `closed` is the marker.
+        assert!(user.close_dangling_sessions(cutoff)?.is_empty());
+        Ok(())
+    }
+
+    /// A review record for `card_hash` at `when`. The sweep closes a session
+    /// at its last surviving review, so these tests need real review rows.
+    fn review_at(card_hash: CardHash, when: Timestamp) -> ReviewRecord {
+        ReviewRecord {
+            card_hash,
+            reviewed_at: when,
+            grade: Grade::Good,
+            stability: 2.0,
+            difficulty: 2.0,
+            interval_raw: 1.0,
+            interval_days: 1,
+            due_date: when.date(),
+            duration_ms: None,
+        }
+    }
+
+    /// FEAT-03: sessions whose heartbeat has been silent since before the
+    /// cutoff are dangling; closing them uses the last surviving review's
+    /// time, or the start time when no review was recorded.
+    #[test]
+    fn dangling_sessions_close_at_their_last_review() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let id = CollectionId::new("bio")?;
+        let db = user.collection(id.clone());
+        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
+        let t1 = Timestamp::try_from("2026-01-01T10:05:00.000".to_string())?;
+
+        // A properly closed session must be left untouched.
+        let closed_session = db.create_session(t0)?;
+        db.close_session(closed_session, t1)?;
+
+        // A dangling session with one review.
+        let card_hash = CardHash::hash_bytes(b"a");
+        db.insert_card(card_hash, t0)?;
+        let dangling = db.create_session(t0)?;
+        db.insert_review_immediately(dangling, &review_at(card_hash, t1))?;
+
+        // A dangling session with no reviews at all.
+        let empty_dangling = db.create_session(t1)?;
+
+        // A cutoff after every heartbeat above, so all stale rows qualify.
+        let cutoff = Timestamp::try_from("2026-01-01T11:00:00.000".to_string())?;
+        assert_eq!(user.close_dangling_sessions(cutoff)?.get(&id), Some(&2));
+
+        let sessions = db.get_all_sessions()?;
+        let find = |session_id: i64| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
+        };
+        assert_eq!(
+            find(dangling)?.ended_at,
+            t1,
+            "closed at its last review time"
+        );
+        assert_eq!(
+            find(empty_dangling)?.ended_at,
+            t1,
+            "closed at its start time"
+        );
+        assert_eq!(
+            find(closed_session)?.ended_at,
+            t1,
+            "already-closed row untouched"
+        );
+
+        // Running it again closes nothing: the sweep marks rows `closed`
+        // rather than inferring it from `ended_at <> started_at`. A session
+        // closed at its own start time — one with no reviews, or one whose
+        // reviews were all undone — used to be indistinguishable from the
+        // placeholder and was re-detected on every single sweep, forever.
+        assert!(user.close_dangling_sessions(cutoff)?.is_empty());
+        assert_eq!(find(empty_dangling)?.ended_at, t1);
+        Ok(())
+    }
+
+    /// A session whose heartbeat is recent is still running somewhere — a
+    /// second server may share the file — and must not be closed. Stamping
+    /// `ended_at` on it left the live session appending reviews to a row
+    /// claiming to have ended.
+    #[test]
+    fn a_live_session_is_not_swept() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let id = CollectionId::new("bio")?;
+        let db = user.collection(id.clone());
+        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
+        let crashed = db.create_session(t0)?;
+        let live = db.create_session(t0)?;
+
+        // The live session has just checked in; the crashed one never did.
+        let now = Timestamp::try_from("2026-01-01T12:00:00.000".to_string())?;
+        db.touch_session(live, now)?;
+
+        // Anything silent for over an hour is presumed dead.
+        let cutoff = now.minus_minutes(60);
+        assert_eq!(user.close_dangling_sessions(cutoff)?.get(&id), Some(&1));
+
+        let sessions = db.get_all_sessions()?;
+        let find = |session_id: i64| {
+            sessions
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
+        };
+        assert_eq!(find(crashed)?.ended_at, t0, "the crashed session is closed");
+        assert_eq!(
+            find(live)?.ended_at,
+            t0,
+            "the live session's row is left open"
+        );
+        // It is not protected forever: once its heartbeat falls behind a
+        // later cutoff, it is swept like any other abandoned session.
+        let much_later = Timestamp::try_from("2026-01-01T14:00:00.000".to_string())?;
+        assert_eq!(
+            user.close_dangling_sessions(much_later.minus_minutes(60))?
+                .get(&id),
+            Some(&1)
+        );
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -76,6 +77,7 @@ use crate::cmd::serve::upload::media_upload_handler;
 use crate::cmd::signals::terminate_signal;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
 use crate::user_db::UserDatabase;
 use crate::utils::ensure_dir;
@@ -89,63 +91,68 @@ use crate::utils::ensure_dir;
 /// window. Accepted tradeoff — any fixed cutoff has some such window.
 const SESSION_STALE_MINUTES: i64 = 60;
 
-/// Close session rows left dangling by a crash or restart, across every
-/// collection this server can serve, and return the per-database counts so
-/// the topic browser can report them once.
+/// Close session rows left dangling by a crash or restart, once per user,
+/// and return the per-collection counts so the topic browser can report them
+/// once.
 ///
-/// Keyed by database path rather than by URL slug: two users may each own a
+/// Keyed by collection id rather than by URL slug: two users may each own a
 /// collection called "Spanish", and a slug-keyed notice would be shown to
-/// whichever of them opened the page first.
+/// whichever of them opened the page first. Nor by database path any more —
+/// after consolidation, that names a whole tree.
 ///
-/// A collection whose database cannot be opened is skipped with a log line
-/// rather than failing startup: an unreadable database is the topic
-/// browser's problem to report, not a reason to refuse to serve everything
-/// else. Each database is independent, so the sweeps run on their own
-/// threads rather than one after another.
+/// A user whose database cannot be opened is skipped with a log line rather
+/// than failing startup: an unreadable database is the collection page's
+/// problem to report, not a reason to refuse to serve everything else. Each
+/// user's database is independent, so the sweeps run on their own threads.
 fn sweep_dangling_sessions(
     data_dir: &Path,
     failures: &HashMap<PathBuf, String>,
-) -> HashMap<PathBuf, usize> {
+) -> HashMap<CollectionId, usize> {
     // Only sessions whose heartbeat has been silent this long are presumed
     // dead. A session in another process stamps its heartbeat as the user
     // works, so a live one is never swept out from under it.
     let stale_before = Timestamp::now().minus_minutes(SESSION_STALE_MINUTES);
-    let collections = discover_all_collections(data_dir);
 
-    let results: Vec<(PathBuf, Fallible<usize>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = collections
-            .iter()
-            .map(|rc| {
-                scope.spawn(move || {
-                    if failures.contains_key(&rc.db_path) {
-                        // Already reported at startup, and the file is not
-                        // what it should be. Do not write to it.
-                        return (rc.db_path.clone(), Ok(0));
-                    }
-                    // Not `open_collection_db`: the sweep runs before
-                    // `AppState` exists, so it consults the failure map
-                    // directly, just above.
-                    let closed = UserDatabase::open(&rc.db_path).and_then(|user| {
-                        user.collection(rc.collection_id.clone())
-                            .close_dangling_sessions(stale_before)
-                    });
-                    (rc.db_path.clone(), closed)
+    // One entry per user, not per collection: after consolidation they share
+    // a file. Ordered, so the threads are spawned in a stable order.
+    let paths: BTreeSet<PathBuf> = discover_all_collections(data_dir)
+        .into_iter()
+        .map(|rc| rc.db_path)
+        // Already reported at startup, and the file is not what it should
+        // be: do not write to it. A tree with no database has nothing to
+        // sweep, and must not have one created for it here.
+        .filter(|path| !failures.contains_key(path) && path.is_file())
+        .collect();
+
+    let results: Vec<(PathBuf, Fallible<HashMap<CollectionId, usize>>)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    scope.spawn(move || {
+                        // Not `open_collection_db`: the sweep runs before
+                        // `AppState` exists, so it consulted the failure map
+                        // itself, above.
+                        let closed = UserDatabase::open(path)
+                            .and_then(|db| db.close_dangling_sessions(stale_before));
+                        (path.clone(), closed)
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("sweep thread panicked"))
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("sweep thread panicked"))
+                .collect()
+        });
 
     let mut counts = HashMap::new();
     for (db_path, closed) in results {
         match closed {
-            Ok(0) => {}
-            Ok(n) => {
-                log::info!("Closed {n} interrupted session(s) in {}", db_path.display());
-                counts.insert(db_path, n);
+            Ok(per_collection) => {
+                for (id, n) in per_collection {
+                    log::info!("Closed {n} interrupted session(s) in collection {id}");
+                    counts.insert(id, n);
+                }
             }
             Err(e) => log::error!(
                 "Could not close interrupted sessions in {}: {e}",
@@ -477,31 +484,33 @@ mod tests {
     /// Two users may each have a collection called "Spanish". They slugify
     /// alike, so a notice keyed by slug would be shown to whichever of them
     /// opened the page first, reporting the other's interrupted sessions.
-    /// Keyed by database path, each notice reaches its own owner.
+    /// Keyed by collection id, each notice reaches its own owner — and a
+    /// database path could not serve, since after consolidation one names a
+    /// whole tree.
     #[test]
-    fn interrupted_notices_are_keyed_per_database_not_per_slug() -> Fallible<()> {
+    fn interrupted_notices_are_keyed_per_collection_not_per_slug() -> Fallible<()> {
         let data_dir = create_tmp_directory()?;
         let db_dir = data_dir.join("db");
         ensure_dir(&db_dir, "review database directory")?;
 
-        let mut db_paths = Vec::new();
+        let mut ids = Vec::new();
         for user in ["alice-example.com", "bob-example.com"] {
             let folder = data_dir.join("cards").join(user).join("Spanish");
             std::fs::create_dir_all(&folder)?;
             let id = collection_id(&folder)?;
             let db_path = db_dir.join(format!("{user}.db"));
-            let db = UserDatabase::open(&db_path)?.collection(id);
+            let db = UserDatabase::open(&db_path)?.collection(id.clone());
             // A session row opened long ago and never closed: exactly what a
             // crash leaves behind.
             let started = Timestamp::now().minus_minutes(SESSION_STALE_MINUTES * 2);
             db.create_session(started)?;
-            db_paths.push(db_path);
+            ids.push(id);
         }
 
         let counts = sweep_dangling_sessions(&data_dir, &HashMap::new());
         assert_eq!(counts.len(), 2, "each user's collection swept separately");
-        for db_path in &db_paths {
-            assert_eq!(counts.get(db_path), Some(&1), "{}", db_path.display());
+        for id in &ids {
+            assert_eq!(counts.get(id), Some(&1), "{id}");
         }
         Ok(())
     }
