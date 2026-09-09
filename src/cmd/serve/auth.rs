@@ -635,6 +635,7 @@ impl axum::extract::OptionalFromRequestParts<AppState> for CurrentUser {
 
 #[cfg(test)]
 mod tests {
+    use crate::cmd::serve::config::ResolvedMcp;
 
     /// Create a collection folder named `name` in `owner`'s card tree under
     /// `data_dir`, holding one card, and stamp it with a stable id so the
@@ -1015,6 +1016,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1083,6 +1085,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1143,6 +1146,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1203,6 +1207,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1270,6 +1275,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1453,6 +1459,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),

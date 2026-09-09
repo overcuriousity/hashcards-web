@@ -307,6 +307,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 pub mod test_support {
     use super::*;
     use crate::cmd::serve::config::DefaultsSection;
+    use crate::cmd::serve::config::ResolvedMcp;
     use crate::cmd::serve::config::ResolvedServeConfig;
 
     /// An `AppState` whose card trees live under `data_dir`, with no OIDC
@@ -321,6 +322,7 @@ pub mod test_support {
                 config_path: None,
                 custom_decks: Vec::new(),
                 session_timeout_minutes: 1440,
+                mcp: ResolvedMcp::default(),
                 oidc: None,
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),

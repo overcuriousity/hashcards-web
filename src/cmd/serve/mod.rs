@@ -41,6 +41,7 @@ mod tests {
     use crate::cmd::drill::katex::KATEX_MHCHEM_JS_URL;
     use crate::cmd::drill::template::STYLE_URL;
     use crate::cmd::serve::config::DefaultsSection;
+    use crate::cmd::serve::config::ResolvedMcp;
     use crate::cmd::serve::config::ResolvedServeConfig;
     use crate::cmd::serve::server::start_serve;
     use crate::error::ErrorReport;
@@ -101,6 +102,7 @@ mod tests {
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: None,
         };
         spawn(async move { start_serve(config).await });
