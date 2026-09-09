@@ -240,6 +240,31 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
     }
 }
 
+/// Rewrite a collection's `.hashcards.toml` with new scheduling overrides.
+///
+/// The `id` is read first and written back unchanged. It is what every
+/// review row in this collection is keyed by, so losing it here would
+/// orphan the whole history *and* leave the folder to mint itself a fresh
+/// one on its next read -- the schedule would appear to reset for no reason
+/// a user could see.
+///
+/// `None` for either value removes that override, so the collection falls
+/// back to the instance default.
+pub fn write_collection_overrides(
+    folder: &Path,
+    retention: Option<DesiredRetention>,
+    max_interval: Option<MaxInterval>,
+) -> Fallible<()> {
+    let id = collection_id(folder)?;
+    let meta = CollectionMeta {
+        id: id.to_string(),
+        desired_retention: retention.map(|r| toml::Value::Float(r.into_inner())),
+        max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
+    };
+    write(folder.join(COLLECTION_META_FILE), toml::to_string(&meta)?)?;
+    Ok(())
+}
+
 /// The number an override was written as, or `None` with a warning when it
 /// was not written as a number at all. TOML tells integers and floats apart
 /// and `max_interval_days = 256` is the natural way to write a whole number

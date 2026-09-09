@@ -7,6 +7,7 @@
 //! migration gate, `CardRoot`'s path checking) applies to a model too.
 
 pub mod cards;
+pub mod collections;
 pub mod decks;
 pub mod read;
 
