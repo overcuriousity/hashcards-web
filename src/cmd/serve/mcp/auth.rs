@@ -27,12 +27,9 @@ use crate::types::timestamp::Timestamp;
 /// everywhere else in the server.
 #[derive(Clone)]
 pub struct McpCaller {
-    // Read by the tool handlers, which land in the next commits.
-    #[cfg_attr(not(test), allow(dead_code))]
     owner: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl McpCaller {
     /// The same identity in the form every domain function already takes.
     ///

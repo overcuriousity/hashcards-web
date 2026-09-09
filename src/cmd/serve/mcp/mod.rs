@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod server;
+pub mod tools;
 
 use std::sync::Arc;
 

@@ -1,11 +1,6 @@
 //! The MCP server itself: what it tells a model about hashcards, and how a
 //! tool handler learns who is calling.
 
-// Nothing reads the state, the caller or the tool listing until the tool
-// handlers land in the next commits -- the server answers a handshake and
-// offers nothing. The attribute comes off with them.
-#![allow(dead_code)]
-
 use rmcp::ErrorData;
 use rmcp::RoleServer;
 use rmcp::ServerHandler;
@@ -81,7 +76,7 @@ impl HashcardsMcp {
             state,
             // Groups are added here as later commits land:
             //   Self::read_router() + Self::card_router() + ...
-            tool_router: ToolRouter::new(),
+            tool_router: Self::read_router(),
         }
     }
 
@@ -106,8 +101,9 @@ impl HashcardsMcp {
     }
 
     /// Every tool this server offers, by name. The trash tools' test uses
-    /// it to assert that nothing here destroys anything.
+    /// it to assert that nothing in the whole surface destroys anything.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_router
             .list_all()

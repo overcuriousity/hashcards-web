@@ -36,8 +36,6 @@ impl CurrentUser {
     /// Every other `CurrentUser` comes out of a signed cookie; this is the
     /// one that does not, so that a tool handler can hand the domain
     /// functions exactly what a browser session would have handed them.
-    // Called by the MCP tool handlers, which land in the next commits.
-    #[allow(dead_code)]
     pub(crate) fn new(email: &str) -> Self {
         Self {
             email: email.to_string(),

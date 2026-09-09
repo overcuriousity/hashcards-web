@@ -804,6 +804,41 @@ impl Database {
         Ok(reviews)
     }
 
+    /// Every surviving review of one card, oldest first.
+    ///
+    /// `voided = 0`, like every other read path: an undone review is marked
+    /// rather than deleted, and reporting it here would tell a reader the
+    /// card was graded when the user took that back.
+    pub fn reviews_for_card(&self, card_hash: CardHash) -> Fallible<Vec<ReviewRow>> {
+        let conn = self.conn.lock();
+        let sql = "select review_id, card_hash, reviewed_at, grade, stability, difficulty, \
+                   interval_raw, interval_days, due_date, duration_ms from reviews \
+                   where card_hash = ? and collection_id = ? and voided = 0 \
+                   order by reviewed_at;";
+        let mut stmt = conn.prepare(sql)?;
+        let review_iter = stmt.query_map(params![card_hash, self.collection], |row| {
+            Ok(ReviewRow {
+                review_id: row.get(0)?,
+                data: ReviewRecord {
+                    card_hash: row.get(1)?,
+                    reviewed_at: row.get(2)?,
+                    grade: row.get(3)?,
+                    stability: row.get(4)?,
+                    difficulty: row.get(5)?,
+                    interval_raw: row.get(6)?,
+                    interval_days: row.get(7)?,
+                    due_date: row.get(8)?,
+                    duration_ms: row.get(9)?,
+                },
+            })
+        })?;
+        let mut reviews = Vec::new();
+        for review in review_iter {
+            reviews.push(review?);
+        }
+        Ok(reviews)
+    }
+
     /// Remove every row this collection owns.
     ///
     /// What deleting a collection folder used to do by deleting a file. The
@@ -1364,6 +1399,51 @@ mod tests {
 
     /// Build a review record for `card_hash` with the given stability.
     #[cfg(test)]
+    /// A card's history is what `get_card` reports, so it must show what
+    /// survived — an undone review was taken back and is not a grade.
+    #[test]
+    fn a_cards_reviews_come_back_in_order_and_skip_voided_ones() -> Fallible<()> {
+        let db = UserDatabase::memory()?.collection(CollectionId::new("abc12345")?);
+        let now = Timestamp::now();
+        let hash = CardHash::hash_bytes(b"a card");
+        db.insert_card(hash, now)?;
+        let session = db.create_session(now)?;
+        db.insert_review_immediately(session, &sample_review(hash, now, 1.0))?;
+        let second = db.insert_review_immediately(session, &sample_review(hash, now, 2.0))?;
+
+        let reviews = db.reviews_for_card(hash)?;
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|r| r.data.card_hash == hash));
+
+        db.void_review_and_restore_performance(second, hash, Performance::New, None)?;
+        assert_eq!(db.reviews_for_card(hash)?.len(), 1);
+        Ok(())
+    }
+
+    /// Another card's reviews are not this card's, and neither are another
+    /// collection's.
+    #[test]
+    fn a_cards_reviews_are_scoped_to_it_and_its_collection() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let spanish = user.collection(CollectionId::new("abc12345")?);
+        let german = user.collection(CollectionId::new("def67890")?);
+        let now = Timestamp::now();
+        let hash = CardHash::hash_bytes(b"a card");
+        let other = CardHash::hash_bytes(b"another card");
+
+        for db in [&spanish, &german] {
+            db.insert_card(hash, now)?;
+            db.insert_card(other, now)?;
+            let session = db.create_session(now)?;
+            db.insert_review_immediately(session, &sample_review(hash, now, 1.0))?;
+            db.insert_review_immediately(session, &sample_review(other, now, 1.0))?;
+        }
+
+        assert_eq!(spanish.reviews_for_card(hash)?.len(), 1);
+        assert_eq!(german.reviews_for_card(hash)?.len(), 1);
+        Ok(())
+    }
+
     fn sample_review(card_hash: CardHash, now: Timestamp, stability: f64) -> ReviewRecord {
         ReviewRecord {
             card_hash,

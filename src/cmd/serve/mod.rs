@@ -1236,7 +1236,24 @@ A: 2
             .list_tools(Default::default())
             .await
             .map_err(|e| crate::error::ErrorReport::new(format!("tools/list failed: {e}")))?;
-        assert!(tools.tools.is_empty(), "no tools exist yet");
+        let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "list_collections",
+            "get_collection",
+            "read_deck",
+            "list_cards",
+            "get_card",
+            "get_collection_stats",
+            "get_user_stats",
+        ] {
+            assert!(names.contains(&expected), "no `{expected}` tool: {names:?}");
+        }
+        // Every tool carries a description: it is where a model learns the
+        // card syntax, and an undescribed tool is one it will misuse.
+        assert!(
+            tools.tools.iter().all(|t| t.description.is_some()),
+            "a tool has no description"
+        );
         client.cancel().await.ok();
         Ok(())
     }
