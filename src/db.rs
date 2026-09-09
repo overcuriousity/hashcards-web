@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -83,9 +83,18 @@ pub struct Bookmark {
     pub created_at: Timestamp,
 }
 
-/// The schema version a freshly created database gets, and the highest
-/// migration number `migrate` knows how to apply.
-const SCHEMA_VERSION: i64 = 7;
+/// The schema version of a user database — one file per user, every table
+/// scoped by `collection_id`. Created by `UserDatabase`, never by the
+/// migration ladder: consolidation merges N files into one, which an
+/// in-place `alter table` cannot express.
+// Read by `UserDatabase`, whose first production caller lands in the next
+// two commits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SCHEMA_VERSION: i64 = 8;
+
+/// The highest version a per-collection database can be at, and the top of
+/// the `migrate_legacy` ladder. Deployed databases sit between 0 and here.
+pub const LEGACY_SCHEMA_VERSION: i64 = 7;
 
 /// How long a connection waits for a lock held by another connection before
 /// giving up with SQLITE_BUSY.
@@ -123,10 +132,10 @@ impl Database {
         {
             let tx = conn.transaction()?;
             if !probe_schema_exists(&tx)? {
-                tx.execute_batch(include_str!("schema.sql"))?;
-                set_schema_version(&tx, SCHEMA_VERSION)?;
+                tx.execute_batch(include_str!("schema_v7.sql"))?;
+                set_schema_version(&tx, LEGACY_SCHEMA_VERSION)?;
             } else {
-                migrate(&tx)?;
+                migrate_legacy(&tx)?;
             }
             tx.commit()?;
         }
@@ -754,6 +763,31 @@ impl Database {
     }
 }
 
+/// Open a per-collection database and bring it up to the last version that
+/// shape ever had.
+///
+/// Only the startup merge calls this. Nothing else may write to these files:
+/// after they have been merged they are moved into `db/legacy/`, and an older
+/// binary writing into one would strand every review it recorded there.
+#[expect(dead_code)]
+pub fn open_legacy_source(path: &Path) -> Fallible<Connection> {
+    let mut conn = Connection::open(path)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    {
+        let tx = conn.transaction()?;
+        if !probe_schema_exists(&tx)? {
+            return fail(format!(
+                "{} has no `cards` table, so it is not a review database.",
+                path.display()
+            ));
+        }
+        migrate_legacy(&tx)?;
+        tx.commit()?;
+    }
+    Ok(conn)
+}
+
 fn update_card_performance_tx(
     tx: &Transaction,
     card_hash: CardHash,
@@ -866,15 +900,16 @@ fn migrate_add_session_liveness(tx: &Transaction) -> Fallible<()> {
 /// migrations in order. Databases from before the version table existed
 /// start at version 0; migrations 1-3 probe before altering, so they are
 /// safe no-ops on legacy databases that already have the feature.
-fn migrate(tx: &Transaction) -> Fallible<()> {
+fn migrate_legacy(tx: &Transaction) -> Fallible<()> {
     ensure_version_table(tx)?;
     let current = get_schema_version(tx)?;
-    if current > SCHEMA_VERSION {
+    if current > LEGACY_SCHEMA_VERSION {
         return fail(format!(
-            "This database uses schema version {current}, but this version of hashcards-web only supports up to schema version {SCHEMA_VERSION}. Please upgrade hashcards-web."
+            "This database uses schema version {current}, but a per-collection database only \
+             goes up to schema version {LEGACY_SCHEMA_VERSION}. Please upgrade hashcards-web."
         ));
     }
-    for version in (current + 1)..=SCHEMA_VERSION {
+    for version in (current + 1)..=LEGACY_SCHEMA_VERSION {
         match version {
             1 => migrate_add_duration_ms(tx)?,
             2 => migrate_add_bookmarks(tx)?,
@@ -896,7 +931,7 @@ fn migrate(tx: &Transaction) -> Fallible<()> {
 
 /// Create the schema_version table if missing and seed it at version 0
 /// (the state of databases created before versioning existed).
-fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
+pub(crate) fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
     tx.execute_batch(
         "create table if not exists schema_version (version integer not null) strict;",
     )?;
@@ -907,12 +942,12 @@ fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
     Ok(())
 }
 
-fn get_schema_version(tx: &Transaction) -> Fallible<i64> {
+pub(crate) fn get_schema_version(tx: &Transaction) -> Fallible<i64> {
     let version: i64 = tx.query_row("select version from schema_version;", [], |row| row.get(0))?;
     Ok(version)
 }
 
-fn set_schema_version(tx: &Transaction, version: i64) -> Fallible<()> {
+pub(crate) fn set_schema_version(tx: &Transaction, version: i64) -> Fallible<()> {
     tx.execute("delete from schema_version;", [])?;
     tx.execute(
         "insert into schema_version (version) values (?);",
@@ -937,7 +972,7 @@ fn migrate_add_reviewed_date(tx: &Transaction) -> Fallible<()> {
     Ok(())
 }
 
-fn probe_schema_exists(tx: &Transaction) -> Fallible<bool> {
+pub(crate) fn probe_schema_exists(tx: &Transaction) -> Fallible<bool> {
     let sql = "select count(*) from sqlite_master where type='table' AND name=?;";
     let count: i64 = tx.query_row(sql, ["cards"], |row| row.get(0))?;
     Ok(count > 0)
@@ -952,6 +987,74 @@ fn migrate_add_meta(tx: &Transaction) -> Fallible<()> {
         ) strict;",
     )?;
     Ok(())
+}
+
+/// Builders for the database shapes this release replaces. Tests only: the
+/// server never creates a per-collection database again.
+#[cfg(test)]
+pub mod test_support {
+    use std::path::Path;
+
+    use rusqlite::Connection;
+
+    use super::LEGACY_SCHEMA_VERSION;
+    use crate::error::Fallible;
+
+    /// The last per-collection shape, at version 7.
+    pub fn create_legacy_v7(path: &Path) -> Fallible<Connection> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(include_str!("schema_v7.sql"))?;
+        conn.execute(
+            "insert into schema_version (version) values (?);",
+            rusqlite::params![LEGACY_SCHEMA_VERSION],
+        )?;
+        Ok(conn)
+    }
+
+    /// The shape from before the version table existed, which
+    /// `migrate_legacy` reads as version 0.
+    pub fn create_legacy_v0(path: &Path) -> Fallible<Connection> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "create table cards (
+                card_hash text primary key,
+                added_at text not null,
+                last_reviewed_at text,
+                stability real,
+                difficulty real,
+                interval_raw real,
+                interval_days integer,
+                due_date text,
+                review_count integer not null
+            ) strict;
+
+            create table sessions (
+                session_id integer primary key,
+                started_at text not null,
+                ended_at text not null
+            ) strict;
+
+            create table reviews (
+                review_id integer primary key,
+                session_id integer not null
+                    references sessions (session_id)
+                    on update cascade
+                    on delete cascade,
+                card_hash text not null
+                    references cards (card_hash)
+                    on update cascade
+                    on delete cascade,
+                reviewed_at text not null,
+                grade text not null,
+                stability real not null,
+                difficulty real not null,
+                interval_raw real not null,
+                interval_days integer not null,
+                due_date text not null
+            ) strict;",
+        )?;
+        Ok(conn)
+    }
 }
 
 #[cfg(test)]
@@ -1290,48 +1393,6 @@ mod tests {
         Ok(())
     }
 
-    /// The reviews/cards/sessions schema as it stood before the duration_ms,
-    /// bookmarks, and voided migrations existed (schema.sql minus those three
-    /// features). Used to exercise the full migration chain from version 0.
-    const OLD_SCHEMA: &str = "
-        create table cards (
-            card_hash text primary key,
-            added_at text not null,
-            last_reviewed_at text,
-            stability real,
-            difficulty real,
-            interval_raw real,
-            interval_days integer,
-            due_date text,
-            review_count integer not null
-        ) strict;
-
-        create table sessions (
-            session_id integer primary key,
-            started_at text not null,
-            ended_at text not null
-        ) strict;
-
-        create table reviews (
-            review_id integer primary key,
-            session_id integer not null
-                references sessions (session_id)
-                on update cascade
-                on delete cascade,
-            card_hash text not null
-                references cards (card_hash)
-                on update cascade
-                on delete cascade,
-            reviewed_at text not null,
-            grade text not null,
-            stability real not null,
-            difficulty real not null,
-            interval_raw real not null,
-            interval_days integer not null,
-            due_date text not null
-        ) strict;
-    ";
-
     /// Render a normalized, order-stable description of every user table:
     /// all columns (via table_xinfo, so generated columns are included) and
     /// every explicitly created index. Comparing two snapshots with
@@ -1396,28 +1457,25 @@ mod tests {
     }
 
     /// Migrating a pre-migration-era DB produces exactly the same schema as
-    /// executing a fresh schema.sql, and stamps the current schema version.
+    /// executing a fresh schema_v7.sql, and stamps the legacy schema version.
     #[test]
-    fn test_migrated_schema_matches_fresh_schema() -> Fallible<()> {
+    fn test_legacy_ladder_converges_on_the_v7_schema() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let old_path = dir.path().join("old.db");
+        crate::db::test_support::create_legacy_v0(&old_path)?;
         let old_path = old_path.to_str().unwrap();
-        {
-            let conn = Connection::open(old_path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
-        }
         let migrated = Database::new(old_path)?;
         let fresh = Database::new(":memory:")?;
         assert_eq!(
             schema_snapshot(&migrated.conn)?,
             schema_snapshot(&fresh.conn)?,
-            "migrated schema diverged from fresh schema.sql"
+            "migrated schema diverged from schema_v7.sql"
         );
         let version: i64 =
             migrated
                 .conn
                 .query_row("select version from schema_version;", [], |row| row.get(0))?;
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, LEGACY_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -1427,11 +1485,8 @@ mod tests {
     fn test_reopening_migrated_db_is_stable() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("stable.db");
+        crate::db::test_support::create_legacy_v0(&path)?;
         let path = path.to_str().unwrap();
-        {
-            let conn = Connection::open(path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
-        }
         let first = Database::new(path)?;
         let snapshot = schema_snapshot(&first.conn)?;
         drop(first);
@@ -1449,7 +1504,7 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let conn = Connection::open(path)?;
-            conn.execute_batch(include_str!("schema.sql"))?;
+            conn.execute_batch(include_str!("schema_v7.sql"))?;
             conn.execute_batch(
                 "create table if not exists schema_version (version integer not null) strict;",
             )?;
@@ -1470,10 +1525,8 @@ mod tests {
     fn test_populated_legacy_db_migrates() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pop.db");
-        let path = path.to_str().unwrap();
         {
-            let conn = Connection::open(path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
+            let conn = crate::db::test_support::create_legacy_v0(&path)?;
             conn.execute_batch(
                 "insert into cards (card_hash, added_at, review_count) values ('abc', '2026-08-30T09:00:00.000', 1);
                  insert into sessions (session_id, started_at, ended_at) values (1, '2026-08-30T09:00:00.000', '2026-08-30T09:00:00.000');
@@ -1481,7 +1534,7 @@ mod tests {
                  values (1, 1, 'abc', '2026-08-30T09:00:00.000', 'good', 2.0, 5.0, 2.0, 2, '2026-09-01');",
             )?;
         }
-        let db = Database::new(path)?;
+        let db = Database::new(path.to_str().unwrap())?;
         let d: String = db
             .conn
             .query_row("select reviewed_date from reviews;", [], |r| r.get(0))?;

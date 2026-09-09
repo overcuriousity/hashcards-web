@@ -26,6 +26,7 @@ mod media;
 mod parser;
 mod rng;
 mod types;
+mod user_db;
 mod utils;
 
 use std::process::ExitCode;
