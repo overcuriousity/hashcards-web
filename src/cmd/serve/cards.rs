@@ -51,6 +51,18 @@ impl CardRoot {
         &self.root
     }
 
+    /// This tree's directory name: `default`, or `{email-slug}-{8 hex}`.
+    ///
+    /// The key under which everything belonging to one user is filed --
+    /// their review database (`{data_dir}/db/{tree}.db`) and their trash
+    /// (`{data_dir}/trash/{tree}/`).
+    pub fn tree_name(&self) -> Fallible<&str> {
+        self.root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| ErrorReport::new("the card folder has no readable name"))
+    }
+
     /// Resolve a client-supplied relative path inside this tree.
     ///
     /// Unlike `MediaLoader::validate`, the final component need not exist —
@@ -419,12 +431,7 @@ pub fn discover_local_collections(
 /// `default` or `{email-slug}-{8 hex}`, and so can never collide with a
 /// collection id, which is eight hex characters.
 pub fn user_db_path(root: &CardRoot, db_dir: &Path) -> Fallible<PathBuf> {
-    let name = root
-        .path()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| ErrorReport::new("the card folder has no readable name"))?;
-    Ok(db_dir.join(format!("{name}.db")))
+    Ok(db_dir.join(format!("{}.db", root.tree_name()?)))
 }
 
 /// Every collection in every user's tree under `{data_dir}/cards`.

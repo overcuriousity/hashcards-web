@@ -16,6 +16,7 @@ mod merge;
 mod reviewdb;
 pub mod server;
 mod state;
+mod trash;
 mod upload;
 
 pub mod stats;
