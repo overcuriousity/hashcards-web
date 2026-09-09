@@ -110,6 +110,17 @@ impl Display for TokenSecret {
     }
 }
 
+/// Redacted, deliberately. `Debug` is what a panic message, a `dbg!` and
+/// every `{:?}` in a log line reach for, and a secret that only has to be
+/// readable once should not be one interpolation away from a log file.
+/// `Display` is the way to get at the value, and it has exactly one caller:
+/// the page that shows it.
+impl std::fmt::Debug for TokenSecret {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenSecret(redacted)")
+    }
+}
+
 /// The blake3 digest of a `TokenSecret`, hex encoded.
 ///
 /// This is what a row is keyed by, what a revocation names, and the only

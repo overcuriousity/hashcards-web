@@ -7,6 +7,7 @@ use axum_extra::extract::cookie::Key;
 use chrono::Duration;
 use parking_lot::Mutex;
 
+use crate::auth_db::AuthDatabase;
 use crate::cmd::drill::render::AnswerControls;
 use crate::cmd::drill::state::CardMigration;
 use crate::cmd::drill::state::MigrationEffect;
@@ -92,6 +93,11 @@ pub struct AppState {
     /// Set when `[oidc]` is configured. Gates every route except `/auth/*`
     /// behind login and scopes collections/notes to their `owner`.
     pub oidc: Option<Arc<OidcRuntime>>,
+    /// The server's MCP token store, at `{data_dir}/auth.db`.
+    ///
+    /// `None` only when no data directory is configured, which is the same
+    /// condition under which there is nothing to serve.
+    pub auth: Option<Arc<AuthDatabase>>,
 }
 
 /// Lets `axum_extra`'s `SignedCookieJar` extractor pull the signing key
@@ -324,6 +330,10 @@ pub mod test_support {
             migration_failures: Arc::new(HashMap::new()),
             session_key: Key::generate(),
             oidc: None,
+            // Tests that need one open it themselves: most do not touch
+            // tokens at all, and opening a database per state would make
+            // every unrelated test pay for it.
+            auth: None,
         }
     }
 }

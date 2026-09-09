@@ -13,6 +13,7 @@ use axum::routing::post;
 use axum_extra::extract::cookie::Key;
 use tokio::net::TcpListener;
 
+use crate::auth_db::AuthDatabase;
 use crate::cmd::drill::fonts::font_handler;
 use crate::cmd::drill::fonts::legacy_font_handler;
 use crate::cmd::drill::hljs::hljs_css_handler;
@@ -72,6 +73,9 @@ use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
 use crate::cmd::serve::state::evict_idle_sessions;
 use crate::cmd::serve::stats::collection_stats_handler;
+use crate::cmd::serve::tokens::tokens_get_handler;
+use crate::cmd::serve::tokens::tokens_mint_handler;
+use crate::cmd::serve::tokens::tokens_revoke_handler;
 use crate::cmd::serve::trash_ui::trash_empty_handler;
 use crate::cmd::serve::trash_ui::trash_get_handler;
 use crate::cmd::serve::trash_ui::trash_purge_handler;
@@ -255,6 +259,15 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
     // collision can actually be created.
     let _ = check_deck_slug_collisions;
 
+    // The MCP token store. Opened here rather than per request: it creates
+    // its schema on open, so a data directory that cannot hold it should
+    // fail at startup with a clear error rather than at a client's first
+    // call.
+    let auth = match &config.data_dir {
+        Some(data_dir) => Some(Arc::new(AuthDatabase::open(&data_dir.join("auth.db"))?)),
+        None => None,
+    };
+
     let state = AppState {
         config: config.clone(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -264,6 +277,7 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         migration_failures: Arc::new(migration_failures),
         session_key: session_key(config.oidc.as_ref())?,
         oidc,
+        auth,
     };
 
     spawn_session_eviction_task(state.sessions.clone(), config.session_timeout_minutes);
@@ -285,6 +299,9 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
             "/files/media/{*path}",
             post(media_upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/tokens", get(tokens_get_handler))
+        .route("/tokens/new", post(tokens_mint_handler))
+        .route("/tokens/revoke", post(tokens_revoke_handler))
         .route("/trash", get(trash_get_handler))
         .route("/trash/restore", post(trash_restore_handler))
         .route("/trash/purge", post(trash_purge_handler))
