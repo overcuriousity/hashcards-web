@@ -31,6 +31,7 @@ use crate::db::probe_schema_exists;
 use crate::db::set_schema_version;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::card_hash::CardHash;
 use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
 
@@ -92,6 +93,53 @@ impl UserDatabase {
     /// A view of one collection on this database's connection.
     pub fn collection(&self, id: CollectionId) -> Database {
         Database::new_view(Arc::clone(&self.conn), id)
+    }
+
+    /// Move some cards' review history from one collection to another.
+    ///
+    /// This is what the per-user database bought: after consolidation both
+    /// collections are rows in one file, so a deck moving between them is
+    /// an update, not a transfer between two databases. The schema's
+    /// `on update cascade` on `(collection_id, card_hash)` carries each
+    /// card's reviews and bookmark across with it -- see the comment in
+    /// `schema.sql`, which anticipated exactly this.
+    ///
+    /// A card the destination *already* has keeps the destination's
+    /// schedule: identical cards in two collections are two schedules by
+    /// design, and the one already in force where the card is going is the
+    /// one that applies. The source row is dropped rather than overwriting
+    /// it.
+    ///
+    /// One transaction, so a deck is never half-moved.
+    pub fn move_cards(
+        &self,
+        from: &CollectionId,
+        to: &CollectionId,
+        hashes: &[CardHash],
+    ) -> Fallible<usize> {
+        if from == to || hashes.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut moved = 0;
+        for hash in hashes {
+            if card_row_exists(&tx, to, *hash)? {
+                // The destination already schedules this card. Drop the
+                // source's row rather than colliding with it.
+                tx.execute(
+                    "delete from cards where collection_id = ?1 and card_hash = ?2;",
+                    params![from, hash],
+                )?;
+                continue;
+            }
+            moved += tx.execute(
+                "update cards set collection_id = ?1 where collection_id = ?2 and card_hash = ?3;",
+                params![to, from, hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(moved)
     }
 
     /// Close session rows left dangling by a crash or restart, across every
@@ -206,6 +254,20 @@ fn prepare_schema(conn: &mut Connection, path: &Path) -> Fallible<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Does this collection already have a row for this card?
+fn card_row_exists(
+    tx: &rusqlite::Transaction<'_>,
+    collection: &CollectionId,
+    hash: CardHash,
+) -> Fallible<bool> {
+    let n: i64 = tx.query_row(
+        "select count(*) from cards where collection_id = ?1 and card_hash = ?2;",
+        params![collection, hash],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -439,6 +501,80 @@ mod tests {
             message.contains("legacy"),
             "the error must point at where the file went: {message}"
         );
+        Ok(())
+    }
+
+    /// Moving a deck between collections is an update, not a transfer
+    /// between two database files -- which is what the per-user database
+    /// bought, and the reason the MCP has a move_decks tool at all.
+    #[test]
+    fn moving_a_card_carries_its_reviews_across() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let from = CollectionId::new("aaaaaaaa")?;
+        let to = CollectionId::new("bbbbbbbb")?;
+        let hash = CardHash::hash_bytes(b"a card");
+        let now = Timestamp::now();
+
+        let source = user.collection(from.clone());
+        source.insert_card(hash, now)?;
+        let session = source.create_session(now)?;
+        source.insert_review_immediately(
+            session,
+            &ReviewRecord {
+                card_hash: hash,
+                reviewed_at: now,
+                grade: Grade::Good,
+                stability: 1.0,
+                difficulty: 2.0,
+                interval_raw: 1.0,
+                interval_days: 1,
+                due_date: now.date(),
+                duration_ms: None,
+            },
+        )?;
+
+        assert_eq!(user.move_cards(&from, &to, &[hash])?, 1);
+
+        assert!(user.collection(from).card_hashes()?.is_empty());
+        let dest = user.collection(to);
+        assert!(dest.card_hashes()?.contains(&hash));
+        assert_eq!(
+            dest.reviews_for_card(hash)?.len(),
+            1,
+            "on update cascade did not carry the reviews across"
+        );
+        Ok(())
+    }
+
+    /// Identical cards in two collections are two schedules by design, so
+    /// the destination's own schedule is the one that applies there.
+    #[test]
+    fn moving_a_card_the_destination_already_has_keeps_the_destinations_schedule() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let from = CollectionId::new("aaaaaaaa")?;
+        let to = CollectionId::new("bbbbbbbb")?;
+        let hash = CardHash::hash_bytes(b"a card");
+        let now = Timestamp::now();
+
+        user.collection(from.clone()).insert_card(hash, now)?;
+        user.collection(to.clone()).insert_card(hash, now)?;
+
+        // Nothing moved, and nothing collided.
+        assert_eq!(user.move_cards(&from, &to, &[hash])?, 0);
+        assert!(user.collection(from).card_hashes()?.is_empty());
+        assert!(user.collection(to).card_hashes()?.contains(&hash));
+        Ok(())
+    }
+
+    #[test]
+    fn moving_a_card_to_where_it_already_is_does_nothing() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let id = CollectionId::new("aaaaaaaa")?;
+        let hash = CardHash::hash_bytes(b"a card");
+        user.collection(id.clone())
+            .insert_card(hash, Timestamp::now())?;
+        assert_eq!(user.move_cards(&id, &id, &[hash])?, 0);
+        assert!(user.collection(id).card_hashes()?.contains(&hash));
         Ok(())
     }
 }
