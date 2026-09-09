@@ -79,7 +79,8 @@ impl HashcardsMcp {
             tool_router: Self::read_router()
                 + Self::card_router()
                 + Self::deck_router()
-                + Self::collection_router(),
+                + Self::collection_router()
+                + Self::saved_router(),
         }
     }
 

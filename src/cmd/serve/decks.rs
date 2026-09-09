@@ -225,7 +225,7 @@ pub(super) fn deck_choices(
 }
 
 /// The `[[deck]]` entries as they should be written to the config file.
-fn entries_from(decks: &[ResolvedCustomDeck]) -> Vec<CustomDeckEntry> {
+pub(crate) fn entries_from(decks: &[ResolvedCustomDeck]) -> Vec<CustomDeckEntry> {
     decks
         .iter()
         .map(|d| CustomDeckEntry {
@@ -323,7 +323,7 @@ pub(super) fn render_decks_page(
 /// never be offered on `/decks` and then refused when it is chosen.
 ///
 /// Blocking: local collections are discovered by reading the tree.
-fn owned_collections(state: &AppState, owner: Option<&str>) -> Vec<ResolvedCollection> {
+pub(crate) fn owned_collections(state: &AppState, owner: Option<&str>) -> Vec<ResolvedCollection> {
     collections_for_user(state, current_user_for(owner).as_ref())
 }
 

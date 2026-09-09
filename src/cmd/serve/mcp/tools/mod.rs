@@ -10,6 +10,7 @@ pub mod cards;
 pub mod collections;
 pub mod decks;
 pub mod read;
+pub mod saved;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -39,6 +40,23 @@ pub(crate) mod tests {
         collection_id(&root.path().join("Spanish"))?;
         ensure_dir(&dir.path().join("db"), "review database directory")?;
         Ok((dir, HashcardsMcp::new(state)))
+    }
+
+    /// The same fixture with a real `hashcards.toml` on disk, which saved
+    /// decks are written back to.
+    pub(crate) fn mcp_fixture_with_config() -> Fallible<(TempDir, HashcardsMcp, std::path::PathBuf)>
+    {
+        let (dir, mcp) = mcp_fixture()?;
+        let config_path = dir.path().join("hashcards.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\ndata_dir = {:?}\n",
+                dir.path().display().to_string()
+            ),
+        )?;
+        *mcp.state.config_path.lock() = Some(config_path.clone());
+        Ok((dir, mcp, config_path))
     }
 
     /// A drill session on `slug`, holding `cards` in its queue — the shape
