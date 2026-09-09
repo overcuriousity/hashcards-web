@@ -67,6 +67,7 @@ use crate::cmd::serve::handlers::collection_post_handler;
 use crate::cmd::serve::handlers::collection_script_handler;
 use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
+use crate::cmd::serve::mcp::mcp_routes;
 use crate::cmd::serve::merge::merge_legacy_databases;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
@@ -387,6 +388,14 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         app
     };
     let app = app.merge(static_routes);
+    // After `require_auth`, like `/auth/*`: an MCP client cannot follow a
+    // redirect to a login page, so `/mcp` does its own bearer check and
+    // answers 401 instead.
+    let app = if state.config.mcp.enabled {
+        app.merge(mcp_routes(&state))
+    } else {
+        app
+    };
     let app = app.with_state(state);
 
     log::debug!("Starting server on {bind}");

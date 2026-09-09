@@ -12,6 +12,7 @@ mod files_ui;
 mod handlers;
 mod href;
 mod landing;
+mod mcp;
 mod merge;
 mod reviewdb;
 pub mod server;
@@ -28,6 +29,7 @@ mod tests {
     use std::fs::write;
     use std::path::PathBuf;
 
+    use crate::helper::create_tmp_directory;
     use portpicker::pick_unused_port;
     use tempfile::TempDir;
     use tempfile::tempdir;
@@ -94,6 +96,16 @@ mod tests {
 
     /// Serve `data_dir` on `port`, and wait until it answers.
     async fn serve_data_dir(data_dir: &std::path::Path, port: u16) -> Fallible<()> {
+        serve_data_dir_with(data_dir, port, ResolvedMcp::default()).await
+    }
+
+    /// The same, with the MCP endpoint configured — the tests that turn it
+    /// off, or point it at a hostname, need to say so.
+    async fn serve_data_dir_with(
+        data_dir: &std::path::Path,
+        port: u16,
+        mcp: ResolvedMcp,
+    ) -> Fallible<()> {
         let config = ResolvedServeConfig {
             host: TEST_HOST.to_string(),
             port,
@@ -102,7 +114,7 @@ mod tests {
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
-            mcp: ResolvedMcp::default(),
+            mcp,
             oidc: None,
         };
         spawn(async move { start_serve(config).await });
@@ -1105,6 +1117,188 @@ A: 2
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// A token minted straight into `{data_dir}/auth.db`, before the server
+    /// opens it.
+    fn seed_token(data_dir: &std::path::Path) -> Fallible<String> {
+        use crate::auth_db::AuthDatabase;
+        let auth = AuthDatabase::open(&data_dir.join("auth.db"))?;
+        Ok(auth
+            .mint(None, "test", crate::types::timestamp::Timestamp::now())?
+            .to_string())
+    }
+
+    async fn post_mcp(port: u16, token: Option<&str>) -> Fallible<reqwest::Response> {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{TEST_HOST}:{port}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("{}");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        req.send()
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(e.to_string()))
+    }
+
+    /// An MCP client cannot follow a redirect to a login page, so /mcp must
+    /// refuse with a challenge rather than the redirect require_auth sends.
+    #[tokio::test]
+    async fn test_mcp_without_a_token_is_refused_without_a_redirect() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = post_mcp(port, None).await?;
+        assert_eq!(res.status(), 401);
+        assert!(
+            res.headers().contains_key("www-authenticate"),
+            "an MCP client needs to be told how to authenticate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_with_an_unknown_token_is_refused() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let bogus = format!("hcw_{}", "0".repeat(64));
+        assert_eq!(post_mcp(port, Some(&bogus)).await?.status(), 401);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_revoked_token_stops_working() -> Fallible<()> {
+        use crate::auth_db::AuthDatabase;
+        use crate::auth_db::TokenSecret;
+
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        {
+            let auth = AuthDatabase::open(&dir.join("auth.db"))?;
+            auth.revoke(None, &TokenSecret::parse(&token)?.digest())?;
+        }
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        assert_eq!(post_mcp(port, Some(&token)).await?.status(), 401);
+        Ok(())
+    }
+
+    /// The handshake, driven by a real MCP client rather than a
+    /// hand-written frame, so protocol negotiation is exercised.
+    #[tokio::test]
+    async fn test_mcp_handshake_succeeds_and_carries_the_instructions() -> Fallible<()> {
+        use rmcp::ServiceExt;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{TEST_HOST}:{port}/mcp"))
+                .auth_header(token),
+        );
+        let client = ()
+            .serve(transport)
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(format!("handshake failed: {e}")))?;
+
+        let info = client.peer_info().expect("the server sent no server info");
+        let instructions = info
+            .instructions
+            .clone()
+            .expect("the server sent no instructions");
+        // A model cannot infer any of this from tool names.
+        for needle in [
+            "collection",
+            "deck",
+            "CONTENT ADDRESS",
+            "Q:",
+            "A:",
+            "C:",
+            "---",
+        ] {
+            assert!(
+                instructions.contains(needle),
+                "the instructions never mention `{needle}`"
+            );
+        }
+
+        let tools = client
+            .list_tools(Default::default())
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(format!("tools/list failed: {e}")))?;
+        assert!(tools.tools.is_empty(), "no tools exist yet");
+        client.cancel().await.ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_endpoint_is_absent_when_disabled() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir_with(
+            &dir,
+            port,
+            ResolvedMcp {
+                enabled: false,
+                allowed_hosts: vec![TEST_HOST.to_string()],
+            },
+        )
+        .await?;
+        assert_eq!(post_mcp(port, Some(&token)).await?.status(), 404);
+        Ok(())
+    }
+
+    /// Mounting /mcp must not change what the rest of the application does
+    /// with a path it does not have. `Router::layer` wraps the fallback as
+    /// well as the routes, so the bearer check answered 401 for every
+    /// unknown path in the whole server until this used `route_layer`.
+    #[tokio::test]
+    async fn test_mounting_mcp_leaves_unknown_paths_a_404() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = reqwest::get(format!("http://{TEST_HOST}:{port}/no-such-page")).await?;
+        assert_eq!(res.status(), 404);
+        Ok(())
+    }
+
+    /// rmcp refuses a Host it does not recognise, as protection against a
+    /// browser page rebinding DNS at a local MCP server. An instance served
+    /// under a real name must list it or nothing works, so the refusal is
+    /// pinned here rather than discovered in production.
+    #[tokio::test]
+    async fn test_mcp_refuses_an_unlisted_host() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = reqwest::Client::new()
+            .post(format!("http://{TEST_HOST}:{port}/mcp"))
+            .header("host", "cards.example.com")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("{}")
+            .send()
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(e.to_string()))?;
+        assert_ne!(
+            res.status(),
+            200,
+            "an unlisted Host must not be served: that is the DNS-rebinding guard"
+        );
         Ok(())
     }
 }
