@@ -11,6 +11,7 @@ pub mod collections;
 pub mod decks;
 pub mod read;
 pub mod saved;
+pub mod trash;
 
 #[cfg(test)]
 pub(crate) mod tests {

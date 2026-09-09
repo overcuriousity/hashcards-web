@@ -1254,6 +1254,8 @@ A: 2
             tools.tools.iter().all(|t| t.description.is_some()),
             "a tool has no description"
         );
+        // The whole surface reaches a real client, not just the router.
+        assert_eq!(tools.tools.len(), 23, "{names:?}");
         client.cancel().await.ok();
         Ok(())
     }

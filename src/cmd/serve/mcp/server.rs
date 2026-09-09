@@ -80,7 +80,8 @@ impl HashcardsMcp {
                 + Self::card_router()
                 + Self::deck_router()
                 + Self::collection_router()
-                + Self::saved_router(),
+                + Self::saved_router()
+                + Self::trash_router(),
         }
     }
 
@@ -107,7 +108,6 @@ impl HashcardsMcp {
     /// Every tool this server offers, by name. The trash tools' test uses
     /// it to assert that nothing in the whole surface destroys anything.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_router
             .list_all()
