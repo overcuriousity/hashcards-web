@@ -95,13 +95,6 @@ impl SessionDbs {
         &self.dbs[idx.min(self.dbs.len().saturating_sub(1))]
     }
 
-    /// The database owning `hash`, for the writes that need `&mut Database`.
-    pub fn for_card_mut(&mut self, hash: CardHash) -> &mut SessionDb {
-        let idx = self.routes.get(&hash).copied().unwrap_or(0);
-        let idx = idx.min(self.dbs.len().saturating_sub(1));
-        &mut self.dbs[idx]
-    }
-
     /// How the collection owning `hash` schedules it.
     pub fn scheduling_for(&self, hash: CardHash) -> Scheduling {
         self.for_card(hash).scheduling
@@ -418,7 +411,7 @@ mod tests {
     /// A session holding `cards`, with every card in the cache as `New` and
     /// a real in-memory database behind it.
     fn session_over(cards: Vec<Card>) -> Fallible<MutableState> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let session_id = db.create_session(Timestamp::now())?;
         let mut cache = Cache::new();
         for card in &cards {
@@ -457,7 +450,7 @@ mod tests {
         let a = make_card("belongs to the strict collection");
         let b = make_card("belongs to the relaxed collection");
         let db = |scheduling| -> Fallible<SessionDb> {
-            let db = Database::new(":memory:")?;
+            let db = Database::memory()?;
             let session_id = db.create_session(Timestamp::now())?;
             Ok(SessionDb {
                 db,
@@ -481,7 +474,7 @@ mod tests {
     /// so Undo (which pops `reviews`) rolls progress back automatically.
     #[test]
     fn test_progress_counts_first_grades_and_repeats() {
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let session_id = db.create_session(Timestamp::now()).unwrap();
         let a = make_card("question a");
         let b = make_card("question b");
@@ -661,9 +654,9 @@ mod tests {
     fn migration_rekeys_the_database_route() -> Fallible<()> {
         let old = make_card("question a");
         let new = make_card_with("question a", "a better answer");
-        let db_a = Database::new(":memory:")?;
+        let db_a = Database::memory()?;
         let session_a = db_a.create_session(Timestamp::now())?;
-        let db_b = Database::new(":memory:")?;
+        let db_b = Database::memory()?;
         let session_b = db_b.create_session(Timestamp::now())?;
         let source = SessionSource {
             coll_dir: PathBuf::from("/tmp/coll"),

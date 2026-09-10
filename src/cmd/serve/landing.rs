@@ -33,7 +33,7 @@ pub async fn landing_handler(
         let state = state.clone();
         let user = current_user.clone();
         match tokio::task::spawn_blocking(move || {
-            refresh_collection_info(&collections_for_user(&state, user.as_ref()))
+            refresh_collection_info(&state, &collections_for_user(&state, user.as_ref()))
         })
         .await
         {
@@ -99,7 +99,7 @@ pub async fn landing_handler(
         let uncounted = deck.clone();
         let counts = tokio::task::spawn_blocking(move || {
             let sources = deck_sources(&state, &deck, user.as_ref().map(|u| u.email.as_str()));
-            deck_card_counts(&sources).map(|(due, total)| (deck, due, total))
+            deck_card_counts(&state, &sources).map(|(due, total)| (deck, due, total))
         })
         .await;
         // Counting can fail either way — the collection would not load, or

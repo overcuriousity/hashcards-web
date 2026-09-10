@@ -94,8 +94,9 @@ session_timeout_minutes = 1440      # 0 disables eviction
 `data_dir` is where the server keeps the card trees (`{data_dir}/cards/{user}`)
 and the review databases (`{data_dir}/db`). A collection is a top-level folder
 in one of those trees — discovered by reading the directory, not declared in
-this file — and its review database is named from the stable id in the
-folder's `.hashcards.toml`, so renaming a folder keeps its history.
+this file — and its rows in its owner's review database are scoped by the
+stable id in the folder's `.hashcards.toml`, so renaming a folder keeps its
+history.
 
 Ownership is structural: with `[oidc]` configured a user's collections are the
 folders in `{data_dir}/cards/{their-email-slug}-{hash}/`, and without it they
@@ -261,8 +262,8 @@ cards as hashcards parses them. A file that does not parse is never saved —
 you get the error and its line number instead.
 
 Renaming a folder is safe. Each one keeps a `.hashcards.toml` holding a stable
-id, and review databases are named from that id rather than from the folder
-name, so your history follows the rename.
+id, and review rows are scoped by that id rather than by the folder name, so
+your history follows the rename.
 
 A collection folder cannot take the URL slug of a saved deck: both are
 addressed through `/collection/{slug}` and routing prefers the collection, so
@@ -272,8 +273,26 @@ the first by name order wins and the other is left out of the list with a
 warning in the log, rather than making the URL mean whichever the filesystem
 happened to yield first.
 
-Deleting a collection folder deletes its review database with it. Folders that
-still hold files are refused, so this only happens once you have emptied one.
+Deleting anything moves it to the **trash** rather than destroying it, so a
+folder full of topics can go in one action — you no longer have to empty it
+first.
+
+### Trash
+
+`/trash` holds everything you have deleted, from the file manager or through
+the MCP endpoint. Restoring puts it back where it was; if something has taken
+the same name since, the restore is refused and the copy stays in the trash
+rather than overwriting what is there now.
+
+A deleted collection keeps its review history for as long as it is in the
+trash. Card hashes are content addresses, so a restored folder finds its own
+rows again and its whole schedule comes back — nothing is replayed, because
+nothing was thrown away.
+
+**Emptying the trash is the only thing in hashcards that destroys anything.**
+It removes the files *and* erases the review history of any collection in
+there, which is also what stops a collection recreated under an old name
+inheriting a stale schedule. Disk space is not reclaimed until you do it.
 
 ### Images
 
@@ -536,20 +555,103 @@ Principles of Neural Science/
   Ch2.md
 ```
 
+## MCP
+
+hashcards speaks [MCP](https://modelcontextprotocol.io) at `/mcp`, so an AI
+assistant can read and write your cards, decks and collections — writing
+cards from your notes, reorganising a collection, or telling you what is
+waiting to be reviewed.
+
+Mint a token for yourself at `/tokens`. It is shown once, when it is created,
+and only its digest is stored, so nobody can read it back out of the server —
+including you. Give one to software you trust, over a connection you trust:
+every token can write, and anyone holding one can do anything to your cards
+that you can. Revoke it from the same page the moment you no longer want it
+to work.
+
+The endpoint is on by default and needs no configuration to reach from the
+same machine. An instance served under a real hostname must name it:
+
+```toml
+[mcp]
+allowed_hosts = ["cards.example.com"]
+```
+
+Without that, every MCP request is refused and nothing in the log explains
+why. The check is not ours — it is the MCP SDK's protection against a web
+page in a browser driving a local MCP server by pointing its own hostname at
+`127.0.0.1` — and its default of loopback-only is right for an MCP server
+running on a desktop and wrong for one on a server. `enabled = false` turns
+the endpoint off entirely.
+
+What an assistant can and cannot do:
+
+- **Cards, decks, collections and saved decks are writable.** So are a
+  collection's scheduling settings.
+- **The schedule itself is not.** There is no way to make a card be
+  forgotten, set its due date, or suspend it. Reading a card's history and
+  statistics is fine; rewriting them is not on offer.
+- **Nothing it deletes is destroyed.** Everything goes to your trash, and
+  there is no tool that empties it — that is a human action, in the web
+  interface. This is the reason a write token is a reasonable thing to hand
+  out at all.
+
+One thing worth knowing: your cards are text, and an assistant reading them
+is reading text you may not have written. A collection imported from
+somewhere else could contain something shaped like an instruction. That is
+worth a thought before pointing an assistant with a write token at a
+collection you did not write yourself — the trash is what bounds the damage,
+not prevention.
+
 ## Database
 
-Each collection has an SQLite database at `{data_dir}/db/{id}.db`, where `id`
-is the stable id in the collection folder's `.hashcards.toml` — not the folder
-name, so renaming a folder keeps its history. Reviews are written as they
-happen and in the same transaction as the card's performance, so an
-interrupted session keeps its progress. Undo marks a review `voided` rather
-than deleting it, and read paths filter on `voided = 0`.
+Each **user** has one SQLite database at `{data_dir}/db/{tree}.db`, where
+`tree` is the name of their card tree under `{data_dir}/cards/` — `default`
+without `[oidc]`, and `{email-slug}-{hash}` with it. Every row carries the
+`collection_id` of the collection it belongs to: the stable id in that
+collection folder's `.hashcards.toml`, not the folder name, so renaming a
+folder keeps its history.
+
+Identical cards in two collections keep two schedules. That is what two
+files necessarily meant, and it is now stated as the primary key
+`(collection_id, card_hash)`.
+
+Reviews are written as they happen and in the same transaction as the card's
+performance, so an interrupted session keeps its progress. Undo marks a
+review `voided` rather than deleting it, and read paths filter on
+`voided = 0`.
+
+Databases are opened with write-ahead logging where the filesystem supports
+it. Where it does not — some NFS and SMB mounts — hashcards logs a line and
+carries on in rollback-journal mode.
+
+### Upgrading from per-collection databases
+
+Before this release, each *collection* had its own database at
+`{data_dir}/db/{id}.db`. On the first start after upgrading, those are
+merged into one database per user, in a single transaction per user, and the
+originals are **moved** — not deleted — into `{data_dir}/db/legacy/`.
+
+A user whose merge fails is refused, loudly: their collections show the
+error and point at the startup log, rather than being served from an empty
+database. Every other user is served, and the server starts.
+
+**The upgrade is one way.** An older binary will not look at
+`db/{tree}.db`; it will look for `db/{id}.db`, find nothing, and quietly
+create empty per-collection databases, so every session starts from zero
+with no error at all. If you need to go back: stop the server, move the
+files in `db/legacy/` back into `db/`, and delete the `db/{tree}.db` files
+the newer binary wrote. The originals are kept precisely so that this is
+possible — and moved rather than left where they were, because an older
+binary writing into a file that has already been merged would have those
+reviews skipped by the next upgrade and lost without a word.
 
 The `cards` table:
 
 | Column             | Type               | Description                                                                        |
 |--------------------|--------------------|------------------------------------------------------------------------------------|
-| `card_hash`        | `text primary key` | The hash of the card.                                                              |
+| `collection_id`    | `text not null`    | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
+| `card_hash`        | `text not null`    | The hash of the card.                                                              |
 | `added_at`         | `text not null`    | When the card was first added to the database.                                     |
 | `last_reviewed_at` | `text`             | When the card was most recently reviewed. `null` if the card is new.               |
 | `stability`        | `real`             | The card's stability. `null` if the card is new.                                   |
@@ -564,6 +666,7 @@ The `sessions` table:
 | Column         | Type                  | Description                                                                     |
 |----------------|-----------------------|---------------------------------------------------------------------------------|
 | `session_id`   | `integer primary key` | The ID of the session.                                                          |
+| `collection_id` | `text not null`      | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
 | `started_at`   | `text not null`       | When the session started.                                                       |
 | `ended_at`     | `text not null`       | When the session ended.                                                         |
 | `last_seen_at` | `text`                | Stamped as the owning process serves the session, so the startup sweep can tell a session abandoned by a crash from one still live elsewhere. |
@@ -575,6 +678,7 @@ The `reviews` table:
 |-----------------|-----------------------|---------------------------------------------------------------------------------|
 | `review_id`     | `integer primary key` | The review ID.                                                                  |
 | `session_id`    | `integer not null`    | The session this review was performed in, a foreign key.                        |
+| `collection_id` | `text not null`       | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
 | `card_hash`     | `text not null`       | The card that was reviewed, a foreign key.                                      |
 | `reviewed_at`   | `text not null`       | When the grade was submitted.                                                   |
 | `grade`         | `text not null`       | One of `forgot`, `hard`, `good`, or `easy`.                                     |
@@ -591,7 +695,8 @@ The `bookmarks` table:
 
 | Column       | Type               | Description                                                    |
 |--------------|--------------------|----------------------------------------------------------------|
-| `card_hash`  | `text primary key` | The bookmarked card, a foreign key that cascades on rename.    |
+| `collection_id` | `text not null` | The collection this row belongs to: the stable id in its folder's `.hashcards.toml`. |
+| `card_hash`  | `text not null`    | The bookmarked card, a foreign key that cascades on rename.    |
 | `note`       | `text`             | The note attached to the bookmark, if any.                     |
 | `created_at` | `text not null`    | When the bookmark was made.                                    |
 

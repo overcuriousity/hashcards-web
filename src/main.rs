@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod auth_db;
 mod cli;
 mod cmd;
 mod collection;
@@ -26,6 +27,7 @@ mod media;
 mod parser;
 mod rng;
 mod types;
+mod user_db;
 mod utils;
 
 use std::process::ExitCode;

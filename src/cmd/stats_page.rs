@@ -304,7 +304,7 @@ mod tests {
     /// full card total, and the forecast would disagree with the deck table.
     #[test]
     fn test_never_drilled_collection_counts_every_card_due() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let cards = vec![
             make_card("Biology", "Q1"),
             make_card("Biology", "Q2"),
@@ -335,7 +335,7 @@ mod tests {
     /// the page irreconcilable.
     #[test]
     fn test_orphan_rows_are_excluded_from_the_forecast() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let cards = vec![make_card("Biology", "Q1")];
         let now = Timestamp::now();
         db.insert_card(cards[0].hash(), now)?;
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_gather_stats_per_deck_counts() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let now = Timestamp::now();
         let a = make_card("Alpha", "q1");
         let b = make_card("Alpha", "q2");
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_render_stats_page_sections() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let stats = gather_stats(&db, &[], Date::today())?;
         let html = render_stats_page("MyCollection", &stats, Some("/collection/my")).into_string();
         assert!(html.contains("MyCollection"));

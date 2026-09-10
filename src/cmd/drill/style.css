@@ -164,8 +164,19 @@ html {
   text-rendering: optimizeLegibility;
 }
 
+/* The installed app is drawn edge to edge: on Android 15 and later the
+   layout viewport spans the status bar and the gesture bar, so `100dvh`
+   measures pixels the system draws over. The inset those bars need is
+   reserved once, here, and every page is laid out inside what is left. It
+   has to be `border-box` for that: otherwise the padding is added to the
+   height rather than taken out of it, and the page grows by exactly the
+   amount it was meant to give back. */
 body {
   margin: 0;
+  box-sizing: border-box;
+  padding:
+    env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   min-height: 100dvh;
   background: var(--color-bg-base);
   color: var(--color-fg-primary);
@@ -178,8 +189,15 @@ body {
    header, card, controls, with the card scrolling between two pinned bars. It
    claims the viewport; every other page is prose and scrolls normally.
    Scoped with `:has` so the claim lives with the layout that makes it, and no
-   page has to remember to opt out. */
-body:has(.root) { height: 100dvh; overflow: hidden; }
+   page has to remember to opt out.
+
+   The strips the insets reserve sit against its two pinned bars, so the
+   body behind them is painted the bars' own surface: the system bars abut
+   the colour they are next to rather than a seam of the page behind it. */
+body:has(.root) {
+  height: 100dvh; overflow: hidden;
+  background: var(--color-bg-surface);
+}
 
 h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 h1 { font-size: var(--text-2xl); letter-spacing: -0.02em; }
@@ -502,7 +520,11 @@ input[type="checkbox"] { accent-color: var(--color-accent); }
 
    Above the drill's pinned bars, which is the only thing it can overlap. */
 .theme-toggle {
-  position: fixed; top: 0.625rem; right: 0.75rem; z-index: 10;
+  /* Fixed elements are placed against the viewport, not against the body's
+     padding box, so the inset reserved there cannot reach this one. */
+  position: fixed; z-index: 10;
+  top: calc(0.625rem + env(safe-area-inset-top, 0px));
+  right: calc(0.75rem + env(safe-area-inset-right, 0px));
   -webkit-appearance: none; appearance: none;
   display: inline-flex; align-items: center;
   min-height: 28px; padding: 0 0.625rem;
@@ -526,9 +548,14 @@ input[type="checkbox"] { accent-color: var(--color-accent); }
 
 /* ── The drill ─────────────────────────────────────────────────────────────
    Three rows: progress, card, controls. The card is the only one that
-   scrolls, so the grade buttons are always where the hand left them. */
+   scrolls, so the grade buttons are always where the hand left them.
+
+   Its height is the body's content box, not the screen: the body is already
+   exactly the screen less the insets, and asking for `100dvh` here would
+   measure the screen a second time and hang the bottom of the grade bar —
+   and the End button under it — off the bottom edge again. */
 .root {
-  height: 100dvh;
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-base);

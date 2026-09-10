@@ -26,6 +26,7 @@ use crate::cmd::drill::template::page_template;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::files::collections_for_user;
 use crate::cmd::serve::handlers::current_user_for;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::collection::Collection;
 use crate::error::Fallible;
@@ -189,10 +190,15 @@ pub(super) struct DeckChoices {
 ///
 /// A collection that fails to load is skipped rather than failing the page:
 /// one broken markdown file should not make every other deck unpickable.
-pub(super) fn deck_choices(collections: &[ResolvedCollection]) -> Vec<DeckChoices> {
+pub(super) fn deck_choices(
+    state: &AppState,
+    collections: &[ResolvedCollection],
+) -> Vec<DeckChoices> {
     let mut out = Vec::new();
     for rc in collections {
-        let collection = match Collection::with_db_path(rc.coll_dir.clone(), rc.db_path.clone()) {
+        let collection = match open_collection_db(state, rc)
+            .and_then(|db| Collection::open(rc.coll_dir.clone(), db))
+        {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("skipping collection '{}' while listing decks: {e}", rc.name);
@@ -219,7 +225,7 @@ pub(super) fn deck_choices(collections: &[ResolvedCollection]) -> Vec<DeckChoice
 }
 
 /// The `[[deck]]` entries as they should be written to the config file.
-fn entries_from(decks: &[ResolvedCustomDeck]) -> Vec<CustomDeckEntry> {
+pub(crate) fn entries_from(decks: &[ResolvedCustomDeck]) -> Vec<CustomDeckEntry> {
     decks
         .iter()
         .map(|d| CustomDeckEntry {
@@ -317,7 +323,7 @@ pub(super) fn render_decks_page(
 /// never be offered on `/decks` and then refused when it is chosen.
 ///
 /// Blocking: local collections are discovered by reading the tree.
-fn owned_collections(state: &AppState, owner: Option<&str>) -> Vec<ResolvedCollection> {
+pub(crate) fn owned_collections(state: &AppState, owner: Option<&str>) -> Vec<ResolvedCollection> {
     collections_for_user(state, current_user_for(owner).as_ref())
 }
 
@@ -345,7 +351,7 @@ pub async fn decks_manage_handler(
     let state2 = state.clone();
     let owner2 = owner.clone();
     let choices = match tokio::task::spawn_blocking(move || {
-        deck_choices(&owned_collections(&state2, owner2.as_deref()))
+        deck_choices(&state2, &owned_collections(&state2, owner2.as_deref()))
     })
     .await
     {
@@ -542,6 +548,7 @@ pub async fn deck_delete_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::collection_id::CollectionId;
 
     fn entry(name: &str, owner: Option<&str>, members: &[&str]) -> CustomDeckEntry {
         CustomDeckEntry {
@@ -668,6 +675,7 @@ mod tests {
             slug: decks[0].slug.clone(),
             coll_dir: std::path::PathBuf::from("/tmp/a"),
             db_path: std::path::PathBuf::from("/tmp/a.db"),
+            collection_id: CollectionId::new("test-collection").expect("a non-empty id"),
             owner: None,
             overrides: Default::default(),
         }];

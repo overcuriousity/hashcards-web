@@ -12,8 +12,14 @@ mod files_ui;
 mod handlers;
 mod href;
 mod landing;
+mod mcp;
+mod merge;
+mod reviewdb;
 pub mod server;
 mod state;
+mod tokens;
+mod trash;
+mod trash_ui;
 mod upload;
 
 pub mod stats;
@@ -23,6 +29,7 @@ mod tests {
     use std::fs::write;
     use std::path::PathBuf;
 
+    use crate::helper::create_tmp_directory;
     use portpicker::pick_unused_port;
     use tempfile::TempDir;
     use tempfile::tempdir;
@@ -36,15 +43,17 @@ mod tests {
     use crate::cmd::drill::katex::KATEX_MHCHEM_JS_URL;
     use crate::cmd::drill::template::STYLE_URL;
     use crate::cmd::serve::config::DefaultsSection;
+    use crate::cmd::serve::config::ResolvedMcp;
     use crate::cmd::serve::config::ResolvedServeConfig;
     use crate::cmd::serve::server::start_serve;
-    use crate::db::Database;
     use crate::error::ErrorReport;
     use crate::error::Fallible;
     use crate::error::fail;
     use crate::types::card_hash::CardHash;
+    use crate::types::collection_id::CollectionId;
     use crate::types::performance::Performance;
     use crate::types::timestamp::Timestamp;
+    use crate::user_db::UserDatabase;
     use crate::utils::CACHE_CONTROL_IMMUTABLE;
     use crate::utils::CACHE_CONTROL_REVALIDATE;
     use crate::utils::wait_for_server;
@@ -58,14 +67,16 @@ mod tests {
     /// The folder name *is* the URL slug: discovery slugifies it, so a name
     /// with a space becomes a slug with a dash.
     ///
-    /// Returns the collection folder and its review database path.
+    /// Returns the collection folder, its owner's review database path, and
+    /// the id that scopes this collection's rows inside it.
     fn card_collection(
         data_dir: &std::path::Path,
         name: &str,
         files: &[(&str, &str)],
-    ) -> Fallible<(PathBuf, PathBuf)> {
+    ) -> Fallible<(PathBuf, PathBuf, CollectionId)> {
         use crate::cmd::serve::cards::CardRoot;
         use crate::cmd::serve::cards::collection_id;
+        use crate::cmd::serve::cards::user_db_path;
 
         let root = CardRoot::for_user(data_dir, None)?;
         let folder = root.path().join(name);
@@ -80,11 +91,21 @@ mod tests {
         let id = collection_id(&folder)?;
         let db_dir = data_dir.join("db");
         std::fs::create_dir_all(&db_dir)?;
-        Ok((folder, db_dir.join(format!("{id}.db"))))
+        Ok((folder, user_db_path(&root, &db_dir)?, id))
     }
 
     /// Serve `data_dir` on `port`, and wait until it answers.
     async fn serve_data_dir(data_dir: &std::path::Path, port: u16) -> Fallible<()> {
+        serve_data_dir_with(data_dir, port, ResolvedMcp::default()).await
+    }
+
+    /// The same, with the MCP endpoint configured — the tests that turn it
+    /// off, or point it at a hostname, need to say so.
+    async fn serve_data_dir_with(
+        data_dir: &std::path::Path,
+        port: u16,
+        mcp: ResolvedMcp,
+    ) -> Fallible<()> {
         let config = ResolvedServeConfig {
             host: TEST_HOST.to_string(),
             port,
@@ -93,6 +114,7 @@ mod tests {
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp,
             oidc: None,
         };
         spawn(async move { start_serve(config).await });
@@ -658,7 +680,7 @@ A: 2
         let port = pick_unused_port().unwrap();
         let dir = tempdir()?;
         let slug = "resume-collection".to_string();
-        let (_folder, db_path) = card_collection(
+        let (_folder, db_path, id) = card_collection(
             dir.path(),
             &slug,
             &[(
@@ -688,14 +710,75 @@ A: 2
 
         // A second start POST must not discard the session: still one DB row.
         start().await?;
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| crate::error::ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = Database::new(db_path_str)?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         assert_eq!(
             db.get_all_sessions()?.len(),
             1,
             "second start POST must not create a new session"
+        );
+        Ok(())
+    }
+
+    /// A server started on a data directory seeded with pre-consolidation
+    /// databases serves the review history they hold. This is the upgrade,
+    /// end to end.
+    #[tokio::test]
+    async fn test_legacy_databases_are_merged_at_startup() -> Fallible<()> {
+        let port = pick_unused_port().unwrap();
+        let dir = tempdir()?;
+        let slug = "legacy-collection".to_string();
+        let (folder, _db_path, id) =
+            card_collection(dir.path(), &slug, &[("Deck.md", "Q: What is 1+1?\nA: 2\n")])?;
+
+        // The card, hashed exactly as the old database would have had it.
+        let parsed = crate::parser::parse_deck(&folder)?;
+        let hash = parsed.cards[0].hash().to_hex();
+
+        // A pre-consolidation database for that collection, with one review
+        // and a due date far in the future.
+        {
+            let legacy = crate::db::test_support::create_legacy_v7(
+                &dir.path().join("db").join(format!("{id}.db")),
+            )?;
+            legacy.execute(
+                "insert into cards (card_hash, added_at, due_date, review_count) \
+                 values (?, '2026-01-01T09:00:00.000', '2099-01-01', 1);",
+                rusqlite::params![hash],
+            )?;
+            legacy.execute(
+                "insert into sessions (session_id, started_at, ended_at) \
+                 values (1, '2026-01-01T09:00:00.000', '2026-01-01T09:30:00.000');",
+                [],
+            )?;
+            legacy.execute(
+                "insert into reviews (session_id, card_hash, reviewed_at, grade, stability, \
+                 difficulty, interval_raw, interval_days, due_date) values \
+                 (1, ?, '2026-01-01T09:00:00.000', 'good', 2.0, 5.0, 2.0, 2, '2099-01-01');",
+                rusqlite::params![hash],
+            )?;
+        }
+
+        serve_data_dir(dir.path(), port).await?;
+
+        // The card is scheduled far in the future, so the collection page
+        // must report nothing due — which it can only know from the merged
+        // history. Without the merge it would be a brand-new card, and due.
+        let body = reqwest::get(format!("http://{TEST_HOST}:{port}/collection/{slug}"))
+            .await?
+            .text()
+            .await?;
+        assert!(
+            !body.contains("1 due"),
+            "the merged review history must be in force: {body}"
+        );
+        // And the source is kept.
+        assert!(
+            dir.path()
+                .join("db")
+                .join("legacy")
+                .join(format!("{id}.db"))
+                .exists(),
+            "the source database must be kept, not deleted"
         );
         Ok(())
     }
@@ -708,15 +791,12 @@ A: 2
         let port = pick_unused_port().unwrap();
         let dir = tempdir()?;
         let slug = "dangling-collection".to_string();
-        let (_folder, db_path) =
+        let (_folder, db_path, id) =
             card_collection(dir.path(), &slug, &[("Deck.md", "Q: What is 1+1?\nA: 2\n")])?;
 
         // Simulate a crash: a session row that was never closed.
         {
-            let db_path_str = db_path
-                .to_str()
-                .ok_or_else(|| crate::error::ErrorReport::new("non-UTF-8 temp path"))?;
-            let db = Database::new(db_path_str)?;
+            let db = UserDatabase::open(&db_path)?.collection(id);
             let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
             db.create_session(t0)?;
         }
@@ -1016,12 +1096,9 @@ A: 2
         let folder = dir.path().join("cards").join("default").join("Spanish");
         let id = crate::cmd::serve::cards::existing_collection_id(&folder)?
             .ok_or_else(|| ErrorReport::new("the collection has no id"))?;
-        let db_path = dir.path().join("db").join(format!("{id}.db"));
-        let db_str = match db_path.to_str() {
-            Some(p) => p,
-            None => return fail("temp path is not UTF-8"),
-        };
-        let db = Database::new(db_str)?;
+        let root = crate::cmd::serve::cards::CardRoot::open(dir.path(), None)?;
+        let db_path = crate::cmd::serve::cards::user_db_path(&root, &dir.path().join("db"))?;
+        let db = UserDatabase::open(&db_path)?.collection(id);
         let hash = CardHash::from_hex(&new_hash)?;
         assert!(db.card_exists(hash)?, "the edited card has no row");
         match db.get_card_performance_opt(hash)? {
@@ -1040,6 +1117,207 @@ A: 2
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// A token minted straight into `{data_dir}/auth.db`, before the server
+    /// opens it.
+    fn seed_token(data_dir: &std::path::Path) -> Fallible<String> {
+        use crate::auth_db::AuthDatabase;
+        let auth = AuthDatabase::open(&data_dir.join("auth.db"))?;
+        Ok(auth
+            .mint(None, "test", crate::types::timestamp::Timestamp::now())?
+            .to_string())
+    }
+
+    async fn post_mcp(port: u16, token: Option<&str>) -> Fallible<reqwest::Response> {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{TEST_HOST}:{port}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("{}");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        req.send()
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(e.to_string()))
+    }
+
+    /// An MCP client cannot follow a redirect to a login page, so /mcp must
+    /// refuse with a challenge rather than the redirect require_auth sends.
+    #[tokio::test]
+    async fn test_mcp_without_a_token_is_refused_without_a_redirect() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = post_mcp(port, None).await?;
+        assert_eq!(res.status(), 401);
+        assert!(
+            res.headers().contains_key("www-authenticate"),
+            "an MCP client needs to be told how to authenticate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_with_an_unknown_token_is_refused() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let bogus = format!("hcw_{}", "0".repeat(64));
+        assert_eq!(post_mcp(port, Some(&bogus)).await?.status(), 401);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_revoked_token_stops_working() -> Fallible<()> {
+        use crate::auth_db::AuthDatabase;
+        use crate::auth_db::TokenSecret;
+
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        {
+            let auth = AuthDatabase::open(&dir.join("auth.db"))?;
+            auth.revoke(None, &TokenSecret::parse(&token)?.digest())?;
+        }
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        assert_eq!(post_mcp(port, Some(&token)).await?.status(), 401);
+        Ok(())
+    }
+
+    /// The handshake, driven by a real MCP client rather than a
+    /// hand-written frame, so protocol negotiation is exercised.
+    #[tokio::test]
+    async fn test_mcp_handshake_succeeds_and_carries_the_instructions() -> Fallible<()> {
+        use rmcp::ServiceExt;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{TEST_HOST}:{port}/mcp"))
+                .auth_header(token),
+        );
+        let client = ()
+            .serve(transport)
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(format!("handshake failed: {e}")))?;
+
+        let info = client.peer_info().expect("the server sent no server info");
+        let instructions = info
+            .instructions
+            .clone()
+            .expect("the server sent no instructions");
+        // A model cannot infer any of this from tool names.
+        for needle in [
+            "collection",
+            "deck",
+            "CONTENT ADDRESS",
+            "Q:",
+            "A:",
+            "C:",
+            "---",
+        ] {
+            assert!(
+                instructions.contains(needle),
+                "the instructions never mention `{needle}`"
+            );
+        }
+
+        let tools = client
+            .list_tools(Default::default())
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(format!("tools/list failed: {e}")))?;
+        let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "list_collections",
+            "get_collection",
+            "read_deck",
+            "list_cards",
+            "get_card",
+            "get_collection_stats",
+            "get_user_stats",
+        ] {
+            assert!(names.contains(&expected), "no `{expected}` tool: {names:?}");
+        }
+        // Every tool carries a description: it is where a model learns the
+        // card syntax, and an undescribed tool is one it will misuse.
+        assert!(
+            tools.tools.iter().all(|t| t.description.is_some()),
+            "a tool has no description"
+        );
+        // The whole surface reaches a real client, not just the router.
+        assert_eq!(tools.tools.len(), 23, "{names:?}");
+        client.cancel().await.ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_endpoint_is_absent_when_disabled() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir_with(
+            &dir,
+            port,
+            ResolvedMcp {
+                enabled: false,
+                allowed_hosts: vec![TEST_HOST.to_string()],
+            },
+        )
+        .await?;
+        assert_eq!(post_mcp(port, Some(&token)).await?.status(), 404);
+        Ok(())
+    }
+
+    /// Mounting /mcp must not change what the rest of the application does
+    /// with a path it does not have. `Router::layer` wraps the fallback as
+    /// well as the routes, so the bearer check answered 401 for every
+    /// unknown path in the whole server until this used `route_layer`.
+    #[tokio::test]
+    async fn test_mounting_mcp_leaves_unknown_paths_a_404() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = reqwest::get(format!("http://{TEST_HOST}:{port}/no-such-page")).await?;
+        assert_eq!(res.status(), 404);
+        Ok(())
+    }
+
+    /// rmcp refuses a Host it does not recognise, as protection against a
+    /// browser page rebinding DNS at a local MCP server. An instance served
+    /// under a real name must list it or nothing works, so the refusal is
+    /// pinned here rather than discovered in production.
+    #[tokio::test]
+    async fn test_mcp_refuses_an_unlisted_host() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let token = seed_token(&dir)?;
+        let port = pick_unused_port().expect("no free port");
+        serve_data_dir(&dir, port).await?;
+        let res = reqwest::Client::new()
+            .post(format!("http://{TEST_HOST}:{port}/mcp"))
+            .header("host", "cards.example.com")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("{}")
+            .send()
+            .await
+            .map_err(|e| crate::error::ErrorReport::new(e.to_string()))?;
+        assert_ne!(
+            res.status(),
+            200,
+            "an unlisted Host must not be served: that is the DNS-rebinding guard"
+        );
         Ok(())
     }
 }

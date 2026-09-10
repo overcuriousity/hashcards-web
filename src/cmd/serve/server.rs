@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use axum::routing::post;
 use axum_extra::extract::cookie::Key;
 use tokio::net::TcpListener;
 
+use crate::auth_db::AuthDatabase;
 use crate::cmd::drill::fonts::font_handler;
 use crate::cmd::drill::fonts::legacy_font_handler;
 use crate::cmd::drill::hljs::hljs_css_handler;
@@ -65,19 +67,28 @@ use crate::cmd::serve::handlers::collection_post_handler;
 use crate::cmd::serve::handlers::collection_script_handler;
 use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
+use crate::cmd::serve::mcp::mcp_routes;
+use crate::cmd::serve::merge::merge_legacy_databases;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
 use crate::cmd::serve::state::evict_idle_sessions;
 use crate::cmd::serve::stats::collection_stats_handler;
+use crate::cmd::serve::tokens::tokens_get_handler;
+use crate::cmd::serve::tokens::tokens_mint_handler;
+use crate::cmd::serve::tokens::tokens_revoke_handler;
+use crate::cmd::serve::trash_ui::trash_empty_handler;
+use crate::cmd::serve::trash_ui::trash_get_handler;
+use crate::cmd::serve::trash_ui::trash_purge_handler;
+use crate::cmd::serve::trash_ui::trash_restore_handler;
 use crate::cmd::serve::upload::MAX_UPLOAD_BYTES;
 use crate::cmd::serve::upload::media_upload_handler;
 use crate::cmd::signals::terminate_signal;
-use crate::db::Database;
-use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
+use crate::user_db::UserDatabase;
 use crate::utils::ensure_dir;
 
 /// How long a session's heartbeat must have been silent before the startup
@@ -89,58 +100,68 @@ use crate::utils::ensure_dir;
 /// window. Accepted tradeoff — any fixed cutoff has some such window.
 const SESSION_STALE_MINUTES: i64 = 60;
 
-/// Close session rows left dangling by a crash or restart, across every
-/// collection this server can serve, and return the per-database counts so
-/// the topic browser can report them once.
+/// Close session rows left dangling by a crash or restart, once per user,
+/// and return the per-collection counts so the topic browser can report them
+/// once.
 ///
-/// Keyed by database path rather than by URL slug: two users may each own a
+/// Keyed by collection id rather than by URL slug: two users may each own a
 /// collection called "Spanish", and a slug-keyed notice would be shown to
-/// whichever of them opened the page first.
+/// whichever of them opened the page first. Nor by database path any more —
+/// after consolidation, that names a whole tree.
 ///
-/// A collection whose database cannot be opened is skipped with a log line
-/// rather than failing startup: an unreadable database is the topic
-/// browser's problem to report, not a reason to refuse to serve everything
-/// else. Each database is independent, so the sweeps run on their own
-/// threads rather than one after another.
-fn sweep_dangling_sessions(data_dir: &Path) -> HashMap<PathBuf, usize> {
+/// A user whose database cannot be opened is skipped with a log line rather
+/// than failing startup: an unreadable database is the collection page's
+/// problem to report, not a reason to refuse to serve everything else. Each
+/// user's database is independent, so the sweeps run on their own threads.
+fn sweep_dangling_sessions(
+    data_dir: &Path,
+    failures: &HashMap<PathBuf, String>,
+) -> HashMap<CollectionId, usize> {
     // Only sessions whose heartbeat has been silent this long are presumed
     // dead. A session in another process stamps its heartbeat as the user
     // works, so a live one is never swept out from under it.
     let stale_before = Timestamp::now().minus_minutes(SESSION_STALE_MINUTES);
-    let collections = discover_all_collections(data_dir);
 
-    let results: Vec<(PathBuf, Fallible<usize>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = collections
-            .iter()
-            .map(|rc| {
-                scope.spawn(move || {
-                    let closed = (|| {
-                        let db_path = rc.db_path.to_str().ok_or_else(|| {
-                            ErrorReport::new(format!(
-                                "Database path is not valid UTF-8: {}",
-                                rc.db_path.display()
-                            ))
-                        })?;
-                        Database::new(db_path)
-                            .and_then(|db| db.close_dangling_sessions(stale_before))
-                    })();
-                    (rc.db_path.clone(), closed)
+    // One entry per user, not per collection: after consolidation they share
+    // a file. Ordered, so the threads are spawned in a stable order.
+    let paths: BTreeSet<PathBuf> = discover_all_collections(data_dir)
+        .into_iter()
+        .map(|rc| rc.db_path)
+        // Already reported at startup, and the file is not what it should
+        // be: do not write to it. A tree with no database has nothing to
+        // sweep, and must not have one created for it here.
+        .filter(|path| !failures.contains_key(path) && path.is_file())
+        .collect();
+
+    let results: Vec<(PathBuf, Fallible<HashMap<CollectionId, usize>>)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    scope.spawn(move || {
+                        // Not `open_collection_db`: the sweep runs before
+                        // `AppState` exists, so it consulted the failure map
+                        // itself, above.
+                        let closed = UserDatabase::open(path)
+                            .and_then(|db| db.close_dangling_sessions(stale_before));
+                        (path.clone(), closed)
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("sweep thread panicked"))
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("sweep thread panicked"))
+                .collect()
+        });
 
     let mut counts = HashMap::new();
     for (db_path, closed) in results {
         match closed {
-            Ok(0) => {}
-            Ok(n) => {
-                log::info!("Closed {n} interrupted session(s) in {}", db_path.display());
-                counts.insert(db_path, n);
+            Ok(per_collection) => {
+                for (id, n) in per_collection {
+                    log::info!("Closed {n} interrupted session(s) in collection {id}");
+                    counts.insert(id, n);
+                }
             }
             Err(e) => log::error!(
                 "Could not close interrupted sessions in {}: {e}",
@@ -195,13 +216,31 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
     let bind = format!("{}:{}", config.host, config.port);
 
     let config = Arc::new(config);
+
+    // The upgrade: fold any pre-consolidation per-collection databases into
+    // one database per user. Before the sweep, which opens the databases
+    // this produces. A tree whose merge failed is recorded rather than
+    // fatal: one broken file must not take an instance down for everybody.
+    let migration_failures = match &config.data_dir {
+        Some(data_dir) => merge_legacy_databases(data_dir),
+        None => HashMap::new(),
+    };
+    for (path, why) in &migration_failures {
+        log::error!(
+            "The review database at {} was not consolidated ({why}). The collections that use it \
+             will refuse to open until this is fixed; their previous databases have not been \
+             deleted.",
+            path.display()
+        );
+    }
+
     // FEAT-03: close session rows left open by a crash or restart, once, at
     // startup. They cannot be resumed (the card queue lives only in memory),
     // so they are closed with all persisted reviews kept. This must not run
     // per request: the predicate cannot distinguish a crashed session from a
-    // live one, and a CLI `drill` may be running against the same database.
+    // live one, and a second server may share the same database.
     let interrupted_closed = match &config.data_dir {
-        Some(data_dir) => sweep_dangling_sessions(data_dir),
+        Some(data_dir) => sweep_dangling_sessions(data_dir, &migration_failures),
         None => HashMap::new(),
     };
 
@@ -221,14 +260,25 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
     // collision can actually be created.
     let _ = check_deck_slug_collisions;
 
+    // The MCP token store. Opened here rather than per request: it creates
+    // its schema on open, so a data directory that cannot hold it should
+    // fail at startup with a clear error rather than at a client's first
+    // call.
+    let auth = match &config.data_dir {
+        Some(data_dir) => Some(Arc::new(AuthDatabase::open(&data_dir.join("auth.db"))?)),
+        None => None,
+    };
+
     let state = AppState {
         config: config.clone(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         custom_decks: Arc::new(Mutex::new(custom_decks)),
         config_path,
         interrupted_closed: Arc::new(Mutex::new(interrupted_closed)),
+        migration_failures: Arc::new(migration_failures),
         session_key: session_key(config.oidc.as_ref())?,
         oidc,
+        auth,
     };
 
     spawn_session_eviction_task(state.sessions.clone(), config.session_timeout_minutes);
@@ -250,6 +300,13 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
             "/files/media/{*path}",
             post(media_upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/tokens", get(tokens_get_handler))
+        .route("/tokens/new", post(tokens_mint_handler))
+        .route("/tokens/revoke", post(tokens_revoke_handler))
+        .route("/trash", get(trash_get_handler))
+        .route("/trash/restore", post(trash_restore_handler))
+        .route("/trash/purge", post(trash_purge_handler))
+        .route("/trash/empty", post(trash_empty_handler))
         .route("/decks", get(decks_manage_handler))
         .route("/decks/add", post(deck_add_handler))
         .route("/decks/delete", post(deck_delete_handler))
@@ -331,6 +388,14 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         app
     };
     let app = app.merge(static_routes);
+    // After `require_auth`, like `/auth/*`: an MCP client cannot follow a
+    // redirect to a login page, so `/mcp` does its own bearer check and
+    // answers 401 instead.
+    let app = if state.config.mcp.enabled {
+        app.merge(mcp_routes(&state))
+    } else {
+        app
+    };
     let app = app.with_state(state);
 
     log::debug!("Starting server on {bind}");
@@ -448,39 +513,38 @@ mod tests {
     use super::*;
     use crate::cmd::serve::cards::collection_id;
     use crate::helper::create_tmp_directory;
+    use crate::user_db::UserDatabase;
 
     /// Two users may each have a collection called "Spanish". They slugify
     /// alike, so a notice keyed by slug would be shown to whichever of them
     /// opened the page first, reporting the other's interrupted sessions.
-    /// Keyed by database path, each notice reaches its own owner.
+    /// Keyed by collection id, each notice reaches its own owner — and a
+    /// database path could not serve, since after consolidation one names a
+    /// whole tree.
     #[test]
-    fn interrupted_notices_are_keyed_per_database_not_per_slug() -> Fallible<()> {
+    fn interrupted_notices_are_keyed_per_collection_not_per_slug() -> Fallible<()> {
         let data_dir = create_tmp_directory()?;
         let db_dir = data_dir.join("db");
         ensure_dir(&db_dir, "review database directory")?;
 
-        let mut db_paths = Vec::new();
+        let mut ids = Vec::new();
         for user in ["alice-example.com", "bob-example.com"] {
             let folder = data_dir.join("cards").join(user).join("Spanish");
             std::fs::create_dir_all(&folder)?;
             let id = collection_id(&folder)?;
-            let db_path = db_dir.join(format!("{id}.db"));
-            let db_str = match db_path.to_str() {
-                Some(p) => p,
-                None => return fail("temp path is not UTF-8"),
-            };
-            let db = Database::new(db_str)?;
+            let db_path = db_dir.join(format!("{user}.db"));
+            let db = UserDatabase::open(&db_path)?.collection(id.clone());
             // A session row opened long ago and never closed: exactly what a
             // crash leaves behind.
             let started = Timestamp::now().minus_minutes(SESSION_STALE_MINUTES * 2);
             db.create_session(started)?;
-            db_paths.push(db_path);
+            ids.push(id);
         }
 
-        let counts = sweep_dangling_sessions(&data_dir);
+        let counts = sweep_dangling_sessions(&data_dir, &HashMap::new());
         assert_eq!(counts.len(), 2, "each user's collection swept separately");
-        for db_path in &db_paths {
-            assert_eq!(counts.get(db_path), Some(&1), "{}", db_path.display());
+        for id in &ids {
+            assert_eq!(counts.get(id), Some(&1), "{id}");
         }
         Ok(())
     }

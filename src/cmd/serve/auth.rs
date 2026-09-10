@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use time::Duration as CookieDuration;
 
+use crate::cmd::drill::template::VIEWPORT;
 use crate::cmd::serve::config::ResolvedOidc;
 use crate::cmd::serve::state::AppState;
 use crate::error::ErrorReport;
@@ -28,6 +29,19 @@ const FLOW_LIFETIME_MINUTES: i64 = 10;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CurrentUser {
     pub email: String,
+}
+
+impl CurrentUser {
+    /// The caller an MCP bearer token resolves to.
+    ///
+    /// Every other `CurrentUser` comes out of a signed cookie; this is the
+    /// one that does not, so that a tool handler can hand the domain
+    /// functions exactly what a browser session would have handed them.
+    pub(crate) fn new(email: &str) -> Self {
+        Self {
+            email: email.to_string(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,7 +186,7 @@ fn session_expired_page() -> String {
         html lang="en" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="viewport" content=(VIEWPORT);
                 // This page is reached without a session, so it shares the
                 // stored theme rather than starting over at the system's.
                 script { (maud::PreEscaped(crate::cmd::drill::template::THEME_BOOT)) }
@@ -635,6 +649,7 @@ impl axum::extract::OptionalFromRequestParts<AppState> for CurrentUser {
 
 #[cfg(test)]
 mod tests {
+    use crate::cmd::serve::config::ResolvedMcp;
 
     /// Create a collection folder named `name` in `owner`'s card tree under
     /// `data_dir`, holding one card, and stamp it with a stable id so the
@@ -1015,6 +1030,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1083,6 +1099,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1143,6 +1160,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1203,6 +1221,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1270,6 +1289,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),
@@ -1453,6 +1473,7 @@ A: 2
             config_path: None,
             custom_decks: Vec::new(),
             session_timeout_minutes: 1440,
+            mcp: ResolvedMcp::default(),
             oidc: Some(ResolvedOidc {
                 issuer_url: format!("http://127.0.0.1:{idp_port}"),
                 client_id: "test-client".to_string(),

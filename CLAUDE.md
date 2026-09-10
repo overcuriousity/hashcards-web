@@ -11,19 +11,43 @@ a local CLI tool; the CLI is gone.
 # Design and Internals
 
 - Cards are content addressed.
+- One review database per user, at `{data_dir}/db/{tree}.db`. Every row
+  carries its `collection_id`. `Database` is a *view* of one collection on a
+  `UserDatabase`'s shared connection, and that mutex is not reentrant: a
+  method takes the lock once and calls only free functions under it.
 - Media files are referenced in markdown using standard image syntax: `![](path/to/file.ext)`. Standard image and AV formats are supported.
 - We use `pulldown-cmark` to parse/process/render Markdown.
 - In `markdown.rs`: URLs are rewritten to `/file/{url}` endpoints for serving.
 - In `media.rs`: Image references are extracted and validated during collection loading.
 - Files are served via `/file/*path` endpoint, resolved relative to collection directory.
 - Path validation (in `src/media/load.rs`) prevents directory traversal attacks.
+- Deleting moves to `{data_dir}/trash/{tree}/` and leaves the collection's
+  review rows behind as orphans, which every read path ignores. A restore
+  finds them again by content address. Emptying the trash is the only thing
+  that erases them, and the only thing that destroys anything.
+- A collection's *slug* addresses it in URLs and MCP calls; paths are built
+  from its folder name (`collection_folder`). They differ whenever the name
+  is not already slug-shaped.
+- Everything that opens a review database goes through `src/cmd/serve/reviewdb.rs`,
+  which is where the failed-merge gate lives. Take `open_user_db` when you need
+  two views of one collection: two `open_collection_db` calls are two connections.
+- The MCP tools are adapters over the same functions the web handlers call.
+  Never reimplement one there: the guards (`refuse_if_drilling`, the
+  slug-collision check, the migration gate, `CardRoot`'s path checking) apply
+  to a model only because it is the same code.
+- The MCP has no purge tool, by design, and a test enforces it.
 
 # Layout
 
 - One binary, one job: `hashcards-web [--config <path>]`, defaulting to
   `hashcards.toml`. There are no subcommands. A config file is mandatory.
-- `src/cmd/serve/` is the server: routing, handlers, auth, config, git,
-  HedgeDoc, editing, decks, export.
+- `src/cmd/serve/` is the server: routing, handlers, auth, config, editing,
+  decks, export, and the startup merge of pre-consolidation databases.
+- `src/cmd/serve/mcp/` is the MCP endpoint at `/mcp`: routing, the bearer
+  middleware, and the tools. `src/auth_db.rs` is its token store, at
+  `{data_dir}/auth.db`. Tokens are minted from `/tokens`
+  (`src/cmd/serve/tokens.rs`).
+- `src/cmd/serve/trash.rs` is the trash; `trash_ui.rs` is its page.
 - `src/cmd/drill/` is the drill engine the server embeds — rendering
   (`get.rs`), actions (`post.rs`), session state, cache, templates and
   static assets. The directory names predate the fork; there is no drill

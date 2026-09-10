@@ -91,3 +91,27 @@ data_dir = "/var/lib/hashcards"       # Directory for the card trees, the review
 # name = "Exam revision"
 # members = ["japanese/Verbs", "medicine-anatomy/Bones"]
 # owner = "me@example.com"            # Required when [oidc] is configured
+
+# Optional: the MCP endpoint at /mcp, which lets an AI assistant read and write
+# your cards, decks and collections. It is authenticated by a token you mint
+# for yourself at /tokens, shown once when it is created; every token can
+# write, so give one out as carefully as you would your own password.
+#
+# Nothing an assistant deletes is destroyed -- it goes to your trash, and only
+# you can empty that, from the web interface.
+
+# [mcp]
+# enabled = true                      # The default. Turn it off and /mcp does
+#                                     # not exist at all.
+#
+# allowed_hosts = ["cards.example.com"]
+#                                     # The hostnames /mcp will answer to.
+#                                     # hashcards always allows localhost, so a
+#                                     # client on this machine needs nothing
+#                                     # here -- but an instance served under a
+#                                     # real name MUST list it, or every MCP
+#                                     # request is refused with nothing in the
+#                                     # log to explain it. The check is what
+#                                     # stops a web page in a browser from
+#                                     # driving a local MCP server by pointing
+#                                     # its own hostname at 127.0.0.1.

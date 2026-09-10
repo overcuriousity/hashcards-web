@@ -26,9 +26,9 @@ use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::handlers::DrillTarget;
 use crate::cmd::serve::handlers::deck_sources;
 use crate::cmd::serve::handlers::find_drill_target;
+use crate::cmd::serve::reviewdb::open_collection_db;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::migrate_sessions;
-use crate::db::Database;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
@@ -247,7 +247,7 @@ fn render_edit_form(
 // ── POST handler ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-pub struct EditForm {
+pub(crate) struct EditForm {
     pub new_text: String,
     pub mtime_ms: String,
     #[serde(default)]
@@ -255,7 +255,7 @@ pub struct EditForm {
 }
 
 /// What a successful edit did, for user-facing reporting.
-pub struct EditOutcome {
+pub(crate) struct EditOutcome {
     /// Cards whose review history was migrated to a new hash.
     pub migrated: usize,
     /// New cards that could not be matched to prior history and start fresh.
@@ -308,7 +308,7 @@ pub async fn edit_post_handler(
     }
 }
 
-fn edit_post_inner(
+pub(crate) fn edit_post_inner(
     state: &AppState,
     slug: &str,
     hash_hex: &str,
@@ -377,11 +377,7 @@ fn edit_post_inner(
 
     let plan = plan_hash_migration(&old_cards, &new_at_block);
 
-    let db_path = rc
-        .db_path
-        .to_str()
-        .ok_or_else(|| ErrorReport::new("invalid db path"))?;
-    let mut db = Database::new(db_path)?;
+    let db = open_collection_db(state, &rc)?;
     let now = Timestamp::now();
 
     // One transaction, so a failure part-way through cannot leave the
@@ -425,7 +421,7 @@ fn is_card_terminator(line: &str) -> bool {
 /// `Card.range().1` is the terminator line index in non-EOF cases (exclusive)
 /// and the last content line index in the EOF case (inclusive). This function
 /// normalises to an exclusive bound suitable for `lines[start..end]`.
-fn block_end(lines: &[&str], range: (usize, usize)) -> usize {
+pub(crate) fn block_end(lines: &[&str], range: (usize, usize)) -> usize {
     let end = range.1;
     // `end > range.0` guards the one-line card case: a single-line `C:`/`Q:`
     // card's own first line is not the terminator of its own block.
@@ -681,7 +677,6 @@ mod tests {
     use super::*;
 
     use crate::cmd::serve::handlers::find_collection;
-    use crate::db::Database;
     use crate::types::card::CardContent;
     use crate::types::timestamp::Timestamp;
 
@@ -813,15 +808,11 @@ mod tests {
         )?;
         let file = coll_dir.join("Deck.md");
         let slug = rc.slug.clone();
-        let db_path = rc.db_path.clone();
-        let db_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-utf8 db path"))?;
 
         let old_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(old_cards.len(), 2);
         {
-            let db = Database::new(db_str)?;
+            let db = open_collection_db(&state, &rc)?;
             let now = Timestamp::now();
             for c in &old_cards {
                 db.insert_card_if_new(c.hash(), now)?;
@@ -848,7 +839,7 @@ mod tests {
         assert_eq!(outcome.skipped, 1);
 
         // The second card keeps its history, and nothing was left dangling.
-        let db = Database::new(db_str)?;
+        let db = open_collection_db(&state, &rc)?;
         assert!(db.card_exists(old_cards[1].hash())?);
         Ok(())
     }
@@ -868,18 +859,14 @@ mod tests {
         )?;
         let file = coll_dir.join("Deck.md");
         let slug = rc.slug.clone();
-        let db_path = rc.db_path.clone();
 
         let old_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(old_cards.len(), 1);
         let old_hash = old_cards[0].hash();
         let hash_hex = old_hash.to_hex();
 
-        let db_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-utf8 db path"))?;
         {
-            let db = Database::new(db_str)?;
+            let db = open_collection_db(&state, &rc)?;
             db.insert_card_if_new(old_hash, Timestamp::now())?;
         }
 
@@ -904,7 +891,7 @@ mod tests {
 
         let new_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(new_cards.len(), 1);
-        let db = Database::new(db_str)?;
+        let db = open_collection_db(&state, &rc)?;
         assert!(
             db.card_exists(new_cards[0].hash())?,
             "history must have followed the card to its new hash"
@@ -922,7 +909,6 @@ mod tests {
         let (state, rc, coll_dir) = fixture(&data_dir, &[("Deck.md", "C: A [x] B [y]\n")])?;
         let file = coll_dir.join("Deck.md");
         let slug = rc.slug.clone();
-        let db_path = rc.db_path.clone();
 
         let old_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(old_cards.len(), 2);
@@ -930,10 +916,7 @@ mod tests {
 
         // Seed the DB with both pre-edit cards.
         {
-            let db_str = db_path
-                .to_str()
-                .ok_or_else(|| ErrorReport::new("non-utf8 db path"))?;
-            let db = Database::new(db_str)?;
+            let db = open_collection_db(&state, &rc)?;
             let now = Timestamp::now();
             for c in &old_cards {
                 db.insert_card_if_new(c.hash(), now)?;
@@ -956,10 +939,7 @@ mod tests {
         assert_eq!(outcome.skipped, 0);
 
         // Every post-edit hash is in the DB; no pre-edit hash remains.
-        let db_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-utf8 db path"))?;
-        let db = Database::new(db_str)?;
+        let db = open_collection_db(&state, &rc)?;
         let new_cards = parse_deck(&coll_dir)?.cards;
         assert_eq!(new_cards.len(), 2);
         for c in &new_cards {

@@ -7,6 +7,7 @@ use axum_extra::extract::cookie::Key;
 use chrono::Duration;
 use parking_lot::Mutex;
 
+use crate::auth_db::AuthDatabase;
 use crate::cmd::drill::render::AnswerControls;
 use crate::cmd::drill::state::CardMigration;
 use crate::cmd::drill::state::MigrationEffect;
@@ -14,6 +15,7 @@ use crate::cmd::drill::state::MutableState;
 use crate::cmd::serve::auth::OidcRuntime;
 use crate::cmd::serve::config::ResolvedServeConfig;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
+use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
 
 /// A drill session shared behind a per-session lock. Handlers clone the
@@ -69,9 +71,19 @@ pub struct AppState {
     /// the first time it renders, so the notice is shown once rather than on
     /// every visit (see `sweep_dangling_sessions`).
     ///
-    /// Keyed by database path, not by slug: two users may each own a
-    /// collection called "Spanish".
-    pub interrupted_closed: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    /// Keyed by collection id — not by slug, and no longer by database path:
+    /// two users may each own a collection called "Spanish", and after
+    /// consolidation every collection in one tree shares a database file.
+    pub interrupted_closed: Arc<Mutex<HashMap<CollectionId, usize>>>,
+    /// Users whose startup merge failed, keyed by their review database's
+    /// path and holding the error to show them.
+    ///
+    /// Their collections refuse to open rather than starting from an empty
+    /// database. A merge that half-succeeded is a transaction that rolled
+    /// back, so no rows were lost — but the sources are still in place and
+    /// the target is not what it should be, and serving that as though it
+    /// were a fresh account is how a person concludes their history is gone.
+    pub migration_failures: Arc<HashMap<PathBuf, String>>,
     /// Signs the OIDC session and login-flow cookies. When `[oidc]` is not
     /// configured this key is generated randomly at startup and never used
     /// — keeping it non-optional avoids threading `Option` through every
@@ -81,6 +93,11 @@ pub struct AppState {
     /// Set when `[oidc]` is configured. Gates every route except `/auth/*`
     /// behind login and scopes collections/notes to their `owner`.
     pub oidc: Option<Arc<OidcRuntime>>,
+    /// The server's MCP token store, at `{data_dir}/auth.db`.
+    ///
+    /// `None` only when no data directory is configured, which is the same
+    /// condition under which there is nothing to serve.
+    pub auth: Option<Arc<AuthDatabase>>,
 }
 
 /// Lets `axum_extra`'s `SignedCookieJar` extractor pull the signing key
@@ -290,6 +307,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 pub mod test_support {
     use super::*;
     use crate::cmd::serve::config::DefaultsSection;
+    use crate::cmd::serve::config::ResolvedMcp;
     use crate::cmd::serve::config::ResolvedServeConfig;
 
     /// An `AppState` whose card trees live under `data_dir`, with no OIDC
@@ -304,14 +322,20 @@ pub mod test_support {
                 config_path: None,
                 custom_decks: Vec::new(),
                 session_timeout_minutes: 1440,
+                mcp: ResolvedMcp::default(),
                 oidc: None,
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             custom_decks: Arc::new(Mutex::new(Vec::new())),
             config_path: Arc::new(Mutex::new(None)),
             interrupted_closed: Arc::new(Mutex::new(HashMap::new())),
+            migration_failures: Arc::new(HashMap::new()),
             session_key: Key::generate(),
             oidc: None,
+            // Tests that need one open it themselves: most do not touch
+            // tokens at all, and opening a database per state would make
+            // every unrelated test pay for it.
+            auth: None,
         }
     }
 }
@@ -325,18 +349,21 @@ mod tests {
     use super::*;
     use crate::cmd::drill::cache::Cache;
     use crate::cmd::drill::state::SessionDbs;
-    use crate::error::ErrorReport;
     use crate::error::Fallible;
     use crate::rng::TinyRng;
     use crate::types::performance::Jitter;
     use crate::types::performance::Scheduling;
 
+    /// A view on the user database at `path`, under a fixed collection id:
+    /// these tests are about session bookkeeping, not about scoping.
+    fn test_db(path: &Path) -> Fallible<crate::db::Database> {
+        Ok(crate::user_db::UserDatabase::open(path)?.collection(
+            crate::types::collection_id::CollectionId::new("test-collection")?,
+        ))
+    }
+
     fn session_started_at(at: &str, dir: &Path) -> Fallible<SharedSession> {
-        let db_path = dir.join("test.db");
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = crate::db::Database::new(db_path_str)?;
+        let db = test_db(&dir.join("test.db"))?;
         let started_at = Timestamp::try_from(at.to_string())?;
         let session_id = db.create_session(started_at)?;
         let mutable = MutableState::new(
@@ -376,11 +403,7 @@ mod tests {
         assert!(sessions.lock().is_empty());
 
         // The DB session row was closed with the eviction time.
-        let db_path = dir.path().join("test.db");
-        let db_path_str = db_path
-            .to_str()
-            .ok_or_else(|| ErrorReport::new("non-UTF-8 temp path"))?;
-        let db = crate::db::Database::new(db_path_str)?;
+        let db = test_db(&dir.path().join("test.db"))?;
         let rows = db.get_all_sessions()?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, now);

@@ -14,9 +14,11 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use rusqlite::Transaction;
 use rusqlite::config::DbConfig;
@@ -28,13 +30,20 @@ use crate::fsrs::Difficulty;
 use crate::fsrs::Grade;
 use crate::fsrs::Stability;
 use crate::types::card_hash::CardHash;
+use crate::types::collection_id::CollectionId;
 use crate::types::date::Date;
 use crate::types::performance::Performance;
 use crate::types::performance::ReviewedPerformance;
 use crate::types::timestamp::Timestamp;
 
+/// A view of one collection inside a user's review database.
+///
+/// Scoped, not separate: the connection is shared with every other view on
+/// the same file, so a saved deck spanning three collections does not open
+/// three writers that contend on every grade.
 pub struct Database {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
+    collection: CollectionId,
 }
 
 pub struct ReviewRecord {
@@ -83,9 +92,15 @@ pub struct Bookmark {
     pub created_at: Timestamp,
 }
 
-/// The schema version a freshly created database gets, and the highest
-/// migration number `migrate` knows how to apply.
-const SCHEMA_VERSION: i64 = 7;
+/// The schema version of a user database — one file per user, every table
+/// scoped by `collection_id`. Created by `UserDatabase`, never by the
+/// migration ladder: consolidation merges N files into one, which an
+/// in-place `alter table` cannot express.
+pub const SCHEMA_VERSION: i64 = 8;
+
+/// The highest version a per-collection database can be at, and the top of
+/// the `migrate_legacy` ladder. Deployed databases sit between 0 and here.
+pub const LEGACY_SCHEMA_VERSION: i64 = 7;
 
 /// How long a connection waits for a lock held by another connection before
 /// giving up with SQLITE_BUSY.
@@ -93,9 +108,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared by `Database::card_exists` and `apply_edit_migration`, which needs
 /// it inside a `Transaction` rather than on `&self`.
-fn card_exists_in(conn: &Connection, card_hash: CardHash) -> Fallible<bool> {
-    let sql = "select count(*) from cards where card_hash = ?;";
-    let count: i64 = conn.query_row(sql, [card_hash], |row| row.get(0))?;
+fn card_exists_in(
+    conn: &Connection,
+    collection: &CollectionId,
+    card_hash: CardHash,
+) -> Fallible<bool> {
+    let sql = "select count(*) from cards where collection_id = ? and card_hash = ?;";
+    let count: i64 = conn.query_row(sql, params![collection, card_hash], |row| row.get(0))?;
     Ok(count > 0)
 }
 
@@ -103,53 +122,52 @@ fn card_exists_in(conn: &Connection, card_hash: CardHash) -> Fallible<bool> {
 /// needs it inside a `Transaction` rather than on `&self`.
 fn insert_card_if_new_in(
     conn: &Connection,
+    collection: &CollectionId,
     card_hash: CardHash,
     added_at: Timestamp,
 ) -> Fallible<()> {
-    let sql = "insert into cards (card_hash, added_at, review_count) values (?, ?, 0) on conflict (card_hash) do nothing;";
-    conn.execute(sql, params![card_hash, added_at])?;
+    let sql = "insert into cards (collection_id, card_hash, added_at, review_count) \
+               values (?, ?, ?, 0) on conflict (collection_id, card_hash) do nothing;";
+    conn.execute(sql, params![collection, card_hash, added_at])?;
     Ok(())
 }
 
 impl Database {
-    pub fn new(database_path: &str) -> Fallible<Self> {
-        let mut conn = Connection::open(database_path)?;
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
-        // `serve` opens a second connection per stats request while a drill
-        // session holds its own, and a CLI `drill` may share the file. Without
-        // a busy timeout, a read landing during another connection's write
-        // returns SQLITE_BUSY immediately and surfaces as a 500.
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        {
-            let tx = conn.transaction()?;
-            if !probe_schema_exists(&tx)? {
-                tx.execute_batch(include_str!("schema.sql"))?;
-                set_schema_version(&tx, SCHEMA_VERSION)?;
-            } else {
-                migrate(&tx)?;
-            }
-            tx.commit()?;
-        }
-        Ok(Self { conn })
+    /// Only `UserDatabase::collection` calls this: a view must never be
+    /// built on a connection whose schema has not been checked.
+    pub(crate) fn new_view(conn: Arc<Mutex<Connection>>, collection: CollectionId) -> Self {
+        Self { conn, collection }
     }
 
-    /// Insert a new card in the database.
+    /// An empty single-collection database in memory. Test-only.
+    #[cfg(test)]
+    pub fn memory() -> Fallible<Self> {
+        Ok(crate::user_db::UserDatabase::memory()?
+            .collection(CollectionId::new("test-collection")?))
+    }
+
+    /// Insert a new card in this collection.
     ///
-    /// If a card with the given hash exists, returns an error.
+    /// If a card with the given hash exists *in this collection*, returns an
+    /// error. The same hash in another collection is a different card here:
+    /// two collections keep two schedules.
     pub fn insert_card(&self, card_hash: CardHash, added_at: Timestamp) -> Fallible<()> {
-        if self.card_exists(card_hash)? {
+        let conn = self.conn.lock();
+        if card_exists_in(&conn, &self.collection, card_hash)? {
             return fail("Card already exists");
         }
-        let sql = "insert into cards (card_hash, added_at, review_count) values (?, ?, 0);";
-        self.conn.execute(sql, params![card_hash, added_at])?;
+        let sql = "insert into cards (collection_id, card_hash, added_at, review_count) \
+                   values (?, ?, ?, 0);";
+        conn.execute(sql, params![self.collection, card_hash, added_at])?;
         Ok(())
     }
 
     /// Return the set of all card hashes in the database.
     pub fn card_hashes(&self) -> Fallible<HashSet<CardHash>> {
-        let sql = "select card_hash from cards;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let card_iter = stmt.query_map([], |row| {
+        let conn = self.conn.lock();
+        let sql = "select card_hash from cards where collection_id = ?;";
+        let mut stmt = conn.prepare(sql)?;
+        let card_iter = stmt.query_map(params![self.collection], |row| {
             let card_hash: CardHash = row.get(0)?;
             Ok(card_hash)
         })?;
@@ -162,10 +180,11 @@ impl Database {
 
     /// Find the hashes of the cards due today.
     pub fn due_today(&self, today: Date) -> Fallible<HashSet<CardHash>> {
+        let conn = self.conn.lock();
         let mut due = HashSet::new();
-        let sql = "select card_hash, due_date from cards;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query(params![])?;
+        let sql = "select card_hash, due_date from cards where collection_id = ?;";
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![self.collection])?;
         while let Some(row) = rows.next()? {
             let hash: CardHash = row.get(0)?;
             let due_date: Option<Date> = row.get(1)?;
@@ -186,9 +205,11 @@ impl Database {
 
     /// Get a card's performance information.
     pub fn get_card_performance_opt(&self, card_hash: CardHash) -> Fallible<Option<Performance>> {
-        let sql = "select last_reviewed_at, stability, difficulty, interval_raw, interval_days, due_date, review_count from cards where card_hash = ?;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![card_hash], |row| {
+        let conn = self.conn.lock();
+        let sql = "select last_reviewed_at, stability, difficulty, interval_raw, interval_days, \
+                   due_date, review_count from cards where collection_id = ? and card_hash = ?;";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.collection, card_hash], |row| {
             let last_reviewed_at: Option<Timestamp> = row.get(0)?;
             let stability: Option<Stability> = row.get(1)?;
             let difficulty: Option<Difficulty> = row.get(2)?;
@@ -255,7 +276,8 @@ impl Database {
         card_hash: CardHash,
         performance: Performance,
     ) -> Fallible<()> {
-        if !self.card_exists(card_hash)? {
+        let conn = self.conn.lock();
+        if !card_exists_in(&conn, &self.collection, card_hash)? {
             return fail("Card not found");
         }
         let (
@@ -278,7 +300,9 @@ impl Database {
                 rp.review_count as i32,
             ),
         };
-        let sql = "update cards set last_reviewed_at = ?, stability = ?, difficulty = ?, interval_raw = ?, interval_days = ?, due_date = ?, review_count = ? where card_hash = ?;";
+        let sql = "update cards set last_reviewed_at = ?, stability = ?, difficulty = ?, \
+                   interval_raw = ?, interval_days = ?, due_date = ?, review_count = ? \
+                   where collection_id = ? and card_hash = ?;";
         let params = params![
             last_reviewed_at,
             stability,
@@ -287,9 +311,10 @@ impl Database {
             interval_days,
             due_date,
             review_count,
+            self.collection,
             card_hash
         ];
-        self.conn.execute(sql, params)?;
+        conn.execute(sql, params)?;
         Ok(())
     }
 
@@ -297,12 +322,14 @@ impl Database {
     /// ended_at is initially set to started_at as a placeholder; call
     /// close_session when the session finishes.
     pub fn create_session(&self, started_at: Timestamp) -> Fallible<i64> {
-        let sql = "insert into sessions (started_at, ended_at, last_seen_at) values (?, ?, ?) returning session_id;";
-        let session_id: i64 =
-            self.conn
-                .query_row(sql, params![started_at, started_at, started_at], |row| {
-                    row.get(0)
-                })?;
+        let conn = self.conn.lock();
+        let sql = "insert into sessions (collection_id, started_at, ended_at, last_seen_at) \
+                   values (?, ?, ?, ?) returning session_id;";
+        let session_id: i64 = conn.query_row(
+            sql,
+            params![self.collection, started_at, started_at, started_at],
+            |row| row.get(0),
+        )?;
         Ok(session_id)
     }
 
@@ -311,18 +338,23 @@ impl Database {
     /// Both operations run inside a single transaction so a crash between them
     /// cannot leave the DB in an inconsistent state. Returns the new review_id.
     pub fn insert_review_and_update_performance(
-        &mut self,
+        &self,
         session_id: i64,
         review: &ReviewRecord,
         performance: Performance,
     ) -> Fallible<i64> {
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let review_id: i64 = {
-            let sql = "insert into reviews (session_id, card_hash, reviewed_at, grade, stability, difficulty, interval_raw, interval_days, due_date, duration_ms) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning review_id;";
+            let sql = "insert into reviews (session_id, collection_id, card_hash, reviewed_at, \
+                       grade, stability, difficulty, interval_raw, interval_days, due_date, \
+                       duration_ms) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                       returning review_id;";
             tx.query_row(
                 sql,
                 params![
                     session_id,
+                    self.collection,
                     review.card_hash,
                     review.reviewed_at,
                     review.grade,
@@ -336,7 +368,7 @@ impl Database {
                 |row| row.get(0),
             )?
         };
-        update_card_performance_tx(&tx, review.card_hash, performance)?;
+        update_card_performance_tx(&tx, &self.collection, review.card_hash, performance)?;
         tx.commit()?;
         Ok(review_id)
     }
@@ -352,25 +384,28 @@ impl Database {
     /// All operations run inside a single transaction so a crash between
     /// them cannot leave the DB in an inconsistent state.
     pub fn void_review_and_restore_performance(
-        &mut self,
+        &self,
         review_id: i64,
         card_hash: CardHash,
         prev_performance: Performance,
         reopen_session: Option<i64>,
     ) -> Fallible<()> {
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let rows = tx.execute(
-            "update reviews set voided = 1 where review_id = ? and card_hash = ?;",
-            params![review_id, card_hash],
+            "update reviews set voided = 1 \
+             where review_id = ? and collection_id = ? and card_hash = ?;",
+            params![review_id, self.collection, card_hash],
         )?;
         if rows != 1 {
             return fail("review not found or does not belong to this card");
         }
-        update_card_performance_tx(&tx, card_hash, prev_performance)?;
+        update_card_performance_tx(&tx, &self.collection, card_hash, prev_performance)?;
         if let Some(session_id) = reopen_session {
             let rows = tx.execute(
-                "update sessions set ended_at = started_at, closed = 0 where session_id = ?;",
-                params![session_id],
+                "update sessions set ended_at = started_at, closed = 0 \
+                 where session_id = ? and collection_id = ?;",
+                params![session_id, self.collection],
             )?;
             if rows != 1 {
                 return fail(format!("No session with ID {session_id} to reopen"));
@@ -391,11 +426,15 @@ impl Database {
         session_id: i64,
         review: &ReviewRecord,
     ) -> Fallible<i64> {
-        let sql = "insert into reviews (session_id, card_hash, reviewed_at, grade, stability, difficulty, interval_raw, interval_days, due_date, duration_ms) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning review_id;";
-        let review_id: i64 = self.conn.query_row(
+        let conn = self.conn.lock();
+        let sql = "insert into reviews (session_id, collection_id, card_hash, reviewed_at, grade, \
+                   stability, difficulty, interval_raw, interval_days, due_date, duration_ms) \
+                   values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning review_id;";
+        let review_id: i64 = conn.query_row(
             sql,
             params![
                 session_id,
+                self.collection,
                 review.card_hash,
                 review.reviewed_at,
                 review.grade,
@@ -413,8 +452,10 @@ impl Database {
 
     /// Update ended_at to mark a session as complete.
     pub fn close_session(&self, session_id: i64, ended_at: Timestamp) -> Fallible<()> {
-        let sql = "update sessions set ended_at = ?, closed = 1 where session_id = ?;";
-        let rows = self.conn.execute(sql, params![ended_at, session_id])?;
+        let conn = self.conn.lock();
+        let sql = "update sessions set ended_at = ?, closed = 1 \
+                   where session_id = ? and collection_id = ?;";
+        let rows = conn.execute(sql, params![ended_at, session_id, self.collection])?;
         if rows != 1 {
             return fail(format!("No session with ID {session_id} to close"));
         }
@@ -431,9 +472,10 @@ impl Database {
     /// contains may have no row yet (nothing inserts one before the first
     /// drill), and a row may survive a card that was deleted from the deck.
     pub fn due_dates(&self) -> Fallible<HashMap<CardHash, Option<Date>>> {
-        let sql = "select card_hash, due_date from cards;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
+        let conn = self.conn.lock();
+        let sql = "select card_hash, due_date from cards where collection_id = ?;";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.collection], |row| {
             let hash: CardHash = row.get(0)?;
             let due: Option<Date> = row.get(1)?;
             Ok((hash, due))
@@ -450,9 +492,12 @@ impl Database {
     /// ascending. Days with no reviews are absent. Range-scans the indexed
     /// `reviewed_date` column.
     pub fn count_reviews_per_day_since(&self, since: Date) -> Fallible<Vec<(Date, usize)>> {
-        let sql = "select reviewed_date, count(*) from reviews where voided = 0 and reviewed_date >= ? group by reviewed_date order by reviewed_date;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![since], |row| {
+        let conn = self.conn.lock();
+        let sql = "select reviewed_date, count(*) from reviews \
+                   where collection_id = ? and voided = 0 and reviewed_date >= ? \
+                   group by reviewed_date order by reviewed_date;";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.collection, since], |row| {
             let date: Date = row.get(0)?;
             let count: i64 = row.get(1)?;
             Ok((date, count as usize))
@@ -466,9 +511,11 @@ impl Database {
 
     /// Count non-voided reviews per grade, across all time.
     pub fn grade_distribution(&self) -> Fallible<GradeDistribution> {
-        let sql = "select grade, count(*) from reviews where voided = 0 group by grade;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
+        let conn = self.conn.lock();
+        let sql = "select grade, count(*) from reviews \
+                   where collection_id = ? and voided = 0 group by grade;";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.collection], |row| {
             let grade: Grade = row.get(0)?;
             let count: i64 = row.get(1)?;
             Ok((grade, count as usize))
@@ -494,10 +541,14 @@ impl Database {
     /// The fraction of non-voided reviews since `since` (inclusive) that were
     /// graded better than Forgot. `None` when the window has no reviews.
     pub fn retention_since(&self, since: Date) -> Fallible<Option<f64>> {
-        let sql = "select count(*), coalesce(sum(case when grade <> 'forgot' then 1 else 0 end), 0) from reviews where voided = 0 and reviewed_date >= ?;";
-        let (total, remembered): (i64, i64) = self
-            .conn
-            .query_row(sql, params![since], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let conn = self.conn.lock();
+        let sql = "select count(*), \
+                   coalesce(sum(case when grade <> 'forgot' then 1 else 0 end), 0) \
+                   from reviews where collection_id = ? and voided = 0 and reviewed_date >= ?;";
+        let (total, remembered): (i64, i64) =
+            conn.query_row(sql, params![self.collection, since], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
         if total == 0 {
             Ok(None)
         } else {
@@ -512,34 +563,11 @@ impl Database {
     /// still running in another process. A session that no longer exists is
     /// not an error: the caller is on a request path, not doing bookkeeping.
     pub fn touch_session(&self, session_id: i64, now: Timestamp) -> Fallible<()> {
-        let sql = "update sessions set last_seen_at = ? where session_id = ?;";
-        self.conn.execute(sql, params![now, session_id])?;
+        let conn = self.conn.lock();
+        let sql = "update sessions set last_seen_at = ? \
+                   where session_id = ? and collection_id = ?;";
+        conn.execute(sql, params![now, session_id, self.collection])?;
         Ok(())
-    }
-
-    /// Close sessions left dangling by a crash or restart.
-    ///
-    /// A row is dangling when it has not been closed and its heartbeat has
-    /// been silent since before `stale_before`. Each such row is closed at
-    /// the time of its last surviving (non-voided) review, or left at
-    /// `started_at` if no review was recorded, and marked `closed`. Returns
-    /// the number of rows closed.
-    ///
-    /// The heartbeat is what makes this safe to run while other processes are
-    /// working: `serve` and a CLI `drill` share one database file, and
-    /// nothing in the row itself distinguishes a session abandoned by a crash
-    /// from one that is simply mid-drill elsewhere. Stamping `ended_at` on a
-    /// live session left it appending reviews to a row claiming to have
-    /// ended. Callers should pass a generous cutoff.
-    ///
-    /// `closed` is the marker rather than `ended_at <> started_at`, because a
-    /// session whose reviews were all undone is rewritten back to
-    /// `started_at` and would otherwise be re-detected on every sweep,
-    /// forever.
-    pub fn close_dangling_sessions(&self, stale_before: Timestamp) -> Fallible<usize> {
-        let sql = "update sessions set ended_at = coalesce((select max(reviewed_at) from reviews where reviews.session_id = sessions.session_id and reviews.voided = 0), started_at), closed = 1 where closed = 0 and coalesce(last_seen_at, started_at) < ?;";
-        let rows = self.conn.execute(sql, params![stale_before])?;
-        Ok(rows)
     }
 
     /// Apply a web edit's hash migration in a single transaction.
@@ -561,33 +589,34 @@ impl Database {
     /// carry over, so it is just recorded as a fresh card and not counted in
     /// either number.
     pub fn apply_edit_migration(
-        &mut self,
+        &self,
         renames: &[(CardHash, CardHash)],
         fresh: &[CardHash],
         now: Timestamp,
     ) -> Fallible<EditMigrationCounts> {
-        let tx = self.conn.transaction()?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let mut renamed: usize = 0;
         let mut collided: usize = 0;
         for (old, new) in renames {
-            if card_exists_in(&tx, *new)? {
+            if card_exists_in(&tx, &self.collection, *new)? {
                 // The new content already has history of its own.
                 collided += 1;
                 continue;
             }
-            if !card_exists_in(&tx, *old)? {
+            if !card_exists_in(&tx, &self.collection, *old)? {
                 // Nothing to carry over; just record the new card.
-                insert_card_if_new_in(&tx, *new, now)?;
+                insert_card_if_new_in(&tx, &self.collection, *new, now)?;
                 continue;
             }
             tx.execute(
-                "update cards set card_hash = ? where card_hash = ?;",
-                params![new, old],
+                "update cards set card_hash = ? where collection_id = ? and card_hash = ?;",
+                params![new, self.collection, old],
             )?;
             renamed += 1;
         }
         for new in fresh {
-            insert_card_if_new_in(&tx, *new, now)?;
+            insert_card_if_new_in(&tx, &self.collection, *new, now)?;
         }
         tx.commit()?;
         Ok(EditMigrationCounts { renamed, collided })
@@ -601,8 +630,9 @@ impl Database {
     ///
     /// If no card with the given hash exists, returns an error.
     pub fn delete_card(&self, card_hash: CardHash) -> Fallible<()> {
-        let sql = "delete from cards where card_hash = ?;";
-        let rows = self.conn.execute(sql, params![card_hash])?;
+        let conn = self.conn.lock();
+        let sql = "delete from cards where collection_id = ? and card_hash = ?;";
+        let rows = conn.execute(sql, params![self.collection, card_hash])?;
         if rows != 1 {
             return fail("Card not found");
         }
@@ -611,18 +641,22 @@ impl Database {
 
     /// Does a card with the given hash exist?
     pub fn card_exists(&self, card_hash: CardHash) -> Fallible<bool> {
-        card_exists_in(&self.conn, card_hash)
+        let conn = self.conn.lock();
+        card_exists_in(&conn, &self.collection, card_hash)
     }
 
     /// Insert a card only if it doesn't already exist.
     pub fn insert_card_if_new(&self, card_hash: CardHash, added_at: Timestamp) -> Fallible<()> {
-        insert_card_if_new_in(&self.conn, card_hash, added_at)
+        let conn = self.conn.lock();
+        insert_card_if_new_in(&conn, &self.collection, card_hash, added_at)
     }
 
     /// Does a bookmark for this card hash exist?
     pub fn bookmark_exists(&self, card_hash: CardHash) -> Fallible<bool> {
-        let sql = "select count(*) from bookmarks where card_hash = ?;";
-        let count: i64 = self.conn.query_row(sql, [card_hash], |row| row.get(0))?;
+        let conn = self.conn.lock();
+        let sql = "select count(*) from bookmarks where collection_id = ? and card_hash = ?;";
+        let count: i64 =
+            conn.query_row(sql, params![self.collection, card_hash], |row| row.get(0))?;
         Ok(count > 0)
     }
 
@@ -638,24 +672,29 @@ impl Database {
         note: Option<String>,
         now: Timestamp,
     ) -> Fallible<()> {
-        let sql = "insert into bookmarks (card_hash, note, created_at) values (?, ?, ?) on conflict (card_hash) do nothing;";
-        self.conn.execute(sql, params![card_hash, note, now])?;
+        let conn = self.conn.lock();
+        let sql = "insert into bookmarks (collection_id, card_hash, note, created_at) \
+                   values (?, ?, ?, ?) on conflict (collection_id, card_hash) do nothing;";
+        conn.execute(sql, params![self.collection, card_hash, note, now])?;
         Ok(())
     }
 
     /// Delete a bookmark.
     pub fn delete_bookmark(&self, card_hash: CardHash) -> Fallible<()> {
-        let sql = "delete from bookmarks where card_hash = ?;";
-        self.conn.execute(sql, params![card_hash])?;
+        let conn = self.conn.lock();
+        let sql = "delete from bookmarks where collection_id = ? and card_hash = ?;";
+        conn.execute(sql, params![self.collection, card_hash])?;
         Ok(())
     }
 
     /// Get the bookmark for a card, if any.
     #[allow(dead_code)]
     pub fn get_bookmark(&self, card_hash: CardHash) -> Fallible<Option<Bookmark>> {
-        let sql = "select note, created_at from bookmarks where card_hash = ?;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query_map(params![card_hash], |row| {
+        let conn = self.conn.lock();
+        let sql = "select note, created_at from bookmarks \
+                   where collection_id = ? and card_hash = ?;";
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query_map(params![self.collection, card_hash], |row| {
             Ok(Bookmark {
                 card_hash,
                 note: row.get(0)?,
@@ -671,9 +710,11 @@ impl Database {
 
     /// List all bookmarks, newest first.
     pub fn list_bookmarks(&self) -> Fallible<Vec<Bookmark>> {
-        let sql = "select card_hash, note, created_at from bookmarks order by created_at desc;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
+        let conn = self.conn.lock();
+        let sql = "select card_hash, note, created_at from bookmarks \
+                   where collection_id = ? order by created_at desc;";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.collection], |row| {
             Ok(Bookmark {
                 card_hash: row.get(0)?,
                 note: row.get(1)?,
@@ -689,30 +730,36 @@ impl Database {
 
     /// Update the note on an existing bookmark.
     pub fn update_bookmark_note(&self, card_hash: CardHash, note: Option<String>) -> Fallible<()> {
-        let sql = "update bookmarks set note = ? where card_hash = ?;";
-        self.conn.execute(sql, params![note, card_hash])?;
+        let conn = self.conn.lock();
+        let sql = "update bookmarks set note = ? where collection_id = ? and card_hash = ?;";
+        conn.execute(sql, params![note, self.collection, card_hash])?;
         Ok(())
     }
 
     /// Count the number of bookmarks in the database.
     pub fn count_bookmarks(&self) -> Fallible<usize> {
-        let sql = "select count(*) from bookmarks;";
-        let count: i64 = self.conn.query_row(sql, [], |row| row.get(0))?;
+        let conn = self.conn.lock();
+        let sql = "select count(*) from bookmarks where collection_id = ?;";
+        let count: i64 = conn.query_row(sql, params![self.collection], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     /// Count the number of non-voided reviews performed on the given date.
     pub fn count_reviews_in_date(&self, date: Date) -> Fallible<usize> {
-        let sql = "select count(*) from reviews where reviewed_date = ? and voided = 0;";
-        let count: i64 = self.conn.query_row(sql, params![date], |row| row.get(0))?;
+        let conn = self.conn.lock();
+        let sql = "select count(*) from reviews \
+                   where collection_id = ? and reviewed_date = ? and voided = 0;";
+        let count: i64 = conn.query_row(sql, params![self.collection, date], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     /// Get the list of all sessions in the database.
     pub fn get_all_sessions(&self) -> Fallible<Vec<SessionRow>> {
-        let sql = "select session_id, started_at, ended_at from sessions order by started_at;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let session_iter = stmt.query_map([], |row| {
+        let conn = self.conn.lock();
+        let sql = "select session_id, started_at, ended_at from sessions \
+                   where collection_id = ? order by started_at;";
+        let mut stmt = conn.prepare(sql)?;
+        let session_iter = stmt.query_map(params![self.collection], |row| {
             Ok(SessionRow {
                 session_id: row.get(0)?,
                 started_at: row.get(1)?,
@@ -728,9 +775,13 @@ impl Database {
 
     /// Get the list of all non-voided reviews for a given session.
     pub fn get_reviews_for_session(&self, session_id: i64) -> Fallible<Vec<ReviewRow>> {
-        let sql = "select review_id, card_hash, reviewed_at, grade, stability, difficulty, interval_raw, interval_days, due_date, duration_ms from reviews where session_id = ? and voided = 0 order by reviewed_at;";
-        let mut stmt = self.conn.prepare(sql)?;
-        let review_iter = stmt.query_map(params![session_id], |row| {
+        let conn = self.conn.lock();
+        let sql = "select review_id, card_hash, reviewed_at, grade, stability, difficulty, \
+                   interval_raw, interval_days, due_date, duration_ms from reviews \
+                   where session_id = ? and collection_id = ? and voided = 0 \
+                   order by reviewed_at;";
+        let mut stmt = conn.prepare(sql)?;
+        let review_iter = stmt.query_map(params![session_id, self.collection], |row| {
             Ok(ReviewRow {
                 review_id: row.get(0)?,
                 data: ReviewRecord {
@@ -752,10 +803,94 @@ impl Database {
         }
         Ok(reviews)
     }
+
+    /// Every surviving review of one card, oldest first.
+    ///
+    /// `voided = 0`, like every other read path: an undone review is marked
+    /// rather than deleted, and reporting it here would tell a reader the
+    /// card was graded when the user took that back.
+    pub fn reviews_for_card(&self, card_hash: CardHash) -> Fallible<Vec<ReviewRow>> {
+        let conn = self.conn.lock();
+        let sql = "select review_id, card_hash, reviewed_at, grade, stability, difficulty, \
+                   interval_raw, interval_days, due_date, duration_ms from reviews \
+                   where card_hash = ? and collection_id = ? and voided = 0 \
+                   order by reviewed_at;";
+        let mut stmt = conn.prepare(sql)?;
+        let review_iter = stmt.query_map(params![card_hash, self.collection], |row| {
+            Ok(ReviewRow {
+                review_id: row.get(0)?,
+                data: ReviewRecord {
+                    card_hash: row.get(1)?,
+                    reviewed_at: row.get(2)?,
+                    grade: row.get(3)?,
+                    stability: row.get(4)?,
+                    difficulty: row.get(5)?,
+                    interval_raw: row.get(6)?,
+                    interval_days: row.get(7)?,
+                    due_date: row.get(8)?,
+                    duration_ms: row.get(9)?,
+                },
+            })
+        })?;
+        let mut reviews = Vec::new();
+        for review in review_iter {
+            reviews.push(review?);
+        }
+        Ok(reviews)
+    }
+
+    /// Remove every row this collection owns.
+    ///
+    /// What deleting a collection folder used to do by deleting a file. The
+    /// cards go first and take their reviews and bookmarks with them by
+    /// cascade; the sessions have no card to hang from and are deleted
+    /// explicitly. One transaction, so a collection is never half-erased.
+    ///
+    /// This permanently destroys the collection's review history. It does
+    /// not go through the `voided` audit trail that undo uses.
+    pub fn erase(&self) -> Fallible<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "delete from cards where collection_id = ?;",
+            params![self.collection],
+        )?;
+        tx.execute(
+            "delete from sessions where collection_id = ?;",
+            params![self.collection],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Open a per-collection database and bring it up to the last version that
+/// shape ever had.
+///
+/// Only the startup merge calls this. Nothing else may write to these files:
+/// after they have been merged they are moved into `db/legacy/`, and an older
+/// binary writing into one would strand every review it recorded there.
+pub fn open_legacy_source(path: &Path) -> Fallible<Connection> {
+    let mut conn = Connection::open(path)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    {
+        let tx = conn.transaction()?;
+        if !probe_schema_exists(&tx)? {
+            return fail(format!(
+                "{} has no `cards` table, so it is not a review database.",
+                path.display()
+            ));
+        }
+        migrate_legacy(&tx)?;
+        tx.commit()?;
+    }
+    Ok(conn)
 }
 
 fn update_card_performance_tx(
     tx: &Transaction,
+    collection: &CollectionId,
     card_hash: CardHash,
     performance: Performance,
 ) -> Fallible<()> {
@@ -779,7 +914,9 @@ fn update_card_performance_tx(
             rp.review_count as i32,
         ),
     };
-    let sql = "update cards set last_reviewed_at = ?, stability = ?, difficulty = ?, interval_raw = ?, interval_days = ?, due_date = ?, review_count = ? where card_hash = ?;";
+    let sql = "update cards set last_reviewed_at = ?, stability = ?, difficulty = ?, \
+               interval_raw = ?, interval_days = ?, due_date = ?, review_count = ? \
+               where collection_id = ? and card_hash = ?;";
     tx.execute(
         sql,
         params![
@@ -790,6 +927,7 @@ fn update_card_performance_tx(
             interval_days,
             due_date,
             review_count,
+            collection,
             card_hash
         ],
     )?;
@@ -866,15 +1004,16 @@ fn migrate_add_session_liveness(tx: &Transaction) -> Fallible<()> {
 /// migrations in order. Databases from before the version table existed
 /// start at version 0; migrations 1-3 probe before altering, so they are
 /// safe no-ops on legacy databases that already have the feature.
-fn migrate(tx: &Transaction) -> Fallible<()> {
+fn migrate_legacy(tx: &Transaction) -> Fallible<()> {
     ensure_version_table(tx)?;
     let current = get_schema_version(tx)?;
-    if current > SCHEMA_VERSION {
+    if current > LEGACY_SCHEMA_VERSION {
         return fail(format!(
-            "This database uses schema version {current}, but this version of hashcards-web only supports up to schema version {SCHEMA_VERSION}. Please upgrade hashcards-web."
+            "This database uses schema version {current}, but a per-collection database only \
+             goes up to schema version {LEGACY_SCHEMA_VERSION}. Please upgrade hashcards-web."
         ));
     }
-    for version in (current + 1)..=SCHEMA_VERSION {
+    for version in (current + 1)..=LEGACY_SCHEMA_VERSION {
         match version {
             1 => migrate_add_duration_ms(tx)?,
             2 => migrate_add_bookmarks(tx)?,
@@ -896,7 +1035,7 @@ fn migrate(tx: &Transaction) -> Fallible<()> {
 
 /// Create the schema_version table if missing and seed it at version 0
 /// (the state of databases created before versioning existed).
-fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
+pub(crate) fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
     tx.execute_batch(
         "create table if not exists schema_version (version integer not null) strict;",
     )?;
@@ -907,12 +1046,12 @@ fn ensure_version_table(tx: &Transaction) -> Fallible<()> {
     Ok(())
 }
 
-fn get_schema_version(tx: &Transaction) -> Fallible<i64> {
+pub(crate) fn get_schema_version(tx: &Transaction) -> Fallible<i64> {
     let version: i64 = tx.query_row("select version from schema_version;", [], |row| row.get(0))?;
     Ok(version)
 }
 
-fn set_schema_version(tx: &Transaction, version: i64) -> Fallible<()> {
+pub(crate) fn set_schema_version(tx: &Transaction, version: i64) -> Fallible<()> {
     tx.execute("delete from schema_version;", [])?;
     tx.execute(
         "insert into schema_version (version) values (?);",
@@ -937,7 +1076,7 @@ fn migrate_add_reviewed_date(tx: &Transaction) -> Fallible<()> {
     Ok(())
 }
 
-fn probe_schema_exists(tx: &Transaction) -> Fallible<bool> {
+pub(crate) fn probe_schema_exists(tx: &Transaction) -> Fallible<bool> {
     let sql = "select count(*) from sqlite_master where type='table' AND name=?;";
     let count: i64 = tx.query_row(sql, ["cards"], |row| row.get(0))?;
     Ok(count > 0)
@@ -954,11 +1093,172 @@ fn migrate_add_meta(tx: &Transaction) -> Fallible<()> {
     Ok(())
 }
 
+/// Builders for the database shapes this release replaces. Tests only: the
+/// server never creates a per-collection database again.
+#[cfg(test)]
+pub mod test_support {
+    use std::path::Path;
+
+    use rusqlite::Connection;
+
+    use super::LEGACY_SCHEMA_VERSION;
+    use crate::error::Fallible;
+
+    /// The last per-collection shape, at version 7.
+    pub fn create_legacy_v7(path: &Path) -> Fallible<Connection> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(include_str!("schema_v7.sql"))?;
+        conn.execute(
+            "insert into schema_version (version) values (?);",
+            rusqlite::params![LEGACY_SCHEMA_VERSION],
+        )?;
+        Ok(conn)
+    }
+
+    /// The shape from before the version table existed, which
+    /// `migrate_legacy` reads as version 0.
+    pub fn create_legacy_v0(path: &Path) -> Fallible<Connection> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "create table cards (
+                card_hash text primary key,
+                added_at text not null,
+                last_reviewed_at text,
+                stability real,
+                difficulty real,
+                interval_raw real,
+                interval_days integer,
+                due_date text,
+                review_count integer not null
+            ) strict;
+
+            create table sessions (
+                session_id integer primary key,
+                started_at text not null,
+                ended_at text not null
+            ) strict;
+
+            create table reviews (
+                review_id integer primary key,
+                session_id integer not null
+                    references sessions (session_id)
+                    on update cascade
+                    on delete cascade,
+                card_hash text not null
+                    references cards (card_hash)
+                    on update cascade
+                    on delete cascade,
+                reviewed_at text not null,
+                grade text not null,
+                stability real not null,
+                difficulty real not null,
+                interval_raw real not null,
+                interval_days integer not null,
+                due_date text not null
+            ) strict;",
+        )?;
+        Ok(conn)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fsrs::Grade;
+    use crate::types::collection_id::CollectionId;
     use crate::types::performance::ReviewedPerformance;
+    use crate::user_db::UserDatabase;
+
+    /// The spec's central promise: the same card text in two collections
+    /// keeps two schedules. Two files necessarily meant two schedules, so
+    /// this is today's behaviour restated as a constraint on one file.
+    #[test]
+    fn the_same_hash_in_two_collections_keeps_two_schedules() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let biology = user.collection(CollectionId::new("bio")?);
+        let spanish = user.collection(CollectionId::new("esp")?);
+        let hash = CardHash::hash_bytes(b"shared card");
+        let now = Timestamp::now();
+        biology.insert_card(hash, now)?;
+        spanish.insert_card(hash, now)?;
+
+        let reviewed = Performance::Reviewed(ReviewedPerformance {
+            last_reviewed_at: now,
+            stability: 2.0,
+            difficulty: 5.0,
+            interval_raw: 30.0,
+            interval_days: 30,
+            due_date: now.date(),
+            review_count: 1,
+        });
+        biology.update_card_performance(hash, reviewed)?;
+
+        assert_eq!(biology.get_card_performance(hash)?, reviewed);
+        assert_eq!(spanish.get_card_performance(hash)?, Performance::New);
+        Ok(())
+    }
+
+    /// Deleting one collection's rows must leave its neighbour's alone. This
+    /// is what replaces deleting a file when a collection folder is removed.
+    #[test]
+    fn erasing_one_collection_leaves_the_other_intact() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let biology = user.collection(CollectionId::new("bio")?);
+        let spanish = user.collection(CollectionId::new("esp")?);
+        let hash = CardHash::hash_bytes(b"shared card");
+        let now = Timestamp::now();
+        biology.insert_card(hash, now)?;
+        spanish.insert_card(hash, now)?;
+        biology.insert_bookmark(hash, Some("note".to_string()), now)?;
+        spanish.insert_bookmark(hash, Some("note".to_string()), now)?;
+        biology.create_session(now)?;
+
+        biology.erase()?;
+
+        assert!(biology.card_hashes()?.is_empty());
+        assert_eq!(biology.count_bookmarks()?, 0);
+        assert!(biology.get_all_sessions()?.is_empty());
+        assert!(spanish.card_hashes()?.contains(&hash));
+        assert_eq!(spanish.count_bookmarks()?, 1);
+        Ok(())
+    }
+
+    /// An edit renames a card's hash and its reviews follow by cascade. The
+    /// cascade must stop at the collection boundary: an identical card in a
+    /// neighbouring collection has its own history and must not move.
+    #[test]
+    fn an_edit_rename_cascades_within_its_collection_only() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let biology = user.collection(CollectionId::new("bio")?);
+        let spanish = user.collection(CollectionId::new("esp")?);
+        let old = CardHash::hash_bytes(b"before");
+        let new = CardHash::hash_bytes(b"after");
+        let now = Timestamp::now();
+        biology.insert_card(old, now)?;
+        spanish.insert_card(old, now)?;
+        let session = biology.create_session(now)?;
+        biology.insert_review_immediately(session, &sample_review(old, now, 2.0))?;
+
+        let counts = biology.apply_edit_migration(&[(old, new)], &[], now)?;
+        assert_eq!(
+            counts,
+            EditMigrationCounts {
+                renamed: 1,
+                collided: 0
+            }
+        );
+
+        assert!(biology.card_hashes()?.contains(&new));
+        assert!(!biology.card_hashes()?.contains(&old));
+        assert_eq!(
+            biology.get_reviews_for_session(session)?[0].data.card_hash,
+            new
+        );
+        // The neighbour still holds the old hash, and never gained the new.
+        assert!(spanish.card_hashes()?.contains(&old));
+        assert!(!spanish.card_hashes()?.contains(&new));
+        Ok(())
+    }
 
     #[test]
     fn test_probe_schema_exists() -> Fallible<()> {
@@ -973,7 +1273,7 @@ mod tests {
     /// `due_today` returns it since it's new.
     #[test]
     fn test_insert_card() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -989,7 +1289,7 @@ mod tests {
     /// Inserting a card twice returns an error.
     #[test]
     fn test_insert_twice() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1004,7 +1304,7 @@ mod tests {
     /// works and that `due_today` returns the card.
     #[test]
     fn test_update_performance() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1028,7 +1328,7 @@ mod tests {
     /// `get_card_performance` fails if the card does not exist.
     #[test]
     fn test_get_performance_nonexistent() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let result = db.get_card_performance(card_hash);
         assert!(result.is_err());
@@ -1043,7 +1343,7 @@ mod tests {
     /// `update_card_performance` fails if the card does not exist.
     #[test]
     fn test_update_performance_nonexistent() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let performance = Performance::New;
         let result = db.update_card_performance(card_hash, performance);
@@ -1056,7 +1356,7 @@ mod tests {
     /// Create a session, insert a review immediately, and close the session.
     #[test]
     fn test_session_persistence() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1099,6 +1399,51 @@ mod tests {
 
     /// Build a review record for `card_hash` with the given stability.
     #[cfg(test)]
+    /// A card's history is what `get_card` reports, so it must show what
+    /// survived — an undone review was taken back and is not a grade.
+    #[test]
+    fn a_cards_reviews_come_back_in_order_and_skip_voided_ones() -> Fallible<()> {
+        let db = UserDatabase::memory()?.collection(CollectionId::new("abc12345")?);
+        let now = Timestamp::now();
+        let hash = CardHash::hash_bytes(b"a card");
+        db.insert_card(hash, now)?;
+        let session = db.create_session(now)?;
+        db.insert_review_immediately(session, &sample_review(hash, now, 1.0))?;
+        let second = db.insert_review_immediately(session, &sample_review(hash, now, 2.0))?;
+
+        let reviews = db.reviews_for_card(hash)?;
+        assert_eq!(reviews.len(), 2);
+        assert!(reviews.iter().all(|r| r.data.card_hash == hash));
+
+        db.void_review_and_restore_performance(second, hash, Performance::New, None)?;
+        assert_eq!(db.reviews_for_card(hash)?.len(), 1);
+        Ok(())
+    }
+
+    /// Another card's reviews are not this card's, and neither are another
+    /// collection's.
+    #[test]
+    fn a_cards_reviews_are_scoped_to_it_and_its_collection() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let spanish = user.collection(CollectionId::new("abc12345")?);
+        let german = user.collection(CollectionId::new("def67890")?);
+        let now = Timestamp::now();
+        let hash = CardHash::hash_bytes(b"a card");
+        let other = CardHash::hash_bytes(b"another card");
+
+        for db in [&spanish, &german] {
+            db.insert_card(hash, now)?;
+            db.insert_card(other, now)?;
+            let session = db.create_session(now)?;
+            db.insert_review_immediately(session, &sample_review(hash, now, 1.0))?;
+            db.insert_review_immediately(session, &sample_review(other, now, 1.0))?;
+        }
+
+        assert_eq!(spanish.reviews_for_card(hash)?.len(), 1);
+        assert_eq!(german.reviews_for_card(hash)?.len(), 1);
+        Ok(())
+    }
+
     fn sample_review(card_hash: CardHash, now: Timestamp, stability: f64) -> ReviewRecord {
         ReviewRecord {
             card_hash,
@@ -1130,7 +1475,7 @@ mod tests {
     /// Grading writes the review and the card's performance in one transaction.
     #[test]
     fn test_insert_review_and_update_performance() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1164,7 +1509,7 @@ mod tests {
     /// Undo voids the review and restores the card's prior performance, atomically.
     #[test]
     fn test_void_review_and_restore_performance() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1215,7 +1560,7 @@ mod tests {
     /// and leaves the card's performance untouched.
     #[test]
     fn test_void_review_wrong_card_is_rejected() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let other_hash = CardHash::hash_bytes(b"b");
         let now = Timestamp::now();
@@ -1255,7 +1600,7 @@ mod tests {
     /// Closing a session that does not exist is an error, not a silent no-op.
     #[test]
     fn test_close_nonexistent_session_is_error() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         assert!(db.close_session(999, Timestamp::now()).is_err());
         Ok(())
     }
@@ -1263,7 +1608,7 @@ mod tests {
     /// Trying to delete a non-existent card returns an error.
     #[test]
     fn test_delete_nonexistent_card() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let result = db.delete_card(card_hash);
         assert!(result.is_err());
@@ -1275,7 +1620,7 @@ mod tests {
     /// Delete a card and see that it is gone.
     #[test]
     fn test_delete_card() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1289,48 +1634,6 @@ mod tests {
         );
         Ok(())
     }
-
-    /// The reviews/cards/sessions schema as it stood before the duration_ms,
-    /// bookmarks, and voided migrations existed (schema.sql minus those three
-    /// features). Used to exercise the full migration chain from version 0.
-    const OLD_SCHEMA: &str = "
-        create table cards (
-            card_hash text primary key,
-            added_at text not null,
-            last_reviewed_at text,
-            stability real,
-            difficulty real,
-            interval_raw real,
-            interval_days integer,
-            due_date text,
-            review_count integer not null
-        ) strict;
-
-        create table sessions (
-            session_id integer primary key,
-            started_at text not null,
-            ended_at text not null
-        ) strict;
-
-        create table reviews (
-            review_id integer primary key,
-            session_id integer not null
-                references sessions (session_id)
-                on update cascade
-                on delete cascade,
-            card_hash text not null
-                references cards (card_hash)
-                on update cascade
-                on delete cascade,
-            reviewed_at text not null,
-            grade text not null,
-            stability real not null,
-            difficulty real not null,
-            interval_raw real not null,
-            interval_days integer not null,
-            due_date text not null
-        ) strict;
-    ";
 
     /// Render a normalized, order-stable description of every user table:
     /// all columns (via table_xinfo, so generated columns are included) and
@@ -1396,28 +1699,22 @@ mod tests {
     }
 
     /// Migrating a pre-migration-era DB produces exactly the same schema as
-    /// executing a fresh schema.sql, and stamps the current schema version.
+    /// executing a fresh schema_v7.sql, and stamps the legacy schema version.
     #[test]
-    fn test_migrated_schema_matches_fresh_schema() -> Fallible<()> {
+    fn test_legacy_ladder_converges_on_the_v7_schema() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let old_path = dir.path().join("old.db");
-        let old_path = old_path.to_str().unwrap();
-        {
-            let conn = Connection::open(old_path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
-        }
-        let migrated = Database::new(old_path)?;
-        let fresh = Database::new(":memory:")?;
+        test_support::create_legacy_v0(&old_path)?;
+        let migrated = open_legacy_source(&old_path)?;
+        let fresh = test_support::create_legacy_v7(&dir.path().join("fresh.db"))?;
         assert_eq!(
-            schema_snapshot(&migrated.conn)?,
-            schema_snapshot(&fresh.conn)?,
-            "migrated schema diverged from fresh schema.sql"
+            schema_snapshot(&migrated)?,
+            schema_snapshot(&fresh)?,
+            "migrated schema diverged from schema_v7.sql"
         );
         let version: i64 =
-            migrated
-                .conn
-                .query_row("select version from schema_version;", [], |row| row.get(0))?;
-        assert_eq!(version, SCHEMA_VERSION);
+            migrated.query_row("select version from schema_version;", [], |row| row.get(0))?;
+        assert_eq!(version, LEGACY_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -1427,16 +1724,12 @@ mod tests {
     fn test_reopening_migrated_db_is_stable() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("stable.db");
-        let path = path.to_str().unwrap();
-        {
-            let conn = Connection::open(path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
-        }
-        let first = Database::new(path)?;
-        let snapshot = schema_snapshot(&first.conn)?;
+        test_support::create_legacy_v0(&path)?;
+        let first = open_legacy_source(&path)?;
+        let snapshot = schema_snapshot(&first)?;
         drop(first);
-        let second = Database::new(path)?;
-        assert_eq!(schema_snapshot(&second.conn)?, snapshot);
+        let second = open_legacy_source(&path)?;
+        assert_eq!(schema_snapshot(&second)?, snapshot);
         Ok(())
     }
 
@@ -1446,17 +1739,16 @@ mod tests {
     fn test_newer_schema_version_is_rejected() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("future.db");
-        let path = path.to_str().unwrap();
         {
-            let conn = Connection::open(path)?;
-            conn.execute_batch(include_str!("schema.sql"))?;
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(include_str!("schema_v7.sql"))?;
             conn.execute_batch(
                 "create table if not exists schema_version (version integer not null) strict;",
             )?;
             conn.execute("delete from schema_version;", [])?;
             conn.execute("insert into schema_version (version) values (999);", [])?;
         }
-        let result = Database::new(path);
+        let result = open_legacy_source(&path);
         assert!(result.is_err());
         let message = result.err().unwrap().to_string();
         assert!(message.contains("999"), "unhelpful error: {message}");
@@ -1470,10 +1762,8 @@ mod tests {
     fn test_populated_legacy_db_migrates() -> Fallible<()> {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pop.db");
-        let path = path.to_str().unwrap();
         {
-            let conn = Connection::open(path)?;
-            conn.execute_batch(OLD_SCHEMA)?;
+            let conn = test_support::create_legacy_v0(&path)?;
             conn.execute_batch(
                 "insert into cards (card_hash, added_at, review_count) values ('abc', '2026-08-30T09:00:00.000', 1);
                  insert into sessions (session_id, started_at, ended_at) values (1, '2026-08-30T09:00:00.000', '2026-08-30T09:00:00.000');
@@ -1481,13 +1771,18 @@ mod tests {
                  values (1, 1, 'abc', '2026-08-30T09:00:00.000', 'good', 2.0, 5.0, 2.0, 2, '2026-09-01');",
             )?;
         }
-        let db = Database::new(path)?;
-        let d: String = db
-            .conn
-            .query_row("select reviewed_date from reviews;", [], |r| r.get(0))?;
+        let conn = open_legacy_source(&path)?;
+        let d: String = conn.query_row("select reviewed_date from reviews;", [], |r| r.get(0))?;
         assert_eq!(d, "2026-08-30");
+        // The same predicate `count_reviews_in_date` uses, asked of the
+        // legacy shape directly: this file has no `collection_id` to scope by.
         let day = Date::new(chrono::NaiveDate::from_ymd_opt(2026, 8, 30).unwrap());
-        assert_eq!(db.count_reviews_in_date(day)?, 1);
+        let count: i64 = conn.query_row(
+            "select count(*) from reviews where reviewed_date = ? and voided = 0;",
+            params![day],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1);
         Ok(())
     }
 
@@ -1496,7 +1791,7 @@ mod tests {
     #[test]
     fn test_count_reviews_in_date_uses_date_index() -> Fallible<()> {
         use chrono::NaiveDate;
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         db.insert_card(card_hash, Timestamp::now())?;
         let day1 = Timestamp::new(
@@ -1531,8 +1826,10 @@ mod tests {
         assert_eq!(db.count_reviews_in_date(day1.date())?, 2);
         assert_eq!(db.count_reviews_in_date(day2.date())?, 1);
 
-        let plan: String = db.conn.query_row(
-            "explain query plan select count(*) from reviews where reviewed_date = '2026-08-31' and voided = 0;",
+        let plan: String = db.conn.lock().query_row(
+            "explain query plan select count(*) from reviews \
+             where collection_id = 'test-collection' and reviewed_date = '2026-08-31' \
+             and voided = 0;",
             [],
             |row| row.get(3),
         )?;
@@ -1547,8 +1844,8 @@ mod tests {
     /// not full table scans.
     #[test]
     fn test_reviews_queries_use_indexes() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
-        let plan: String = db.conn.query_row(
+        let db = Database::memory()?;
+        let plan: String = db.conn.lock().query_row(
             "explain query plan select count(*) from reviews where session_id = 1 and voided = 0;",
             [],
             |row| row.get(3),
@@ -1557,13 +1854,14 @@ mod tests {
             plan.contains("idx_reviews_session_id"),
             "session_id query does not use the index; plan: {plan}"
         );
-        let plan: String = db.conn.query_row(
-            "explain query plan select count(*) from reviews where card_hash = 'abc';",
+        let plan: String = db.conn.lock().query_row(
+            "explain query plan select count(*) from reviews \
+             where collection_id = 'test-collection' and card_hash = 'abc';",
             [],
             |row| row.get(3),
         )?;
         assert!(
-            plan.contains("idx_reviews_card_hash"),
+            plan.contains("idx_reviews_card"),
             "card_hash query does not use the index; plan: {plan}"
         );
         Ok(())
@@ -1577,7 +1875,7 @@ mod tests {
     /// so they were lost even though delete_card returned an error.
     #[test]
     fn test_delete_card_failure_leaves_no_partial_state() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1589,10 +1887,17 @@ mod tests {
             sample_performance(now, 2.0, 1),
         )?;
 
-        // Block deletion of this card with a restricting reference.
-        db.conn.execute_batch(&format!(
-            "create table blocker (card_hash text references cards (card_hash) on delete restrict);
-             insert into blocker (card_hash) values ('{card_hash}');"
+        // Block deletion of this card with a restricting reference. The
+        // reference is composite because the primary key is.
+        db.conn.lock().execute_batch(&format!(
+            "create table blocker (
+                 collection_id text,
+                 card_hash text,
+                 foreign key (collection_id, card_hash)
+                     references cards (collection_id, card_hash) on delete restrict
+             );
+             insert into blocker (collection_id, card_hash)
+             values ('test-collection', '{card_hash}');"
         ))?;
 
         let result = db.delete_card(card_hash);
@@ -1607,7 +1912,7 @@ mod tests {
     /// Deleting a card removes its reviews via the FK cascade.
     #[test]
     fn test_delete_card_cascades_to_reviews() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
@@ -1628,7 +1933,7 @@ mod tests {
     /// Round-trip bookmark insert/get/list/delete.
     #[test]
     fn test_bookmark_crud() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(hash, now)?;
@@ -1656,7 +1961,7 @@ mod tests {
     /// Deleting a card cascades to its bookmark.
     #[test]
     fn test_bookmark_cascade_delete() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(hash, now)?;
@@ -1670,7 +1975,7 @@ mod tests {
     /// A migrated rename carries the bookmark FK via ON UPDATE CASCADE.
     #[test]
     fn test_edit_migration_cascades_bookmark() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let old_hash = CardHash::hash_bytes(b"old");
         let new_hash = CardHash::hash_bytes(b"new");
         let now = Timestamp::now();
@@ -1697,7 +2002,7 @@ mod tests {
     /// collision.
     #[test]
     fn test_edit_migration_skips_existing_target() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let hash_a = CardHash::hash_bytes(b"a");
         let hash_b = CardHash::hash_bytes(b"b");
         let now = Timestamp::now();
@@ -1722,7 +2027,7 @@ mod tests {
     /// wrongly warns the user that review history could not be matched.
     #[test]
     fn test_edit_migration_rename_with_no_prior_row_is_not_a_collision() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let old_hash = CardHash::hash_bytes(b"old");
         let new_hash = CardHash::hash_bytes(b"new");
         let now = Timestamp::now();
@@ -1745,7 +2050,7 @@ mod tests {
     /// rather than a conflict.
     #[test]
     fn test_edit_migration_renames_and_inserts_together() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let a = CardHash::hash_bytes(b"a");
         let b = CardHash::hash_bytes(b"b");
         let c = CardHash::hash_bytes(b"c");
@@ -1768,7 +2073,7 @@ mod tests {
     /// insert_card_if_new inserts only when missing.
     #[test]
     fn test_insert_card_if_new() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card_if_new(hash, now)?;
@@ -1777,107 +2082,12 @@ mod tests {
         Ok(())
     }
 
-    /// FEAT-03: sessions whose `ended_at` still equals the `create_session`
-    /// placeholder are dangling; closing them uses the last surviving
-    /// review's time, or the start time when no review was recorded.
-    #[test]
-    fn test_close_dangling_sessions() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
-        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
-        let t1 = Timestamp::try_from("2026-01-01T10:05:00.000".to_string())?;
-
-        // A properly closed session must be left untouched.
-        let closed = db.create_session(t0)?;
-        db.close_session(closed, t1)?;
-
-        // A dangling session with one review.
-        let card_hash = CardHash::hash_bytes(b"a");
-        db.insert_card(card_hash, t0)?;
-        let dangling = db.create_session(t0)?;
-        let review = sample_review(card_hash, t1, 2.0);
-        db.insert_review_immediately(dangling, &review)?;
-
-        // A dangling session with no reviews at all.
-        let empty_dangling = db.create_session(t1)?;
-
-        // A cutoff after every heartbeat above, so all stale rows qualify.
-        let cutoff = Timestamp::try_from("2026-01-01T11:00:00.000".to_string())?;
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 2);
-
-        let sessions = db.get_all_sessions()?;
-        let find = |id: i64| {
-            sessions
-                .iter()
-                .find(|s| s.session_id == id)
-                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
-        };
-        assert_eq!(
-            find(dangling)?.ended_at,
-            t1,
-            "closed at its last review time"
-        );
-        assert_eq!(
-            find(empty_dangling)?.ended_at,
-            t1,
-            "closed at its start time"
-        );
-        assert_eq!(find(closed)?.ended_at, t1, "already-closed row untouched");
-
-        // Running it again closes nothing: the sweep marks rows `closed`
-        // rather than inferring it from `ended_at <> started_at`. A session
-        // closed at its own start time — one with no reviews, or one whose
-        // reviews were all undone — used to be indistinguishable from the
-        // placeholder and was re-detected on every single sweep, forever.
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 0);
-        assert_eq!(find(empty_dangling)?.ended_at, t1);
-        Ok(())
-    }
-
-    /// A session whose heartbeat is recent is still running somewhere —
-    /// `serve` and a CLI `drill` share one database file — and must not be
-    /// closed. Stamping `ended_at` on it left the live session appending
-    /// reviews to a row claiming to have ended.
-    #[test]
-    fn test_live_session_is_not_swept() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
-        let t0 = Timestamp::try_from("2026-01-01T10:00:00.000".to_string())?;
-        let crashed = db.create_session(t0)?;
-        let live = db.create_session(t0)?;
-
-        // The live session has just checked in; the crashed one never did.
-        let now = Timestamp::try_from("2026-01-01T12:00:00.000".to_string())?;
-        db.touch_session(live, now)?;
-
-        // Anything silent for over an hour is presumed dead.
-        let cutoff = now.minus_minutes(60);
-        assert_eq!(db.close_dangling_sessions(cutoff)?, 1);
-
-        let sessions = db.get_all_sessions()?;
-        let find = |id: i64| {
-            sessions
-                .iter()
-                .find(|s| s.session_id == id)
-                .ok_or_else(|| crate::error::ErrorReport::new("session row missing"))
-        };
-        assert_eq!(find(crashed)?.ended_at, t0, "the crashed session is closed");
-        assert_eq!(
-            find(live)?.ended_at,
-            t0,
-            "the live session's row is left open"
-        );
-        // It is not protected forever: once its heartbeat falls behind a
-        // later cutoff, it is swept like any other abandoned session.
-        let much_later = Timestamp::try_from("2026-01-01T14:00:00.000".to_string())?;
-        assert_eq!(db.close_dangling_sessions(much_later.minus_minutes(60))?, 1);
-        Ok(())
-    }
-
     /// BUG-07: bookmark, add note, re-bookmark — the note and created_at survive.
     #[test]
     fn test_rebookmark_preserves_note_and_created_at() -> Fallible<()> {
         use chrono::NaiveDate;
 
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let hash = CardHash::hash_bytes(b"a");
         let created = Timestamp::new(
             NaiveDate::from_ymd_opt(2026, 8, 30)
@@ -1914,7 +2124,7 @@ mod tests {
     /// Seed: card A reviewed good on 08-29 and forgot on 08-30; card B easy
     /// on 08-30; one voided review on 08-30 that must count nowhere.
     fn seed_stats_db() -> Fallible<Database> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let a = CardHash::hash_bytes(b"a");
         let b = CardHash::hash_bytes(b"b");
         let now = ts("2026-08-29 10:00:00");
@@ -1922,7 +2132,7 @@ mod tests {
         db.insert_card(b, now)?;
         let session_id = db.create_session(now)?;
 
-        let review = |db: &mut Database, hash, when: Timestamp, grade| -> Fallible<i64> {
+        let review = |db: &Database, hash, when: Timestamp, grade| -> Fallible<i64> {
             let mut r = sample_review(hash, when, 2.0);
             r.grade = grade;
             db.insert_review_and_update_performance(
@@ -1931,10 +2141,10 @@ mod tests {
                 sample_performance(when, 2.0, 1),
             )
         };
-        review(&mut db, a, ts("2026-08-29 10:00:00"), Grade::Good)?;
-        review(&mut db, a, ts("2026-08-30 09:00:00"), Grade::Forgot)?;
-        review(&mut db, b, ts("2026-08-30 11:00:00"), Grade::Easy)?;
-        let voided = review(&mut db, b, ts("2026-08-30 12:00:00"), Grade::Good)?;
+        review(&db, a, ts("2026-08-29 10:00:00"), Grade::Good)?;
+        review(&db, a, ts("2026-08-30 09:00:00"), Grade::Forgot)?;
+        review(&db, b, ts("2026-08-30 11:00:00"), Grade::Easy)?;
+        let voided = review(&db, b, ts("2026-08-30 12:00:00"), Grade::Good)?;
         db.void_review_and_restore_performance(
             voided,
             b,

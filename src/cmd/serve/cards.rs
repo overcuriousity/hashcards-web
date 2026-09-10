@@ -16,6 +16,7 @@ use crate::cmd::serve::config::slugify;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::MaxInterval;
 use crate::utils::ensure_dir;
@@ -48,6 +49,18 @@ impl CardRoot {
 
     pub fn path(&self) -> &Path {
         &self.root
+    }
+
+    /// This tree's directory name: `default`, or `{email-slug}-{8 hex}`.
+    ///
+    /// The key under which everything belonging to one user is filed --
+    /// their review database (`{data_dir}/db/{tree}.db`) and their trash
+    /// (`{data_dir}/trash/{tree}/`).
+    pub fn tree_name(&self) -> Fallible<&str> {
+        self.root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| ErrorReport::new("the card folder has no readable name"))
     }
 
     /// Resolve a client-supplied relative path inside this tree.
@@ -227,6 +240,31 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
     }
 }
 
+/// Rewrite a collection's `.hashcards.toml` with new scheduling overrides.
+///
+/// The `id` is read first and written back unchanged. It is what every
+/// review row in this collection is keyed by, so losing it here would
+/// orphan the whole history *and* leave the folder to mint itself a fresh
+/// one on its next read -- the schedule would appear to reset for no reason
+/// a user could see.
+///
+/// `None` for either value removes that override, so the collection falls
+/// back to the instance default.
+pub fn write_collection_overrides(
+    folder: &Path,
+    retention: Option<DesiredRetention>,
+    max_interval: Option<MaxInterval>,
+) -> Fallible<()> {
+    let id = collection_id(folder)?;
+    let meta = CollectionMeta {
+        id: id.to_string(),
+        desired_retention: retention.map(|r| toml::Value::Float(r.into_inner())),
+        max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
+    };
+    write(folder.join(COLLECTION_META_FILE), toml::to_string(&meta)?)?;
+    Ok(())
+}
+
 /// The number an override was written as, or `None` with a warning when it
 /// was not written as a number at all. TOML tells integers and floats apart
 /// and `max_interval_days = 256` is the natural way to write a whole number
@@ -252,7 +290,7 @@ fn override_number(value: &toml::Value, what: &str, meta_path: &Path) -> Option<
 /// slug, so renaming a folder keeps its review history. Ids are derived from
 /// the clock and the process id rather than from the name, precisely so that
 /// a rename cannot change them.
-pub fn collection_id(folder: &Path) -> Fallible<String> {
+pub fn collection_id(folder: &Path) -> Fallible<CollectionId> {
     if let Some(id) = existing_collection_id(folder)? {
         return Ok(id);
     }
@@ -264,7 +302,7 @@ pub fn collection_id(folder: &Path) -> Fallible<String> {
         max_interval_days: None,
     };
     write(&meta_path, toml::to_string(&meta)?)?;
-    Ok(id)
+    CollectionId::new(id)
 }
 
 /// Eight hex characters derived from the clock, the process id and the
@@ -297,7 +335,7 @@ pub enum IdPolicy {
 /// one a user is invited to hand-edit. Only a file with no recognisable id
 /// at all is an error — and it has to be, because the alternative is minting
 /// a fresh id and writing over whatever the user was in the middle of.
-pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
+pub fn existing_collection_id(folder: &Path) -> Fallible<Option<CollectionId>> {
     let meta_path = folder.join(COLLECTION_META_FILE);
     if !meta_path.exists() {
         return Ok(None);
@@ -324,7 +362,7 @@ pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
     if meta.id.is_empty() {
         return Ok(None);
     }
-    Ok(Some(meta.id))
+    Ok(Some(CollectionId::new(meta.id)?))
 }
 
 /// The `id` of a metadata file the TOML parser has rejected.
@@ -333,7 +371,7 @@ pub fn existing_collection_id(folder: &Path) -> Fallible<Option<String>> {
 /// legible however badly the rest of the file has been mangled. Nothing else
 /// is recovered this way: the overrides are preferences and can wait for the
 /// file to be fixed, whereas the id cannot be guessed again.
-fn salvage_id(text: &str) -> Option<String> {
+fn salvage_id(text: &str) -> Option<CollectionId> {
     text.lines().find_map(|line| {
         let value = line.trim_start().strip_prefix("id")?.trim_start();
         let value = value.strip_prefix('=')?.trim();
@@ -342,7 +380,7 @@ fn salvage_id(text: &str) -> Option<String> {
             return None;
         }
         let id = value[quote.len_utf8()..].split(quote).next()?;
-        (!id.is_empty()).then(|| id.to_string())
+        CollectionId::new(id).ok()
     })
 }
 
@@ -366,6 +404,7 @@ pub fn discover_local_collections(
     if !root.path().exists() {
         return Ok(collections);
     }
+    let db_path = user_db_path(root, db_dir)?;
     let mut names = Vec::new();
     for entry in read_dir(root.path())? {
         let entry = entry?;
@@ -403,11 +442,21 @@ pub fn discover_local_collections(
             name,
             overrides: collection_overrides(&path),
             coll_dir: path,
-            db_path: db_dir.join(format!("{id}.db")),
+            db_path: db_path.clone(),
+            collection_id: id,
             owner: owner.map(|o| o.to_lowercase()),
         });
     }
     Ok(collections)
+}
+
+/// The review database of the user whose tree this is.
+///
+/// One file per tree, named for the tree's own directory — which is
+/// `default` or `{email-slug}-{8 hex}`, and so can never collide with a
+/// collection id, which is eight hex characters.
+pub fn user_db_path(root: &CardRoot, db_dir: &Path) -> Fallible<PathBuf> {
+    Ok(db_dir.join(format!("{}.db", root.tree_name()?)))
 }
 
 /// Every collection in every user's tree under `{data_dir}/cards`.
@@ -445,7 +494,7 @@ pub fn discover_all_collections(data_dir: &Path) -> Vec<ResolvedCollection> {
 
 /// The id of one folder under `policy`. `None` means "no id yet, and this
 /// caller may not create one".
-fn folder_id(path: &Path, policy: IdPolicy) -> Fallible<Option<String>> {
+fn folder_id(path: &Path, policy: IdPolicy) -> Fallible<Option<CollectionId>> {
     match policy {
         IdPolicy::CreateMissing => Ok(Some(collection_id(path)?)),
         IdPolicy::ExistingOnly => existing_collection_id(path),
@@ -594,7 +643,7 @@ mod tests {
         let first = collection_id(&folder)?;
         let second = collection_id(&folder)?;
         assert_eq!(first, second);
-        assert_eq!(first.len(), 8);
+        assert_eq!(first.as_str().len(), 8);
         assert!(folder.join(COLLECTION_META_FILE).exists());
         Ok(())
     }
@@ -647,8 +696,11 @@ mod tests {
         Ok(())
     }
 
+    /// The database is the *user's*, named for their card tree; which rows
+    /// in it belong to this collection is its stable id, not its slug. A
+    /// rename therefore changes neither.
     #[test]
-    fn discovered_db_path_is_named_from_the_id_not_the_slug() -> Fallible<()> {
+    fn discovered_db_path_is_the_users_file_not_the_collections() -> Fallible<()> {
         let (dir, root) = fixture()?;
         let folder = root.path().join("Spanish");
         std::fs::create_dir_all(&folder)?;
@@ -656,7 +708,9 @@ mod tests {
 
         let db_dir = dir.join("db");
         let found = discover_local_collections(&root, &db_dir, None, IdPolicy::CreateMissing)?;
-        assert_eq!(found[0].db_path, db_dir.join(format!("{id}.db")));
+        assert_eq!(found[0].db_path, user_db_path(&root, &db_dir)?);
+        assert_ne!(found[0].db_path, db_dir.join(format!("{id}.db")));
+        assert_eq!(found[0].collection_id, id);
         Ok(())
     }
 
@@ -730,7 +784,7 @@ mod tests {
         let found =
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
-        assert_eq!(found[0].db_path, dir.join("db").join(format!("{id}.db")));
+        assert_eq!(found[0].collection_id, id);
         let scheduling = found[0].scheduling(Scheduling::default());
         assert_eq!(scheduling.retention.into_inner(), DesiredRetention::DEFAULT);
         assert_eq!(scheduling.max_interval.into_inner(), MaxInterval::DEFAULT);
@@ -779,9 +833,8 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(
-            found[0].db_path,
-            dir.join("db").join(format!("{id}.db")),
-            "the salvaged id must still name the same review database"
+            found[0].collection_id, id,
+            "the salvaged id must still scope the same review rows"
         );
         assert_eq!(
             std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,

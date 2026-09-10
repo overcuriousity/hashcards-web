@@ -36,6 +36,32 @@ struct DeckMetadata {
     name: Option<String>,
 }
 
+/// The 0-based line at which a deck file's cards begin.
+///
+/// Zero unless the file opens with TOML frontmatter, in which case it is the
+/// line after its closing `---`. Anything that edits a deck file by line
+/// needs this: the frontmatter's delimiters are byte-for-byte what a card
+/// separator is, so a rewrite that does not know where the body starts will
+/// happily take the closing one away and leave a file that no longer parses.
+///
+/// A file whose frontmatter is never closed has no body to speak of, and
+/// whoever is about to write it will hear so from `extract_frontmatter`.
+pub fn body_start_line(text: &str) -> usize {
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(first) if first.trim() == "---" => {}
+        _ => return 0,
+    }
+    for (offset, line) in lines.enumerate() {
+        if line.trim() == "---" {
+            // `offset` counts from the line after the opening delimiter, so
+            // the closing one is file line `offset + 1`.
+            return offset + 2;
+        }
+    }
+    0
+}
+
 /// Extract TOML frontmatter from markdown text.
 /// Returns (frontmatter_metadata, content_without_frontmatter, content_start_line)
 /// where `content_start_line` is the 0-based file line at which the content
@@ -128,7 +154,24 @@ pub struct ParsedDeck {
 /// Byte-identical cards (same hash) are deduplicated: the first copy
 /// encountered is kept, and every dropped copy is reported in
 /// `ParsedDeck::duplicates` with both locations.
-pub fn parse_deck(directory: &PathBuf) -> Fallible<ParsedDeck> {
+///
+/// The directory is canonicalized first, so every card knows the real path
+/// of the file it came from. Callers decide which file a card belongs to by
+/// comparing that path against a canonical one — which file a moved deck's
+/// schedules follow is decided exactly that way — and a comparison of a
+/// resolved path against an unresolved one silently matches nothing. The
+/// invariant used to be supplied by `Collection::open`, which canonicalizes
+/// before calling here; every caller that parses a directory itself was
+/// left to remember, and the one that moves a deck between collections did
+/// not. It belongs here, where the paths are made.
+pub fn parse_deck(directory: &Path) -> Fallible<ParsedDeck> {
+    let directory: PathBuf = directory.canonicalize().map_err(|e| {
+        ErrorReport::new(format!(
+            "Failed to read the collection at {}: {e}",
+            directory.display()
+        ))
+    })?;
+    let directory: &Path = &directory;
     let mut all_cards = Vec::new();
     let mut duplicates = Vec::new();
     for entry in WalkDir::new(directory) {
@@ -1509,6 +1552,41 @@ mod tests {
         assert!(deck.is_ok());
         let cards = deck?.cards;
         assert_eq!(cards.len(), 2);
+        Ok(())
+    }
+
+    /// A card's file path is compared against a canonicalized one wherever
+    /// a caller has to decide which file a card came from — moving a deck
+    /// between collections is the case that matters, since the cards whose
+    /// schedules follow the file are chosen by exactly that comparison.
+    /// The paths therefore have to be canonical here, at the one place that
+    /// makes them, and not merely at the callers that happen to hand in a
+    /// canonical directory. A `data_dir` reached through a symlink is an
+    /// ordinary deployment — and on macOS it is every temporary directory,
+    /// which is where this first showed itself.
+    #[test]
+    fn a_card_parsed_through_a_symlink_still_knows_its_real_path() -> Fallible<()> {
+        let real = tempfile::tempdir()?;
+        let real_path = real.path().canonicalize()?;
+        std::fs::write(real_path.join("verbs.md"), "Q: hablar?\nA: to speak\n")?;
+
+        // A second temporary directory holds the link, so the link itself
+        // is not inside the directory being walked.
+        let link_home = tempfile::tempdir()?;
+        let link = link_home.path().canonicalize()?.join("cards");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_path, &link)?;
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_path, &link)?;
+
+        let cards = parse_deck(&link)?.cards;
+        assert_eq!(cards.len(), 1, "the deck behind the link was not read");
+        assert_eq!(
+            cards[0].file_path(),
+            &real_path.join("verbs.md"),
+            "the card's path still runs through the symlink, so a caller \
+             comparing it against a canonical path finds no card at all"
+        );
         Ok(())
     }
 

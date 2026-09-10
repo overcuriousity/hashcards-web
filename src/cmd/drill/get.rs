@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_completion_page_without_reviews_skips_stats() -> Fallible<()> {
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let session_id = db.create_session(Timestamp::now()).unwrap();
         let mutable = MutableState {
             reveal: false,
@@ -501,7 +501,7 @@ mod tests {
     }
 
     fn make_empty_mutable() -> MutableState {
-        let db = Database::new(":memory:").unwrap();
+        let db = Database::memory().unwrap();
         let session_id = db.create_session(Timestamp::now()).unwrap();
         MutableState::new(
             SessionDbs::single(
@@ -587,7 +587,7 @@ mod tests {
     fn test_session_page_keeps_the_grade_bar_for_grades() -> Fallible<()> {
         let dir = crate::helper::create_tmp_directory()?;
         std::fs::write(dir.join("deck.md"), "Q: Question?\nA: Answer.\n")?;
-        let db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let now = Timestamp::now();
         let card = Card::new(
             "Deck".to_string(),
@@ -688,7 +688,7 @@ mod tests {
     /// slowest card shows the question preview, not the deck name.
     #[test]
     fn test_completion_stats_from_db_reviews() -> Fallible<()> {
-        let mut db = Database::new(":memory:")?;
+        let db = Database::memory()?;
         let now = Timestamp::now();
         let slow = make_card("SlowDeck", "What is the slowest question?");
         let fast = make_card("FastDeck", "Fast question?");

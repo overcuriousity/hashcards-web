@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::cmd::drill::render::AnswerControls;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::types::collection_id::CollectionId;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::Jitter;
 use crate::types::performance::MaxInterval;
@@ -23,8 +24,56 @@ pub struct ServeConfig {
     pub defaults: DefaultsSection,
     #[serde(default)]
     pub oidc: Option<OidcSection>,
+    #[serde(default)]
+    pub mcp: Option<McpSection>,
     #[serde(rename = "deck", default)]
     pub decks: Vec<CustomDeckEntry>,
+}
+
+/// `[mcp]`, the MCP endpoint's settings. Absent means enabled, answering
+/// to loopback only.
+#[derive(Deserialize)]
+pub struct McpSection {
+    pub enabled: Option<bool>,
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+/// `[mcp]` after defaults are applied.
+#[derive(Clone)]
+pub struct ResolvedMcp {
+    pub enabled: bool,
+    /// Hostnames `/mcp` will answer to.
+    ///
+    /// `rmcp` validates the `Host` header against this list to stop a web
+    /// page in a browser from driving a locally-running MCP server through
+    /// DNS rebinding. Its default is loopback only, which is right for a
+    /// desktop MCP server and wrong for hashcards, which is normally served
+    /// on a real hostname -- so the deployment's names go here, and
+    /// loopback is always kept alongside them so a client on the same
+    /// machine keeps working with no configuration at all.
+    pub allowed_hosts: Vec<String>,
+}
+
+/// Enabled, answering to loopback only: what an instance with no `[mcp]`
+/// section gets, and what a test that does not care about MCP wants.
+impl Default for ResolvedMcp {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_hosts: Self::loopback(),
+        }
+    }
+}
+
+impl ResolvedMcp {
+    /// The hosts every instance answers to, whatever the config says.
+    fn loopback() -> Vec<String> {
+        vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+        ]
+    }
 }
 
 /// A user-assembled deck: a named selection of decks drawn from any of the
@@ -239,7 +288,11 @@ pub struct ResolvedCollection {
     pub name: String,
     pub slug: String,
     pub coll_dir: PathBuf,
+    /// The owning user's review database, shared by every collection in
+    /// their card tree. Which rows in it belong to this collection is
+    /// `collection_id`, not the file name.
     pub db_path: PathBuf,
+    pub collection_id: CollectionId,
     /// Owning user's email (lowercased), when `[oidc]` is configured.
     pub owner: Option<String>,
     /// Scheduling this collection asks for in place of the instance's.
@@ -277,6 +330,8 @@ pub struct ResolvedServeConfig {
     /// Set when `[oidc]` is configured. Gates every route except `/auth/*`
     /// behind login and scopes collections/notes to their `owner`.
     pub oidc: Option<ResolvedOidc>,
+    /// The MCP endpoint at `/mcp`.
+    pub mcp: ResolvedMcp,
 }
 
 impl ResolvedServeConfig {
@@ -372,6 +427,28 @@ impl ResolvedServeConfig {
             }
         }
 
+        let mcp = {
+            let section = config.mcp.as_ref();
+            let mut allowed_hosts = ResolvedMcp::loopback();
+            if let Some(extra) = section.and_then(|m| m.allowed_hosts.as_ref()) {
+                for host in extra {
+                    let host = host.trim();
+                    if host.is_empty() {
+                        return fail(
+                            "configuration error: [mcp].allowed_hosts must not contain an empty                              entry",
+                        );
+                    }
+                    if !allowed_hosts.iter().any(|h| h == host) {
+                        allowed_hosts.push(host.to_string());
+                    }
+                }
+            }
+            ResolvedMcp {
+                enabled: section.and_then(|m| m.enabled).unwrap_or(true),
+                allowed_hosts,
+            }
+        };
+
         Ok(Self {
             host: config.server.host,
             port: config.server.port,
@@ -381,6 +458,7 @@ impl ResolvedServeConfig {
             custom_decks,
             session_timeout_minutes: config.server.session_timeout_minutes,
             oidc,
+            mcp,
         })
     }
 
@@ -627,6 +705,53 @@ mod tests {
             ResolvedServeConfig::from_toml(config).is_err(),
             "an `owner` without [oidc] must be rejected for decks too"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_is_enabled_when_no_section_is_given() -> Fallible<()> {
+        let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n";
+        let config = ResolvedServeConfig::from_toml(toml::from_str(toml)?)?;
+        assert!(config.mcp.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_can_be_turned_off() -> Fallible<()> {
+        let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n\n[mcp]\nenabled = false\n";
+        let config = ResolvedServeConfig::from_toml(toml::from_str(toml)?)?;
+        assert!(!config.mcp.enabled);
+        Ok(())
+    }
+
+    /// Without this, an instance on a real hostname answers every MCP
+    /// request with a rejection and says nothing about why.
+    #[test]
+    fn mcp_allows_the_configured_hosts_as_well_as_loopback() -> Fallible<()> {
+        let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n\n\
+                    [mcp]\nallowed_hosts = [\"cards.example.com\"]\n";
+        let config = ResolvedServeConfig::from_toml(toml::from_str(toml)?)?;
+        assert!(
+            config
+                .mcp
+                .allowed_hosts
+                .contains(&"cards.example.com".to_string())
+        );
+        assert!(
+            config.mcp.allowed_hosts.iter().any(|h| h == "localhost"),
+            "loopback must stay allowed, or a local client stops working"
+        );
+        Ok(())
+    }
+
+    /// An empty entry would silently allow nothing and look like a typo
+    /// nobody notices until every request is refused.
+    #[test]
+    fn an_empty_allowed_host_is_refused() -> Fallible<()> {
+        let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n\n\
+                    [mcp]\nallowed_hosts = [\"\"]\n";
+        let config: ServeConfig = toml::from_str(toml)?;
+        assert!(ResolvedServeConfig::from_toml(config).is_err());
         Ok(())
     }
 }
