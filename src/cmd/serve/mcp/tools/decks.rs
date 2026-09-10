@@ -403,6 +403,66 @@ mod tests {
     /// The point of the per-user database, and the reason this project
     /// waited for it: moving a deck between collections is a row update,
     /// not a transfer between two database files.
+    /// The same move, with the data directory reached through a symlink.
+    ///
+    /// The cards whose schedules follow the file are chosen by comparing
+    /// each parsed card's path against the canonicalized path of the file
+    /// being moved, so if the two are not resolved the same way the filter
+    /// selects nothing: the deck moves and every review of it is left
+    /// behind as an orphan, with no error to say so. A `data_dir` behind a
+    /// symlink is an ordinary deployment; on macOS it is also every
+    /// temporary directory, which is why this failed there and nowhere
+    /// else.
+    #[test]
+    fn a_deck_moved_under_a_symlinked_data_dir_still_takes_its_history() -> Fallible<()> {
+        use crate::cmd::serve::cards::user_db_path;
+        use crate::cmd::serve::mcp::HashcardsMcp;
+        use crate::cmd::serve::state::test_support::state_with_data_dir;
+        use crate::user_db::UserDatabase;
+        use crate::utils::ensure_dir;
+
+        let real = tempfile::tempdir()?;
+        let real_path = real.path().canonicalize()?;
+        // The link lives outside the tree it points at, so the walk never
+        // meets it and only the data directory's own path is indirect.
+        let link_home = tempfile::tempdir()?;
+        let data_dir = link_home.path().canonicalize()?.join("data");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_path, &data_dir)?;
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_path, &data_dir)?;
+
+        let state = state_with_data_dir(data_dir.clone());
+        let root = CardRoot::for_user(&data_dir, None)?;
+        std::fs::create_dir_all(root.path().join("Spanish"))?;
+        std::fs::write(
+            root.path().join("Spanish/verbs.md"),
+            "Q: hablar\nA: to speak\n",
+        )?;
+        let spanish = collection_id(&root.path().join("Spanish"))?;
+        std::fs::create_dir_all(root.path().join("German"))?;
+        let german = collection_id(&root.path().join("German"))?;
+        ensure_dir(&data_dir.join("db"), "review database directory")?;
+        let mcp = HashcardsMcp::new(state);
+
+        let hex = list_cards_for(&mcp.state, None, "Spanish", None, false, None, 50)?[0]
+            .hash
+            .clone();
+        let hash = CardHash::from_hex(&hex)?;
+        let db = UserDatabase::open(&user_db_path(&root, &data_dir.join("db"))?)?;
+        db.collection(spanish.clone())
+            .insert_card(hash, Timestamp::now())?;
+
+        move_decks_for(&mcp.state, None, "Spanish", "verbs.md", "German")?;
+
+        assert!(
+            db.collection(german).card_hashes()?.contains(&hash),
+            "the review history did not follow the deck across the symlink"
+        );
+        assert!(db.collection(spanish).card_hashes()?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn a_moved_deck_takes_its_cards_and_their_history() -> Fallible<()> {
         use crate::cmd::serve::cards::user_db_path;

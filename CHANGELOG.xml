@@ -92,6 +92,21 @@
         </breaking>
         <fixed>
             <change author="claude">
+            **Moving a deck between collections no longer strands its review
+            history when `data_dir` is reached through a symlink.** The move
+            picks the cards whose schedules follow the file by comparing
+            every parsed card's path against the canonical path of the file
+            being moved. `parse_deck` did not canonicalize, so the two were
+            only ever resolved the same way when nothing in the path was a
+            link: where one was -- `/data` pointing at a mounted volume, a
+            symlinked home, and on macOS every temporary directory -- the
+            comparison selected no cards at all. The deck moved and every
+            review of it stayed behind as an orphan, with nothing said. Card
+            file paths are now canonical from the point they are made,
+            rather than by each caller remembering to hand in a canonical
+            directory.
+            </change>
+            <change author="claude">
             **The bottom of the drill screen is no longer hidden behind the
             phone's gesture bar.** The `End session` button was reported
             missing from the installed app; it was being rendered under the
