@@ -75,12 +75,17 @@ pub async fn require_bearer(
 
 /// The token out of an `Authorization: Bearer …` header, if it is one and
 /// it is shaped like a hashcards token.
+///
+/// The scheme is matched case-insensitively, as RFC 9110 says it is: a
+/// client sending `BEARER` otherwise got a bare 401 asking for the token it
+/// had just sent, with nothing to say why it was ignored.
 fn bearer_token(headers: &HeaderMap) -> Option<TokenSecret> {
     let raw = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let rest = raw
-        .strip_prefix("Bearer ")
-        .or_else(|| raw.strip_prefix("bearer "))?;
-    TokenSecret::parse(rest).ok()
+    let (scheme, rest) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    TokenSecret::parse(rest.trim_start()).ok()
 }
 
 fn unauthorized(message: &str) -> Response {
@@ -110,10 +115,20 @@ mod tests {
     }
 
     /// RFC 9110 says the scheme is case-insensitive, and clients differ.
+    /// Two spellings were accepted and the rest got a bare 401 saying a
+    /// bearer token is required, with nothing to say the token had been
+    /// sent and ignored.
     #[test]
-    fn the_bearer_scheme_is_accepted_in_lower_case() {
+    fn the_bearer_scheme_is_accepted_in_any_case() {
         let secret = TokenSecret::generate().expect("a token");
-        assert!(bearer_token(&headers(&format!("bearer {secret}"))).is_some());
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            assert!(
+                bearer_token(&headers(&format!("{scheme} {secret}"))).is_some(),
+                "`{scheme}` was refused"
+            );
+        }
+        // RFC 9110 allows more than one space between scheme and token.
+        assert!(bearer_token(&headers(&format!("Bearer  {secret}"))).is_some());
     }
 
     #[test]

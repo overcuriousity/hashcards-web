@@ -43,10 +43,12 @@ use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::browse::build_deck_tree;
 use crate::cmd::serve::browse::render_browse_page;
 use crate::cmd::serve::config::ResolvedCollection;
+use crate::cmd::serve::counts::Burial;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
 use crate::cmd::serve::decks::find_custom_deck;
 use crate::cmd::serve::files::existing_collections_for_user;
-use crate::cmd::serve::reviewdb::open_collection_db;
+use crate::cmd::serve::reviewdb::open_user_db;
+use crate::cmd::serve::reviewdb::refuse_if_unconsolidated;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::DrillSession;
 use crate::cmd::serve::state::SessionKey;
@@ -147,10 +149,16 @@ fn collection_get_inner(
         let rc = find_collection(state, slug, owner)
             .ok_or_else(|| crate::error::ErrorReport::new(format!("Unknown collection: {slug}")))?;
         // Two views, because `build_deck_tree` consumes the one it is
-        // given. They share the user's connection, so this is not a second
-        // writer on the file.
-        let browse = build_deck_tree(&rc.coll_dir, open_collection_db(state, &rc)?)?;
-        let db = open_collection_db(state, &rc)?;
+        // given. Both are taken from one `UserDatabase`, so they really do
+        // share this user's connection and are not a second writer on the
+        // file -- two calls to `open_collection_db` would each open one.
+        let user_db = open_user_db(state, &rc)?;
+        let browse = build_deck_tree(
+            &rc.coll_dir,
+            user_db.collection(rc.collection_id.clone()),
+            &state.config.defaults,
+        )?;
+        let db = user_db.collection(rc.collection_id.clone());
         // FEAT-03: report the session rows the startup sweep closed. The
         // sweep itself runs once, at startup: it cannot tell a crashed
         // session from a live one, and a second server may share the same
@@ -514,9 +522,17 @@ pub(super) fn create_session_from_sources(
 
     for (index, spec) in sources.into_iter().enumerate() {
         let rc = spec.collection;
+        // The same gate every read path and `save_file` apply. This path
+        // writes -- a `cards` row per card below, and a `sessions` row --
+        // and rows written into a database whose startup merge failed
+        // collide with the ones the next merge still has to import, leaving
+        // the tree stuck unmerged for good.
         let user_db = match opened.entry(rc.db_path.clone()) {
             Entry::Occupied(slot) => slot.into_mut(),
-            Entry::Vacant(slot) => slot.insert(UserDatabase::open(&rc.db_path)?),
+            Entry::Vacant(slot) => {
+                refuse_if_unconsolidated(state, &rc.db_path)?;
+                slot.insert(UserDatabase::open(&rc.db_path)?)
+            }
         };
         let collection = Collection::open(
             rc.coll_dir.clone(),
@@ -590,9 +606,8 @@ pub(super) fn create_session_from_sources(
         }
     }
 
-    if state.config.defaults.bury_siblings {
-        due_cards = bury_siblings(due_cards);
-    }
+    let mut burial = Burial::new(&state.config.defaults);
+    due_cards.retain(|card| burial.admits(card));
 
     if due_cards.is_empty() {
         // The session rows opened above would otherwise linger as dangling
@@ -659,11 +674,39 @@ pub(super) fn deck_card_counts(
     let today = Timestamp::now().date();
     let mut due_total = 0;
     let mut card_total = 0;
+    // The due count is the size of the session this deck's Drill button
+    // starts, so it is filtered exactly as the queue is: one card per
+    // family, and one card per content address however many collections
+    // offer it. Both run across the whole deck, not per source.
+    let mut burial = Burial::new(&state.config.defaults);
+    let mut queued: HashSet<CardHash> = HashSet::new();
+    // One connection per database rather than one per source: a deck's
+    // collections all belong to one user and so name one file, and this
+    // runs once per source on every render of the landing page.
+    let mut opened: HashMap<PathBuf, UserDatabase> = HashMap::new();
     for spec in sources {
+        let rc = &spec.collection;
+        let user_db = match opened.entry(rc.db_path.clone()) {
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(slot) => {
+                refuse_if_unconsolidated(state, &rc.db_path)?;
+                slot.insert(UserDatabase::open(&rc.db_path)?)
+            }
+        };
         let collection = Collection::open(
-            spec.collection.coll_dir.clone(),
-            open_collection_db(state, &spec.collection)?,
+            rc.coll_dir.clone(),
+            user_db.collection(rc.collection_id.clone()),
         )?;
+        // As the other two counters do, and for the same reason: a card the
+        // database has not seen yet is due, and the session about to be
+        // started will insert it anyway. Counted without this, a collection
+        // no page has opened yet reports nothing due and drills fine.
+        let seen: HashSet<CardHash> = collection.db.card_hashes()?;
+        for card in collection.cards.iter() {
+            if !seen.contains(&card.hash()) {
+                collection.db.insert_card(card.hash(), Timestamp::now())?;
+            }
+        }
         let due: HashSet<CardHash> = collection.db.due_today(today)?;
         let wanted: HashSet<&str> = spec.decks.iter().map(|d| d.as_str()).collect();
         for card in collection
@@ -672,7 +715,7 @@ pub(super) fn deck_card_counts(
             .filter(|c| wanted.contains(c.deck_name().as_str()))
         {
             card_total += 1;
-            if due.contains(&card.hash()) {
+            if due.contains(&card.hash()) && queued.insert(card.hash()) && burial.admits(card) {
                 due_total += 1;
             }
         }
@@ -738,21 +781,6 @@ fn render_custom_deck_page(
             }
         }
     })
-}
-
-fn bury_siblings(deck: Vec<Card>) -> Vec<Card> {
-    let mut seen_families = HashSet::new();
-    let mut result = Vec::new();
-    for card in deck.into_iter() {
-        if let Some(family) = card.family_hash() {
-            if seen_families.contains(&family) {
-                continue;
-            }
-            seen_families.insert(family);
-        }
-        result.push(card);
-    }
-    result
 }
 
 pub async fn collection_post_handler(
@@ -1449,6 +1477,149 @@ mod tests {
         std::fs::create_dir_all(&folder)?;
         collection_id(&folder)?;
         assert!(find_collection(&state, "Spanish", None).is_some());
+        Ok(())
+    }
+
+    /// Regression: the count on the page that starts a drill and the count
+    /// inside the session it starts must be the same number. Sibling clozes
+    /// are buried when the queue is built, so a page that counted them
+    /// unburied promised more cards than the session ever held: "Start (2
+    /// due)" leading to "0 of 1".
+    #[test]
+    fn the_due_count_on_the_page_matches_the_session_it_starts() -> Fallible<()> {
+        use crate::cmd::serve::browse::build_deck_tree;
+        use crate::cmd::serve::handlers::find_collection;
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().canonicalize()?;
+        // One note, two deletions: two cards, one family.
+        card_collection(&data_dir, None, "Deck", "C: Foo [bar] baz [quux].\n")?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(data_dir.clone());
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not discovered"))?;
+
+        // Both deletions really are due: the counts below are burying, not
+        // an empty collection.
+        let db = open_collection_db(&state, &rc)?;
+        crate::cmd::serve::counts::compute_collection_counts(
+            &rc.coll_dir,
+            db,
+            &state.config.defaults,
+        )?;
+        let scheduled = open_collection_db(&state, &rc)?
+            .due_today(crate::types::timestamp::Timestamp::now().date())?
+            .len();
+        assert_eq!(scheduled, 2, "both deletions are scheduled and due");
+
+        let browse = build_deck_tree(
+            &rc.coll_dir,
+            open_collection_db(&state, &rc)?,
+            &state.config.defaults,
+        )?;
+        let shown = browse.tree.due_today_recursive();
+        assert_eq!(shown, 1, "the page counts the queue, one card per family");
+
+        let session = create_session_from_sources(
+            &state,
+            vec![SessionSourceSpec {
+                collection: rc,
+                decks: Vec::new(),
+            }],
+            None,
+        )?
+        .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
+
+        assert_eq!(
+            shown, session.total_cards,
+            "the page promised {shown} cards and the session holds {}",
+            session.total_cards
+        );
+        Ok(())
+    }
+
+    /// A deck's Drill button carries the same promise the collection's does,
+    /// and the same two filters apply to it: cards are content addressed, so
+    /// the same fact written into two of the deck's collections is drilled
+    /// once, and a cloze family is buried once across the whole deck rather
+    /// than once per collection.
+    #[test]
+    fn a_decks_due_count_counts_each_card_once_across_its_collections() -> Fallible<()> {
+        use crate::cmd::serve::decks::ResolvedCustomDeck;
+        use crate::cmd::serve::decks::slug_for_deck;
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().to_path_buf();
+        // The same note in both collections: one shared basic card, and one
+        // cloze family of two.
+        let cards = "Q: shared question?\nA: shared answer\n---\nC: Foo [bar] baz [quux].\n";
+        card_collection(&data_dir, None, "alpha", cards)?;
+        card_collection(&data_dir, None, "beta", cards)?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(data_dir);
+
+        let deck = ResolvedCustomDeck {
+            name: "Mixed".to_string(),
+            slug: slug_for_deck("Mixed", None),
+            owner: None,
+            members: vec![
+                crate::cmd::serve::config::DeckMember::parse("alpha/Deck")
+                    .ok_or_else(|| ErrorReport::new("member"))?,
+                crate::cmd::serve::config::DeckMember::parse("beta/Deck")
+                    .ok_or_else(|| ErrorReport::new("member"))?,
+            ],
+        };
+        state.custom_decks.lock().push(deck.clone());
+
+        let sources = deck_sources(&state, &deck, None);
+        assert_eq!(sources.len(), 2, "both collections must contribute");
+        let (due, _) = super::deck_card_counts(&state, &sources)?;
+
+        let session = create_session_from_sources(&state, sources, None)?
+            .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
+        assert_eq!(
+            due, session.total_cards,
+            "the deck page promised {due} cards and the session holds {}",
+            session.total_cards
+        );
+        // One basic card and one of the cloze family, both taken from alpha.
+        assert_eq!(due, 2);
+        Ok(())
+    }
+
+    /// Regression: the drill-start path opened the review database itself
+    /// instead of going through `open_collection_db`, so it was the one
+    /// write path with no consolidation gate. For a user whose startup
+    /// merge failed, starting a session inserted a `cards` row per card and
+    /// a `sessions` row into the un-consolidated file; the next merge's
+    /// plain insert then collided with them, and the tree could never be
+    /// consolidated at all. This is what `save_file`'s gate exists to stop.
+    #[test]
+    fn a_drill_is_refused_for_a_user_whose_merge_failed() -> Fallible<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().to_path_buf();
+        let (mut state, rc) = test_state(&data_dir)?;
+        state.migration_failures = std::sync::Arc::new(
+            [(rc.db_path.clone(), "disk is on fire".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let started = create_session_from_sources(
+            &state,
+            vec![SessionSourceSpec {
+                collection: rc.clone(),
+                decks: Vec::new(),
+            }],
+            None,
+        );
+        let message = match started {
+            Ok(_) => return crate::error::fail("a failed merge must refuse to start a drill"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("disk is on fire"), "{message}");
+        assert!(
+            !rc.db_path.exists(),
+            "the refused drill opened the database anyway"
+        );
         Ok(())
     }
 }

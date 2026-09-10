@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
+use crate::cmd::serve::cards::CardRoot;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::files::existing_collections_for_user;
 use crate::cmd::serve::files::user_root_readonly;
@@ -155,6 +156,46 @@ pub(super) fn collection_of(
     })
 }
 
+/// The collection's folder, as a path relative to the caller's card tree.
+///
+/// Not the slug. `slugify` maps every character that is not alphanumeric to
+/// `-`, so a collection whose folder is `Exam revision` is addressed as
+/// `Exam-revision` -- and there is no folder of that name. Every tool that
+/// builds a filesystem path takes it from here, because a path built out of
+/// the slug resolves to nothing for any collection whose name contains a
+/// space or a piece of punctuation, and the tools then answer that its
+/// decks do not exist.
+///
+/// Derived from `coll_dir` rather than from `name`, so the folder this
+/// returns is by construction the one the collection was discovered in.
+pub(super) fn collection_folder(root: &CardRoot, rc: &ResolvedCollection) -> Fallible<String> {
+    let outside = || {
+        ErrorReport::new(format!(
+            "`{}` is not a folder inside your card directory, so it cannot be edited here.",
+            rc.name
+        ))
+    };
+    let relative = match rc.coll_dir.strip_prefix(root.path()) {
+        Ok(rel) => rel.to_path_buf(),
+        // Canonical on both sides, for a data directory reached through a
+        // symbolic link.
+        Err(_) => match (rc.coll_dir.canonicalize(), root.path().canonicalize()) {
+            (Ok(coll), Ok(base)) => coll
+                .strip_prefix(&base)
+                .map_err(|_| outside())?
+                .to_path_buf(),
+            _ => return Err(outside()),
+        },
+    };
+    // A collection is a top-level folder, so its path inside the tree is a
+    // single component. Anything else is not one of ours.
+    let folder = relative.to_str().ok_or_else(outside)?;
+    if folder.is_empty() || folder.contains('/') || folder.contains('\\') {
+        return Err(outside());
+    }
+    Ok(folder.to_string())
+}
+
 /// A deck file inside a collection, resolved as hard as a path from a
 /// browser: `CardRoot` refuses `..` and symbolic links, and the result is
 /// checked to be inside the collection it claimed to be in.
@@ -166,7 +207,7 @@ fn deck_path(
     deck: &str,
 ) -> Fallible<std::path::PathBuf> {
     let root = user_root_readonly(state, user)?;
-    let entry = root.resolve_entry(&format!("{slug}/{deck}"))?;
+    let entry = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, rc)?))?;
     let inside = match (entry.path.canonicalize(), rc.coll_dir.canonicalize()) {
         (Ok(p), Ok(c)) => p.starts_with(c),
         _ => false,

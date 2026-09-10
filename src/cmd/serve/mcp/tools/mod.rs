@@ -135,6 +135,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// A collection of the caller's own whose name is not already
+    /// slug-shaped: the folder is `Exam revision`, the slug `Exam-revision`.
+    /// Returns the slug, which is what every tool is addressed by.
+    pub(crate) fn spaced_collection(dir: &TempDir) -> Fallible<String> {
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let folder = root.path().join("Exam revision");
+        std::fs::create_dir_all(&folder)?;
+        std::fs::write(folder.join("facts.md"), "Q: pi\nA: 3.14159\n")?;
+        collection_id(&folder)?;
+        Ok(crate::cmd::serve::config::slugify("Exam revision"))
+    }
+
     /// A second user's collection, for the isolation tests. Returns its
     /// slug, which the caller must not be able to reach.
     pub(crate) fn other_users_collection(dir: &TempDir) -> Fallible<String> {

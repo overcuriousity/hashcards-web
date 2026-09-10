@@ -421,7 +421,7 @@ fn is_card_terminator(line: &str) -> bool {
 /// `Card.range().1` is the terminator line index in non-EOF cases (exclusive)
 /// and the last content line index in the EOF case (inclusive). This function
 /// normalises to an exclusive bound suitable for `lines[start..end]`.
-fn block_end(lines: &[&str], range: (usize, usize)) -> usize {
+pub(crate) fn block_end(lines: &[&str], range: (usize, usize)) -> usize {
     let end = range.1;
     // `end > range.0` guards the one-line card case: a single-line `C:`/`Q:`
     // card's own first line is not the terminator of its own block.

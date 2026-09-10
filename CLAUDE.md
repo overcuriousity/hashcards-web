@@ -25,6 +25,12 @@ a local CLI tool; the CLI is gone.
   review rows behind as orphans, which every read path ignores. A restore
   finds them again by content address. Emptying the trash is the only thing
   that erases them, and the only thing that destroys anything.
+- A collection's *slug* addresses it in URLs and MCP calls; paths are built
+  from its folder name (`collection_folder`). They differ whenever the name
+  is not already slug-shaped.
+- Everything that opens a review database goes through `src/cmd/serve/reviewdb.rs`,
+  which is where the failed-merge gate lives. Take `open_user_db` when you need
+  two views of one collection: two `open_collection_db` calls are two connections.
 - The MCP tools are adapters over the same functions the web handlers call.
   Never reimplement one there: the guards (`refuse_if_drilling`, the
   slug-collision check, the migration gate, `CardRoot`'s path checking) apply

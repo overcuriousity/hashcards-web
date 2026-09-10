@@ -19,17 +19,19 @@ use serde::Deserialize;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::edit::EditForm;
+use crate::cmd::serve::edit::block_end;
 use crate::cmd::serve::edit::edit_post_inner;
-use crate::cmd::serve::edit::extract_card_block;
 use crate::cmd::serve::edit::file_mtime_ms;
 use crate::cmd::serve::files::save_file;
 use crate::cmd::serve::files::user_root;
 use crate::cmd::serve::mcp::server::HashcardsMcp;
+use crate::cmd::serve::mcp::tools::read::collection_folder;
 use crate::cmd::serve::mcp::tools::read::collection_of;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
 use crate::cmd::serve::state::AppState;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
+use crate::parser::body_start_line;
 use crate::parser::parse_deck;
 use crate::types::card::Card;
 use crate::types::card_hash::CardHash;
@@ -50,9 +52,9 @@ pub(super) fn create_card_for(
     deck: &str,
     card: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
+    let rc = collection_of(state, user, slug)?;
     let root = user_root(state, user)?;
-    let entry = root.resolve_entry(&format!("{slug}/{deck}"))?;
+    let entry = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, &rc)?))?;
     if !entry.path.is_file() {
         return Err(ErrorReport::new(format!(
             "There is no deck called `{deck}` in `{slug}`. Create it first with create_deck."
@@ -142,8 +144,7 @@ pub(super) fn delete_card_for(
 ) -> Fallible<String> {
     let (path, range, mtime) = locate(state, user, slug, hash_hex)?;
     let content = std::fs::read_to_string(&path)?;
-    let block = extract_card_block(&content, range)?;
-    let remaining = remove_block(&content, &block);
+    let remaining = remove_card_lines(&content, range);
 
     let root = user_root(state, user)?;
     let rel = path
@@ -156,17 +157,59 @@ pub(super) fn delete_card_for(
     Ok("Card deleted.".to_string())
 }
 
-/// The file without `block`, and without the separator that joined it to
-/// its neighbours -- leaving one behind would make an empty card, which
-/// does not parse.
-fn remove_block(content: &str, block: &str) -> String {
-    let kept: Vec<&str> = content
-        .split("\n---\n")
-        .map(str::trim)
-        .filter(|part| !part.is_empty() && *part != block.trim())
-        .collect();
-    let mut out = kept.join(SEPARATOR);
-    if !out.is_empty() {
+/// The file without the card at `range`, and without the separator that
+/// joined it to its neighbours -- leaving one behind would make an empty
+/// card, which does not parse.
+///
+/// By line range, not by matching the block's text. Splitting the whole
+/// file on `\n---\n` got two things wrong: TOML frontmatter is delimited
+/// exactly the same way, so deleting the last card of a named deck carried
+/// the closing `---` off with it and left a file that no longer parsed at
+/// all; and two byte-identical blocks both matched, so deleting one card
+/// removed both. `body_start_line` is what keeps the backward scan off the
+/// frontmatter.
+fn remove_card_lines(content: &str, range: (usize, usize)) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let body = body_start_line(content);
+    let blank = |i: usize| lines.get(i).is_some_and(|l| l.trim().is_empty());
+    let separator = |i: usize| lines.get(i).is_some_and(|l| l.trim() == "---");
+
+    let mut start = range.0;
+    let mut end = block_end(&lines, range);
+
+    // The separator *after* the card, with the blank lines around it.
+    let mut after = end;
+    while blank(after) {
+        after += 1;
+    }
+    if separator(after) {
+        end = after + 1;
+        while blank(end) {
+            end += 1;
+        }
+    } else {
+        // There is none: this was the last card in the file, so the
+        // separator to take is the one before it -- but never back past the
+        // frontmatter, whose closing delimiter looks just like one.
+        let mut before = start;
+        while before > body && blank(before - 1) {
+            before -= 1;
+        }
+        if before > body && separator(before - 1) {
+            start = before - 1;
+            while start > body && blank(start - 1) {
+                start -= 1;
+            }
+        }
+    }
+
+    let start = start.min(lines.len());
+    let end = end.max(start).min(lines.len());
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    kept.extend_from_slice(&lines[..start]);
+    kept.extend_from_slice(&lines[end..]);
+    let mut out = kept.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     out
@@ -285,6 +328,7 @@ impl HashcardsMcp {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::cmd::serve::cards::CardRoot;
     use crate::cmd::serve::mcp::tools::read::list_cards_for;
@@ -440,6 +484,112 @@ mod tests {
             update_card_for(&mcp.state, None, &theirs, &"0".repeat(64), "Q: a\nA: b\n").is_err()
         );
         assert!(delete_card_for(&mcp.state, None, &theirs, &"0".repeat(64)).is_err());
+        Ok(())
+    }
+
+    /// Regression: `remove_block` split the whole file on `\n---\n`, which
+    /// is also what closes TOML frontmatter. Deleting the only card of a
+    /// named deck left the opening `---` with nothing to close it, so the
+    /// re-parse failed, `save_file` reverted, and the card could never be
+    /// deleted at all -- the tool answered "Not saved -- Frontmatter opening
+    /// '---' found but no closing '---'".
+    #[test]
+    fn the_last_card_of_a_deck_with_frontmatter_can_be_deleted() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let path = root.path().join("Spanish/nouns.md");
+        std::fs::write(
+            &path,
+            "---\nname = \"Nouns\"\n---\n\nQ: el libro\nA: the book\n",
+        )?;
+
+        let hex = list_cards_for(&mcp.state, None, "Spanish", None, false, Some("libro"), 50)?[0]
+            .hash
+            .clone();
+        delete_card_for(&mcp.state, None, "Spanish", &hex)?;
+
+        let left = std::fs::read_to_string(&path)?;
+        assert!(
+            left.contains("name = \"Nouns\""),
+            "the frontmatter was destroyed: {left:?}"
+        );
+        // It still parses, and the card is gone.
+        let cards = parse_deck(&root.path().join("Spanish"))?.cards;
+        assert!(!cards.iter().any(|c| c.hash().to_string() == hex));
+        Ok(())
+    }
+
+    /// Frontmatter is not the only thing the split got wrong: two
+    /// byte-identical blocks both matched the text of the card being
+    /// deleted, so deleting one removed both.
+    #[test]
+    fn deleting_one_of_two_identical_cards_removes_one_block() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let path = root.path().join("Spanish/verbs.md");
+        std::fs::write(
+            &path,
+            "Q: hablar\nA: to speak\n\n---\n\nQ: hablar\nA: to speak\n",
+        )?;
+
+        let hex = list_cards_for(&mcp.state, None, "Spanish", None, false, Some("hablar"), 50)?[0]
+            .hash
+            .clone();
+        delete_card_for(&mcp.state, None, "Spanish", &hex)?;
+
+        let left = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            left.matches("hablar").count(),
+            1,
+            "both copies were removed: {left:?}"
+        );
+        Ok(())
+    }
+
+    /// Deleting a card from the middle takes its separator with it: leaving
+    /// one behind would make an empty card, which does not parse.
+    #[test]
+    fn deleting_a_middle_card_leaves_its_neighbours_parseable() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let path = root.path().join("Spanish/verbs.md");
+        std::fs::write(
+            &path,
+            "Q: uno\nA: one\n\n---\n\nQ: dos\nA: two\n\n---\n\nQ: tres\nA: three\n",
+        )?;
+
+        let hex = list_cards_for(&mcp.state, None, "Spanish", None, false, Some("dos"), 50)?[0]
+            .hash
+            .clone();
+        delete_card_for(&mcp.state, None, "Spanish", &hex)?;
+
+        let left = std::fs::read_to_string(&path)?;
+        assert!(!left.contains("dos"), "{left:?}");
+        // Two cards left, and the file still parses as two.
+        assert_eq!(parse_deck(&root.path().join("Spanish"))?.cards.len(), 2);
+        Ok(())
+    }
+
+    /// `create_card` resolved its deck out of the slug too, so it answered
+    /// "There is no deck called `facts.md`. Create it first" for a deck
+    /// that was right there.
+    #[test]
+    fn a_card_can_be_created_in_a_collection_whose_name_is_not_slug_shaped() -> Fallible<()> {
+        use crate::cmd::serve::mcp::tools::tests::spaced_collection;
+
+        let (dir, mcp) = mcp_fixture()?;
+        let slug = spaced_collection(&dir)?;
+
+        create_card_for(&mcp.state, None, &slug, "facts.md", "Q: e\nA: 2.71828\n")?;
+
+        assert_eq!(
+            list_cards_for(&mcp.state, None, &slug, None, false, None, 50)?.len(),
+            2
+        );
+        // And it went into the collection's own folder, not a new one named
+        // after the slug.
+        let root = CardRoot::for_user(dir.path(), None)?;
+        assert!(!root.path().join("Exam-revision").exists());
         Ok(())
     }
 }

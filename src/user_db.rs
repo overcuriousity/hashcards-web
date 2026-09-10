@@ -107,8 +107,13 @@ impl UserDatabase {
     /// A card the destination *already* has keeps the destination's
     /// schedule: identical cards in two collections are two schedules by
     /// design, and the one already in force where the card is going is the
-    /// one that applies. The source row is dropped rather than overwriting
-    /// it.
+    /// one that applies. The source's row is left exactly where it is
+    /// rather than deleted -- `reviews` and `bookmarks` cascade on delete,
+    /// so dropping it would erase that history outright, and emptying the
+    /// trash is the only thing in hashcards that destroys anything. What it
+    /// becomes instead is an orphan row, which is what a deleted collection
+    /// leaves behind too: every read path ignores it, and moving the deck
+    /// back finds it again by content address.
     ///
     /// One transaction, so a deck is never half-moved.
     pub fn move_cards(
@@ -125,12 +130,12 @@ impl UserDatabase {
         let mut moved = 0;
         for hash in hashes {
             if card_row_exists(&tx, to, *hash)? {
-                // The destination already schedules this card. Drop the
-                // source's row rather than colliding with it.
-                tx.execute(
-                    "delete from cards where collection_id = ?1 and card_hash = ?2;",
-                    params![from, hash],
-                )?;
+                // The destination already schedules this card, and its
+                // schedule is the one that applies. Leave the source's row
+                // where it is rather than deleting it: the delete would
+                // cascade through its reviews and its bookmark, and this
+                // tool does not destroy history. Orphaned is what a deleted
+                // collection's rows are too.
                 continue;
             }
             moved += tx.execute(
@@ -548,21 +553,53 @@ mod tests {
 
     /// Identical cards in two collections are two schedules by design, so
     /// the destination's own schedule is the one that applies there.
+    ///
+    /// Regression: the source's row was deleted to get it out of the way,
+    /// and `reviews` and `bookmarks` both cascade on delete -- so a move
+    /// silently and permanently erased the source collection's history for
+    /// that card. No trash entry, no `voided` row, no undo. Emptying the
+    /// trash is the only thing in hashcards that destroys anything, so the
+    /// row is left where it is and simply orphaned instead.
     #[test]
-    fn moving_a_card_the_destination_already_has_keeps_the_destinations_schedule() -> Fallible<()> {
+    fn moving_a_card_the_destination_already_has_keeps_both_histories() -> Fallible<()> {
         let user = UserDatabase::memory()?;
         let from = CollectionId::new("aaaaaaaa")?;
         let to = CollectionId::new("bbbbbbbb")?;
         let hash = CardHash::hash_bytes(b"a card");
         let now = Timestamp::now();
 
-        user.collection(from.clone()).insert_card(hash, now)?;
+        let source = user.collection(from.clone());
+        source.insert_card(hash, now)?;
+        let session = source.create_session(now)?;
+        source.insert_review_immediately(
+            session,
+            &ReviewRecord {
+                card_hash: hash,
+                reviewed_at: now,
+                grade: Grade::Good,
+                stability: 1.0,
+                difficulty: 2.0,
+                interval_raw: 1.0,
+                interval_days: 1,
+                due_date: now.date(),
+                duration_ms: None,
+            },
+        )?;
         user.collection(to.clone()).insert_card(hash, now)?;
 
         // Nothing moved, and nothing collided.
         assert_eq!(user.move_cards(&from, &to, &[hash])?, 0);
-        assert!(user.collection(from).card_hashes()?.is_empty());
-        assert!(user.collection(to).card_hashes()?.contains(&hash));
+        assert!(user.collection(to.clone()).card_hashes()?.contains(&hash));
+        // The destination keeps the schedule it already had: no review of
+        // its own came across.
+        assert!(user.collection(to).reviews_for_card(hash)?.is_empty());
+        // And the source's history is still there to be found again if the
+        // deck is ever moved back.
+        assert_eq!(
+            user.collection(from).reviews_for_card(hash)?.len(),
+            1,
+            "the move destroyed the source collection's review history"
+        );
         Ok(())
     }
 

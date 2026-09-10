@@ -36,6 +36,32 @@ struct DeckMetadata {
     name: Option<String>,
 }
 
+/// The 0-based line at which a deck file's cards begin.
+///
+/// Zero unless the file opens with TOML frontmatter, in which case it is the
+/// line after its closing `---`. Anything that edits a deck file by line
+/// needs this: the frontmatter's delimiters are byte-for-byte what a card
+/// separator is, so a rewrite that does not know where the body starts will
+/// happily take the closing one away and leave a file that no longer parses.
+///
+/// A file whose frontmatter is never closed has no body to speak of, and
+/// whoever is about to write it will hear so from `extract_frontmatter`.
+pub fn body_start_line(text: &str) -> usize {
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(first) if first.trim() == "---" => {}
+        _ => return 0,
+    }
+    for (offset, line) in lines.enumerate() {
+        if line.trim() == "---" {
+            // `offset` counts from the line after the opening delimiter, so
+            // the closing one is file line `offset + 1`.
+            return offset + 2;
+        }
+    }
+    0
+}
+
 /// Extract TOML frontmatter from markdown text.
 /// Returns (frontmatter_metadata, content_without_frontmatter, content_start_line)
 /// where `content_start_line` is the 0-based file line at which the content

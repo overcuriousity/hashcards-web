@@ -21,7 +21,9 @@ use crate::cmd::serve::cards::write_collection_overrides;
 use crate::cmd::serve::files::create_entry;
 use crate::cmd::serve::files::delete_entry;
 use crate::cmd::serve::files::rename_entry;
+use crate::cmd::serve::files::user_root;
 use crate::cmd::serve::mcp::server::HashcardsMcp;
+use crate::cmd::serve::mcp::tools::read::collection_folder;
 use crate::cmd::serve::mcp::tools::read::collection_of;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
 use crate::cmd::serve::state::AppState;
@@ -46,10 +48,11 @@ pub(super) fn rename_collection_for(
     slug: &str,
     name: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
+    let rc = collection_of(state, user, slug)?;
+    let root = user_root(state, user)?;
     // The id lives in the folder and travels with it, so the review
     // history follows the rename.
-    rename_entry(state, user, slug, name)
+    rename_entry(state, user, &collection_folder(&root, &rc)?, name)
 }
 
 pub(super) fn delete_collection_for(
@@ -57,8 +60,9 @@ pub(super) fn delete_collection_for(
     user: Option<&CurrentUser>,
     slug: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
-    delete_entry(state, user, slug)
+    let rc = collection_of(state, user, slug)?;
+    let root = user_root(state, user)?;
+    delete_entry(state, user, &collection_folder(&root, &rc)?)
 }
 
 /// Set or clear a collection's scheduling overrides.
@@ -334,6 +338,34 @@ mod tests {
         assert!(rename_collection_for(&mcp.state, None, &theirs, "Deutsch").is_err());
         assert!(delete_collection_for(&mcp.state, None, &theirs).is_err());
         assert!(set_scheduling_for(&mcp.state, None, &theirs, Some(0.9), None).is_err());
+        Ok(())
+    }
+
+    /// The same regression as in `decks`: these two passed the slug in as a
+    /// path. A collection whose folder is `Exam revision` is addressed as
+    /// `Exam-revision`, so both answered "`Exam-revision` does not exist"
+    /// about a collection `list_collections` had just returned.
+    #[test]
+    fn a_collection_whose_name_is_not_slug_shaped_can_be_renamed_and_deleted() -> Fallible<()> {
+        use crate::cmd::serve::mcp::tools::tests::spaced_collection;
+
+        let (dir, mcp) = mcp_fixture()?;
+        let slug = spaced_collection(&dir)?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let before = collection_id(&root.path().join("Exam revision"))?;
+
+        rename_collection_for(&mcp.state, None, &slug, "Finals")?;
+        assert!(root.path().join("Finals").is_dir());
+        assert!(!root.path().join("Exam revision").exists());
+        assert_eq!(
+            collection_id(&root.path().join("Finals"))?,
+            before,
+            "the rename lost the collection's id"
+        );
+
+        delete_collection_for(&mcp.state, None, "Finals")?;
+        assert!(!root.path().join("Finals").exists());
+        assert_eq!(list_trash(dir.path(), "default")?.len(), 1);
         Ok(())
     }
 }

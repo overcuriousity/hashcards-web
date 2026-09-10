@@ -19,15 +19,18 @@ use serde::Deserialize;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::cards::user_db_path;
+use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::edit::file_mtime_ms;
 use crate::cmd::serve::files::create_entry;
 use crate::cmd::serve::files::delete_entry;
 use crate::cmd::serve::files::save_file;
 use crate::cmd::serve::files::user_root;
 use crate::cmd::serve::mcp::server::HashcardsMcp;
+use crate::cmd::serve::mcp::tools::read::collection_folder;
 use crate::cmd::serve::mcp::tools::read::collection_of;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
 use crate::cmd::serve::state::AppState;
+use crate::cmd::serve::state::sessions_touching;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
@@ -40,11 +43,12 @@ pub(super) fn create_deck_for(
     slug: &str,
     deck: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
+    let rc = collection_of(state, user, slug)?;
+    let root = user_root(state, user)?;
     // `create_entry` appends `.md` itself and refuses a name that would
     // escape the tree, so a deck name from a model is checked exactly as
     // one typed into the file manager is.
-    create_entry(state, user, slug, deck, false)
+    create_entry(state, user, &collection_folder(&root, &rc)?, deck, false)
 }
 
 pub(super) fn write_deck_for(
@@ -54,9 +58,9 @@ pub(super) fn write_deck_for(
     deck: &str,
     content: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
+    let rc = collection_of(state, user, slug)?;
     let root = user_root(state, user)?;
-    let entry = root.resolve_entry(&format!("{slug}/{deck}"))?;
+    let entry = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, &rc)?))?;
     if !entry.path.is_file() {
         return fail(format!(
             "There is no deck called `{deck}` in `{slug}`. Create it first with create_deck."
@@ -74,8 +78,13 @@ pub(super) fn delete_deck_for(
     slug: &str,
     deck: &str,
 ) -> Fallible<String> {
-    collection_of(state, user, slug)?;
-    delete_entry(state, user, &format!("{slug}/{deck}"))
+    let rc = collection_of(state, user, slug)?;
+    let root = user_root(state, user)?;
+    delete_entry(
+        state,
+        user,
+        &format!("{}/{deck}", collection_folder(&root, &rc)?),
+    )
 }
 
 /// Move a deck into another collection, review history and all.
@@ -102,13 +111,13 @@ pub(super) fn move_decks_for(
     }
 
     let root = user_root(state, user)?;
-    let source = root.resolve_entry(&format!("{from_slug}/{deck}"))?;
+    let source = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, &from)?))?;
     if !source.path.is_file() {
         return fail(format!(
             "There is no deck called `{deck}` in `{from_slug}`."
         ));
     }
-    let target = root.resolve_entry(&format!("{to_slug}/{deck}"))?;
+    let target = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, &to)?))?;
     if target.path.exists() {
         return fail(format!(
             "`{to_slug}` already has a deck called `{deck}`. Rename one of them first."
@@ -118,7 +127,7 @@ pub(super) fn move_decks_for(
     // A live session on either collection is reading cards and writing
     // grades against them; moving the file out from under one strands
     // those grades. The same guard the file manager applies.
-    refuse_if_drilling_either(state, from_slug, to_slug)?;
+    refuse_if_drilling_either(state, &from, &to)?;
 
     // The whole collection, filtered to this file: a deck may sit in a
     // subfolder, so parsing only its parent would miss the collection's
@@ -151,14 +160,25 @@ pub(super) fn move_decks_for(
 }
 
 /// Refuse the move while a drill session is running on either side.
-fn refuse_if_drilling_either(state: &AppState, from_slug: &str, to_slug: &str) -> Fallible<()> {
-    let sessions = state.sessions.lock();
-    for key in sessions.keys() {
-        if key.slug() == from_slug || key.slug() == to_slug {
+///
+/// By collection *folder*, not by the sessions map's keys: a saved deck is
+/// keyed by the deck's own slug, so a session drilling this collection
+/// through one names neither collection and a key comparison misses it
+/// entirely. The move would then land while that session still held a
+/// `Database` scoped to the source collection, and its next grade would
+/// insert a review with no `cards` row to hang it on. `sessions_touching`
+/// is what the file manager's own guard uses, for the same reason.
+fn refuse_if_drilling_either(
+    state: &AppState,
+    from: &ResolvedCollection,
+    to: &ResolvedCollection,
+) -> Fallible<()> {
+    for rc in [from, to] {
+        if !sessions_touching(state, &rc.coll_dir).is_empty() {
             return Err(ErrorReport::new(format!(
                 "`{}` is being drilled right now, so its decks cannot be moved. Finish or end \
                  that session first.",
-                key.slug()
+                rc.slug
             )));
         }
     }
@@ -309,6 +329,8 @@ mod tests {
     use crate::cmd::serve::mcp::tools::read::read_deck_for;
     use crate::cmd::serve::mcp::tools::tests::mcp_fixture;
     use crate::cmd::serve::mcp::tools::tests::other_users_collection;
+    use crate::cmd::serve::mcp::tools::tests::seed_session;
+    use crate::cmd::serve::mcp::tools::tests::spaced_collection;
     use crate::cmd::serve::trash::list_trash;
     use crate::types::card_hash::CardHash;
     use crate::types::timestamp::Timestamp;
@@ -449,6 +471,95 @@ mod tests {
         assert!(write_deck_for(&mcp.state, None, &theirs, "nouns.md", "Q: a\nA: b\n").is_err());
         assert!(delete_deck_for(&mcp.state, None, &theirs, "nouns.md").is_err());
         assert!(move_decks_for(&mcp.state, None, &theirs, "nouns.md", "Spanish").is_err());
+        Ok(())
+    }
+
+    /// Regression: the guard compared the sessions map's keys against the
+    /// two collection slugs, but a saved deck has a key of its own -- the
+    /// deck's slug -- so a session drilling `Spanish` through a saved deck
+    /// was invisible to it. The move then went through while the live
+    /// session still held a `Database` scoped to the source collection,
+    /// and every remaining grade in that session failed a foreign key. The
+    /// file manager's own guard resolves the collection folder instead,
+    /// which is what this one does now.
+    #[test]
+    fn a_saved_deck_session_blocks_a_move_of_the_collection_it_drills() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        second_collection(&dir)?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let spanish = root.path().join("Spanish");
+        // Keyed by a saved deck's slug, drilling Spanish's cards.
+        let cards = parse_deck(&spanish)?.cards;
+        seed_session(&mcp.state, dir.path(), &spanish, "my-deck", cards)?;
+
+        let err = move_decks_for(&mcp.state, None, "Spanish", "verbs.md", "German").unwrap_err();
+        assert!(err.message().contains("drilled"), "{}", err.message());
+        // And nothing moved.
+        assert!(spanish.join("verbs.md").is_file());
+        Ok(())
+    }
+
+    /// Regression: every tool built its filesystem path out of the
+    /// collection's *slug*, and `slugify` maps each character that is not
+    /// alphanumeric to `-`. A collection whose folder is `Exam revision`
+    /// has the slug `Exam-revision`, no such folder exists, and the whole
+    /// MCP surface answered for it with messages that were not merely wrong
+    /// but misleading -- "There is no deck called `facts.md`", for a deck
+    /// `list_decks` had just named. Paths come off `coll_dir` now.
+    #[test]
+    fn a_collection_whose_name_is_not_slug_shaped_is_still_reachable() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let slug = spaced_collection(&dir)?;
+        assert_eq!(slug, "Exam-revision", "the fixture must exercise the gap");
+
+        // Every deck tool, on a collection the slug does not name.
+        read_deck_for(&mcp.state, None, &slug, "facts.md")?;
+        create_deck_for(&mcp.state, None, &slug, "more.md")?;
+        write_deck_for(&mcp.state, None, &slug, "more.md", "Q: e\nA: 2.71828\n")?;
+        assert_eq!(
+            list_cards_for(&mcp.state, None, &slug, None, false, Some("2.71828"), 50)?.len(),
+            1
+        );
+        delete_deck_for(&mcp.state, None, &slug, "more.md")?;
+        assert!(read_deck_for(&mcp.state, None, &slug, "more.md").is_err());
+
+        // And a move out of it.
+        move_decks_for(&mcp.state, None, &slug, "facts.md", "Spanish")?;
+        assert_eq!(
+            list_cards_for(
+                &mcp.state,
+                None,
+                "Spanish",
+                None,
+                false,
+                Some("3.14159"),
+                50
+            )?
+            .len(),
+            1
+        );
+        Ok(())
+    }
+
+    /// The other direction: a move *into* a collection the slug does not
+    /// name resolved a destination folder that was not there, so the file
+    /// landed somewhere nothing would ever parse it.
+    #[test]
+    fn a_deck_can_be_moved_into_a_collection_whose_name_is_not_slug_shaped() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let slug = spaced_collection(&dir)?;
+
+        move_decks_for(&mcp.state, None, "Spanish", "verbs.md", &slug)?;
+
+        let root = CardRoot::for_user(dir.path(), None)?;
+        assert!(
+            root.path().join("Exam revision/verbs.md").is_file(),
+            "the deck did not land in the collection's own folder"
+        );
+        assert_eq!(
+            list_cards_for(&mcp.state, None, &slug, None, false, None, 50)?.len(),
+            3
+        );
         Ok(())
     }
 }

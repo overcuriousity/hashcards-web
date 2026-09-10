@@ -1,8 +1,10 @@
 //! Opening a collection's review database.
 //!
-//! One function, so that every handler resolves a collection to rows the
-//! same way — and so that the check for a user whose startup merge failed
-//! has exactly one place to live.
+//! One place, so that every handler resolves a collection to rows the same
+//! way — and so that the check for a user whose startup merge failed has
+//! exactly one home. Nothing may open one of these files around it.
+
+use std::path::Path;
 
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::state::AppState;
@@ -11,21 +13,41 @@ use crate::error::Fallible;
 use crate::error::fail;
 use crate::user_db::UserDatabase;
 
-/// The rows belonging to `rc`, inside its owner's review database.
+/// Refuse to touch the review database at `db_path` when this user's
+/// startup merge failed.
 ///
-/// Refuses outright when this user's startup merge failed: an empty database
-/// would be served as an empty history, which is indistinguishable from
-/// having lost everything.
+/// Reading it would serve an empty history, which is indistinguishable from
+/// having lost everything. *Writing* it is worse: the rows would collide
+/// with the ones the next merge still has to import, and leave the tree
+/// stuck unmerged for good. Every path that opens one of these files goes
+/// through here, so neither can happen by forgetting.
+pub fn refuse_if_unconsolidated(state: &AppState, db_path: &Path) -> Fallible<()> {
+    let Some(why) = state.migration_failures.get(db_path) else {
+        return Ok(());
+    };
+    fail(format!(
+        "This account's review databases could not be consolidated when the server started, \
+         so its history cannot be read: {why}. Nothing has been lost — the previous databases \
+         are in the server's `db/legacy` directory or still where they were. Ask whoever runs \
+         this server to check the startup log."
+    ))
+}
+
+/// The whole review database `rc`'s rows live in, gated as above.
+///
+/// Take this rather than calling `open_collection_db` twice when a handler
+/// needs more than one view of the same collection: a `Database` is a view
+/// on a `UserDatabase`'s shared connection, so two views taken from one
+/// `UserDatabase` really are one writer on the file — which two calls to
+/// `open_collection_db`, each opening a connection of its own, are not.
+pub fn open_user_db(state: &AppState, rc: &ResolvedCollection) -> Fallible<UserDatabase> {
+    refuse_if_unconsolidated(state, &rc.db_path)?;
+    UserDatabase::open(&rc.db_path)
+}
+
+/// The rows belonging to `rc`, inside its owner's review database.
 pub fn open_collection_db(state: &AppState, rc: &ResolvedCollection) -> Fallible<Database> {
-    if let Some(why) = state.migration_failures.get(&rc.db_path) {
-        return fail(format!(
-            "This account's review databases could not be consolidated when the server started, \
-             so its history cannot be read: {why}. Nothing has been lost — the previous databases \
-             are in the server's `db/legacy` directory or still where they were. Ask whoever runs \
-             this server to check the startup log."
-        ));
-    }
-    Ok(UserDatabase::open(&rc.db_path)?.collection(rc.collection_id.clone()))
+    Ok(open_user_db(state, rc)?.collection(rc.collection_id.clone()))
 }
 
 #[cfg(test)]
