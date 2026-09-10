@@ -89,6 +89,16 @@ pub async fn icon_512_handler() -> (StatusCode, [(HeaderName, &'static str); 1],
     (StatusCode::OK, [(CONTENT_TYPE, "image/png")], ICON_512)
 }
 
+/// The viewport every page declares.
+///
+/// `viewport-fit=cover` is what makes `env(safe-area-inset-*)` report
+/// anything. An installed app is drawn under the system bars whether or not
+/// it says so — on Android 15 and later, always — and until it says so the
+/// insets it needs to reserve all read as zero, which puts the bottom of the
+/// drill's grade bar underneath the gesture bar. Shared, because a page that
+/// declared its own would silently lose the insets `style.css` reserves.
+pub const VIEWPORT: &str = "width=device-width, initial-scale=1, viewport-fit=cover";
+
 /// Applied to `<html>` before the first paint.
 ///
 /// A stylesheet cannot know a stored choice and a deferred script runs after
@@ -123,7 +133,7 @@ pub fn page_template_with_script(script_url: &str, body: Markup) -> Markup {
         html lang="en" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="viewport" content=(VIEWPORT);
                 script { (maud::PreEscaped(THEME_BOOT)) }
                 // The browser paints its chrome from this before the
                 // stylesheet arrives, so the two theme surfaces are named
@@ -219,5 +229,106 @@ mod tests {
                 );
             }
         }
+    }
+    /// The body of a rule, found by its selector line.
+    fn rule(selector: &str) -> String {
+        let css: &str = &STYLE_CSS;
+        let needle = format!("\n{selector} {{");
+        let start = css
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no rule for `{selector}`"))
+            + needle.len();
+        let end = start + css[start..].find('}').expect("unterminated rule");
+        css[start..end].to_string()
+    }
+
+    /// Every page shares one stylesheet, and that stylesheet reserves the
+    /// insets. A page that declared a viewport of its own would lose them.
+    #[test]
+    fn test_no_page_declares_its_own_viewport() {
+        let sources = [
+            include_str!("template.rs"),
+            include_str!("../serve/auth.rs"),
+        ];
+        for source in sources {
+            for line in source.lines() {
+                let line = line.trim();
+                if !line.starts_with("meta name=\"viewport\"") {
+                    continue;
+                }
+                assert_eq!(
+                    line, "meta name=\"viewport\" content=(VIEWPORT);",
+                    "a page spells its viewport out instead of sharing it"
+                );
+            }
+        }
+    }
+
+    /// The app is installable, and an installed app is drawn edge to edge:
+    /// on Android 15 and later the layout viewport — and so `100dvh` —
+    /// spans the status bar and the gesture bar. `env(safe-area-inset-*)`
+    /// reports zero until the page says it is covering them, so without
+    /// this nothing below can reserve anything.
+    #[test]
+    fn test_page_asks_for_the_cover_viewport() {
+        let html = page_template(maud::html! { div {} }).into_string();
+        assert!(
+            html.contains("viewport-fit=cover"),
+            "the page does not claim the covered viewport: {html}"
+        );
+    }
+
+    /// The drill claims exactly `100dvh` and pins a bar to each edge of it,
+    /// so whatever the system bars cover is taken out of the session: the
+    /// End button, and then the bottom of the grade row, sit underneath the
+    /// gesture bar. The inset is reserved once, as padding on a border-box
+    /// body, so `100dvh` on the body still measures the screen while
+    /// everything inside it stays where it can be pressed.
+    #[test]
+    fn test_the_body_reserves_the_safe_area() {
+        let body = rule("body");
+        assert!(
+            body.contains("box-sizing: border-box"),
+            "the body's inset would grow it past the screen: {body}"
+        );
+        // Each inset carries a `0px` fallback because a UA that knows
+        // `env()` but not the variable named drops the whole shorthand,
+        // taking the three edges that did resolve down with it.
+        for edge in ["top", "right", "bottom", "left"] {
+            assert!(
+                body.contains(&format!("env(safe-area-inset-{edge}, 0px)")),
+                "the body does not reserve the {edge} inset: {body}"
+            );
+        }
+    }
+
+    /// The drill fills the body's content box rather than the screen. Asking
+    /// for `100dvh` here would measure the screen a second time, inside a
+    /// body already shortened by the insets, and hang the same band of the
+    /// session off the bottom again.
+    #[test]
+    fn test_the_drill_fills_the_reserved_viewport() {
+        let root = rule(".root");
+        assert!(
+            root.contains("height: 100%"),
+            "the drill does not fill the body's content box: {root}"
+        );
+        assert!(
+            !root.contains("dvh"),
+            "the drill measures the screen again, past the insets: {root}"
+        );
+    }
+
+    /// A fixed element is positioned against the viewport, not against the
+    /// body's padding box, so the body's inset cannot reach it: the one
+    /// control on every page would sit under the status bar.
+    #[test]
+    fn test_the_fixed_theme_toggle_clears_the_safe_area() {
+        let toggle = rule(".theme-toggle");
+        assert!(
+            toggle.contains("env(safe-area-inset-top, 0px)")
+                && toggle.contains("env(safe-area-inset-right, 0px)"),
+            "the theme switch is placed against the screen, not the safe area: {toggle}"
+        );
     }
 }

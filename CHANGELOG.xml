@@ -92,6 +92,21 @@
         </breaking>
         <fixed>
             <change author="claude">
+            **The bottom of the drill screen is no longer hidden behind the
+            phone's gesture bar.** The `End session` button was reported
+            missing from the installed app; it was being rendered under the
+            system UI. An installed app on Android 15 or later is drawn edge
+            to edge, so the viewport -- and every `100dvh` measured against
+            it -- spans the status bar and the gesture bar, while the drill
+            is one screen tall with a bar pinned to each edge of it. The
+            bottom of the grade row, and the way out of the session below
+            it, landed in the band the gesture bar covers. The page now
+            declares that it covers the system bars and reserves what they
+            take, so the drill is laid out inside the part of the screen
+            that can actually be pressed. Every other page gains the same
+            inset, and in landscape a notch no longer eats the left margin.
+            </change>
+            <change author="claude">
             **The card count on a page now matches the session its Drill
             button starts.** A drill buries siblings — a cloze note with
             several deletions gives up one card a day, not all of them — but

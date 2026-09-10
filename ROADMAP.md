@@ -5,45 +5,47 @@ Ordered. Items are worked top to bottom; anything unordered lives in
 
 ## 0. Ending a session must always be possible
 
-**Blocking everything below.** Reported from a phone: mid-session, on a train,
-with no way to stop. A screenshot of the pre-reveal drill screen (v0.4.10 UI:
-back-arrow and star in the header, `Reveal` pinned to the bottom bar) shows no
-`End session` line under the button. The same view in a desktop browser has it.
+**Explained and fixed.** The `End session` line was not missing from the
+markup; it was underneath the gesture bar. An installed app on Android 15 or
+later is drawn edge to edge, so the layout viewport — and every `100dvh`
+measured against it — spans the status bar and the gesture bar, while the
+drill is exactly one viewport tall with a bar pinned to each edge. Nothing in
+the page reserved what the system draws over, so the bottom band of
+`div.controls` was covered: at v0.4.10 that was the whole of the End button,
+and once it was restyled to a quiet line it was the line plus the lower edge
+of the grade row. It only ever happened in the installed app, which is why
+the same URL in a tab on the same phone looked right.
 
-What the code says: `end_button()` sits in `div.controls` outside the
-reveal conditional (`src/cmd/drill/get.rs:162`), and has in every commit in
-the history — `render_session_page` is the only renderer of the drill screen.
-So the markup should carry `id="end"` on both the phone and the desktop.
-Not yet explained. Needs the page source as the phone actually received it.
+The page now declares `viewport-fit=cover` — until it does, `env(safe-area-inset-*)`
+reports zero whether or not the bars are covering anything — and reserves the
+insets once, as padding on a border-box `body`, with the drill filling the
+body's content box rather than measuring the screen a second time. The fixed
+theme switch adds them to its own offsets, since a fixed element is placed
+against the viewport and the body's padding cannot reach it.
 
-Two defects found while looking, both real regardless of the report, both
-now fixed:
+The earlier note here read the screenshot as showing the End button taking no
+height at all, because the visible controls bar ended exactly at the top of
+the gesture bar. That is what a bar clipped by the gesture bar looks like.
+
+Two defects found while looking, both real regardless, both fixed at the time:
 
 - ~~`.end-link` never got its own styling.~~ `.controls button`
   (specificity 0-1-1) outranked `.end-link` (0-1-0) on every property the two
   share, so the way out of a session rendered as a bordered 44px button
   rather than the quiet line the rule was written to produce. The grade rules
-  now exclude it by name.
+  now exclude it by name. This is why the button was hidden *completely*
+  rather than partly: at 44px plus its margin it fitted inside the covered
+  band exactly.
 - ~~`/style.css` was served `immutable` from an unversioned path.~~ It is now
   content addressed, so `immutable` is honest and a deploy invalidates it.
   Note this was only ever true of the stylesheet: `/script.js` and a
   collection's `script.js` sent no cache header at all, which left them to
   heuristic caching; all three now revalidate or carry a hash.
 
-Neither explains the screenshot. The stylesheet in it is demonstrably the
-current one — the header is a three-column grid with the arrow and star at
-the far corners, which the previous `display: flex; justify-content: center`
-could not produce — so a stale cached stylesheet is ruled out, and the End
-button contributes zero height rather than being clipped: measuring the
-screenshot puts the bottom of the controls bar at the top of the gesture bar,
-with the 14 physical px of padding the layout predicts and no room taken by
-anything else.
-
-Also worth doing here: **there is no service worker.** The manifest
-(`template.rs:28`) makes the app installable, but every reveal, grade and
-`End` is a form POST that needs the network. On a train, the whole session
-locks up — which is the situation the report came from, whatever the missing
-button turns out to be.
+Still open from this report: **there is no service worker.** The manifest
+(`template.rs`) makes the app installable, but every reveal, grade and `End`
+is a form POST that needs the network. On a train, the whole session locks
+up — which is the situation the report came from.
 
 ## 1. FSRS
 

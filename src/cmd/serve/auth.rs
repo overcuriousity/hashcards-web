@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use time::Duration as CookieDuration;
 
+use crate::cmd::drill::template::VIEWPORT;
 use crate::cmd::serve::config::ResolvedOidc;
 use crate::cmd::serve::state::AppState;
 use crate::error::ErrorReport;
@@ -185,7 +186,7 @@ fn session_expired_page() -> String {
         html lang="en" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="viewport" content=(VIEWPORT);
                 // This page is reached without a session, so it shares the
                 // stored theme rather than starting over at the system's.
                 script { (maud::PreEscaped(crate::cmd::drill::template::THEME_BOOT)) }
