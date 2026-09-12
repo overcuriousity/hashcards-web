@@ -21,14 +21,13 @@ use serde::Serialize;
 
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
-use crate::cmd::serve::files::user_root;
+use crate::cmd::serve::files::restore_entry;
 use crate::cmd::serve::files::user_root_readonly;
 use crate::cmd::serve::mcp::server::HashcardsMcp;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::trash::TrashId;
 use crate::cmd::serve::trash::list_trash;
-use crate::cmd::serve::trash::restore_from_trash;
 use crate::error::Fallible;
 use crate::error::fail;
 
@@ -73,10 +72,8 @@ pub(super) fn restore_for(
     user: Option<&CurrentUser>,
     raw_id: &str,
 ) -> Fallible<String> {
-    let data_dir = data_dir(state)?;
     let id = TrashId::parse(raw_id)?;
-    let root = user_root(state, user)?;
-    let rel = restore_from_trash(&data_dir, &root, &id)?;
+    let rel = restore_entry(state, user, &id)?;
     Ok(format!("Restored `{rel}`."))
 }
 
@@ -151,6 +148,26 @@ mod tests {
     fn an_empty_trash_lists_nothing() -> Fallible<()> {
         let (_dir, mcp) = mcp_fixture()?;
         assert!(list_trash_for(&mcp.state, None)?.is_empty());
+        Ok(())
+    }
+
+    /// Create and rename refuse a folder whose slug is taken. A restore
+    /// brings a folder back by name just as surely, so it must refuse too.
+    #[test]
+    fn restoring_a_collection_onto_a_taken_slug_is_refused() -> Fallible<()> {
+        use crate::cmd::serve::mcp::tools::collections::create_collection_for;
+
+        let (dir, mcp) = mcp_fixture()?;
+        create_collection_for(&mcp.state, None, "Exam revision")?;
+        delete_collection_for(&mcp.state, None, "Exam-revision")?;
+        create_collection_for(&mcp.state, None, "Exam-revision")?;
+        let entries = list_trash_for(&mcp.state, None)?;
+
+        let err = restore_for(&mcp.state, None, &entries[0].id).unwrap_err();
+        assert!(err.message().contains("Exam-revision"), "{}", err.message());
+        let root = CardRoot::for_user(dir.path(), None)?;
+        assert!(!root.path().join("Exam revision").exists());
+        assert_eq!(list_trash_for(&mcp.state, None)?.len(), 1);
         Ok(())
     }
 

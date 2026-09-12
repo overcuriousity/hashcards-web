@@ -26,6 +26,7 @@ use serde::Serialize;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::config::DeckMember;
+use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
 use crate::cmd::serve::decks::check_deck_slug_collisions;
 use crate::cmd::serve::decks::entries_from;
@@ -33,10 +34,12 @@ use crate::cmd::serve::decks::owned_collections;
 use crate::cmd::serve::decks::persist_custom_decks;
 use crate::cmd::serve::decks::slug_for_deck;
 use crate::cmd::serve::mcp::server::HashcardsMcp;
+use crate::cmd::serve::mcp::tools::read::card_in_deck;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
 use crate::cmd::serve::state::AppState;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::parser::parse_deck;
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SavedDeck {
@@ -69,6 +72,24 @@ pub(super) fn list_saved_decks_for(
         .collect())
 }
 
+/// The deck name `deck` refers to in `rc`, which is what drilling filters on.
+///
+/// A member may name the deck's file, as every other tool does, or the deck
+/// name a card reports; both are stored as the name. One that matches no
+/// card is refused, rather than saved as a deck that is always empty.
+fn deck_name_in(rc: &ResolvedCollection, deck: &str) -> Fallible<String> {
+    let base = rc.coll_dir.canonicalize()?;
+    let cards = parse_deck(&base)?.cards;
+    match cards.iter().find(|c| card_in_deck(c, &base, deck)) {
+        Some(card) => Ok(card.deck_name().to_string()),
+        None => fail(format!(
+            "`{}` has no deck `{deck}` with any cards in it. list_cards shows the deck each card \
+             is in.",
+            rc.slug
+        )),
+    }
+}
+
 /// Create or replace a saved deck.
 pub(super) fn set_saved_deck_for(
     state: &AppState,
@@ -97,13 +118,17 @@ pub(super) fn set_saved_deck_for(
                 "`{raw}` is not a deck reference. Write it as `{{collection-slug}}/{{deck-name}}`."
             ));
         };
-        if !owned.iter().any(|c| c.slug == member.collection_slug) {
+        let Some(rc) = owned.iter().find(|c| c.slug == member.collection_slug) else {
             return fail(format!(
                 "You have no collection called `{}`.",
                 member.collection_slug
             ));
-        }
-        parsed.push(member);
+        };
+        let deck_name = deck_name_in(rc, &member.deck_name)?;
+        parsed.push(DeckMember {
+            collection_slug: member.collection_slug,
+            deck_name,
+        });
     }
 
     let Some(config_path) = state.config_path.lock().clone() else {
@@ -173,8 +198,9 @@ pub(super) fn delete_saved_deck_for(
 pub struct SetSavedDeckArgs {
     /// The deck's name.
     pub name: String,
-    /// The decks it draws on, each written `{collection-slug}/{deck-name}`,
-    /// e.g. `Spanish/verbs.md`.
+    /// The decks it draws on, each written `{collection-slug}/{deck}`, where
+    /// the deck is its file or its name: `Spanish/verbs.md` or
+    /// `Spanish/verbs`. A deck with no cards cannot be a member.
     pub members: Vec<String>,
 }
 
@@ -204,7 +230,8 @@ impl HashcardsMcp {
     }
 
     #[tool(description = "Create or replace a saved deck. Members are written \
-                       `{collection-slug}/{deck-name}`, e.g. `Spanish/verbs.md`. This moves and \
+                       `{collection-slug}/{deck}`, where the deck is its file or its name, e.g. \
+                       `Spanish/verbs.md`; each is stored under the deck name. This moves and \
                        copies nothing: the cards stay in their collections and keep their own \
                        schedules.")]
     async fn set_saved_deck(
@@ -265,7 +292,7 @@ mod tests {
 
         let decks = list_saved_decks_for(&mcp.state, None)?;
         assert_eq!(decks.len(), 1);
-        assert_eq!(decks[0].members, vec!["Spanish/verbs.md".to_string()]);
+        assert_eq!(decks[0].members, vec!["Spanish/verbs".to_string()]);
         Ok(())
     }
 
@@ -348,6 +375,40 @@ mod tests {
         delete_saved_deck_for(&mcp.state, None, "Everything")?;
         assert!(!std::fs::read_to_string(&config_path)?.contains("Everything"));
         assert!(mcp.state.custom_decks.lock().is_empty());
+        Ok(())
+    }
+
+    /// Drilling filters a member on the deck name its cards report, so a
+    /// member written as the file -- the tool's own example -- has to be
+    /// stored as that name, or the deck is saved and always empty.
+    #[test]
+    fn a_member_written_as_a_file_is_stored_as_its_deck_name() -> Fallible<()> {
+        let (_dir, mcp, _config_path) = mcp_fixture_with_config()?;
+        set_saved_deck_for(&mcp.state, None, "Exam", &["Spanish/verbs.md".to_string()])?;
+        let decks = mcp.state.custom_decks.lock();
+        let member = &decks[0].members[0];
+        let rc = owned_collections(&mcp.state, None)
+            .into_iter()
+            .find(|c| c.slug == member.collection_slug)
+            .ok_or_else(|| crate::error::ErrorReport::new("no Spanish collection"))?;
+        let cards = crate::parser::parse_deck(&rc.coll_dir)?.cards;
+        assert!(
+            cards
+                .iter()
+                .any(|c| c.deck_name().as_str() == member.deck_name),
+            "member `{}` matches no card",
+            member.encode()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_naming_no_deck_is_refused() -> Fallible<()> {
+        let (_dir, mcp, _config_path) = mcp_fixture_with_config()?;
+        let err = set_saved_deck_for(&mcp.state, None, "Exam", &["Spanish/nope.md".to_string()])
+            .unwrap_err();
+        assert!(err.message().contains("nope"), "{}", err.message());
+        assert!(list_saved_decks_for(&mcp.state, None)?.is_empty());
         Ok(())
     }
 

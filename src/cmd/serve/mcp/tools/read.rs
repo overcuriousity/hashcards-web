@@ -5,6 +5,8 @@
 //! will write a `.hashcards.toml` into a folder that has none. A tool
 //! described as read-only must not create anything.
 
+use std::path::Path;
+
 use rmcp::ErrorData;
 use rmcp::RoleServer;
 use rmcp::handler::server::wrapper::Json;
@@ -244,6 +246,29 @@ fn front_and_back(card: &Card) -> (String, String) {
     }
 }
 
+/// Whether `card` is in `deck`, named either as its file relative to the
+/// collection (`Unit 2/nouns.md`, `.md` optional) or as the deck name the
+/// card reports (`Unit 2/nouns`, or a frontmatter `name`).
+///
+/// Both, because every other deck tool takes the file while a card reports
+/// its name. `base` is the canonical collection folder: card file paths are
+/// canonical, so the prefix only strips off one that is too.
+pub(super) fn card_in_deck(card: &Card, base: &Path, deck: &str) -> bool {
+    let deck = deck.trim().trim_matches('/');
+    if card.deck_name().as_str() == deck {
+        return true;
+    }
+    let Ok(rel) = card.file_path().strip_prefix(base) else {
+        return false;
+    };
+    let rel = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    rel == deck || rel.strip_suffix(".md") == Some(deck)
+}
+
 fn kind_of(card: &Card) -> String {
     match card.card_type() {
         crate::types::card::CardType::Basic => "basic".to_string(),
@@ -263,6 +288,7 @@ pub(super) fn list_cards_for(
 ) -> Fallible<Vec<CardSummary>> {
     let rc = collection_of(state, user, slug)?;
     let cards = parse_deck(&rc.coll_dir)?.cards;
+    let base = rc.coll_dir.canonicalize()?;
     let db = open_collection_db(state, &rc)?;
     let due = db.due_today(Timestamp::now().date())?;
     let seen = db.card_hashes()?;
@@ -271,7 +297,7 @@ pub(super) fn list_cards_for(
     let mut out = Vec::new();
     for card in &cards {
         if let Some(deck) = deck {
-            if card.deck_name().as_str() != deck {
+            if !card_in_deck(card, &base, deck) {
                 continue;
             }
         }
@@ -427,7 +453,8 @@ pub struct ReadDeckArgs {
 pub struct ListCardsArgs {
     /// The collection's slug, as returned by list_collections.
     pub collection: String,
-    /// Only cards in this deck, e.g. `verbs.md`.
+    /// Only cards in this deck: its file, e.g. `verbs.md`, or the deck name
+    /// a card reports, e.g. `verbs`.
     pub deck: Option<String>,
     /// Only cards due for review today. A card never reviewed is due.
     pub due_only: Option<bool>,
@@ -627,6 +654,31 @@ mod tests {
             !root.path().join("German/.hashcards.toml").exists(),
             "a read tool created a collection id"
         );
+        Ok(())
+    }
+
+    /// Every other deck tool names a deck by its file, so the filter must
+    /// take one too -- as well as the deck name each card reports.
+    #[test]
+    fn listing_cards_by_deck_accepts_the_file_or_the_deck_name() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        std::fs::create_dir_all(root.path().join("Spanish/Unit 2"))?;
+        std::fs::write(
+            root.path().join("Spanish/Unit 2/nouns.md"),
+            "---\nname = \"Nouns\"\n---\n\nQ: casa\nA: house\n",
+        )?;
+        for (deck, expected) in [
+            ("verbs.md", 2),
+            ("verbs", 2),
+            ("Unit 2/nouns.md", 1),
+            ("Unit 2/nouns", 1),
+            ("Nouns", 1),
+            ("nope.md", 0),
+        ] {
+            let cards = list_cards_for(&mcp.state, None, "Spanish", Some(deck), false, None, 50)?;
+            assert_eq!(cards.len(), expected, "deck filter `{deck}`");
+        }
         Ok(())
     }
 

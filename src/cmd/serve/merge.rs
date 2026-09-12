@@ -146,8 +146,21 @@ fn collect_sources(tree: &Path, db_dir: &Path, target: &Path) -> Fallible<Vec<So
             Some(n) if !n.starts_with('.') => {}
             _ => continue,
         }
-        let Some(id) = existing_collection_id(&folder)? else {
-            continue;
+        // Skipped, as discovery skips it: a metadata file with no usable id
+        // keeps that one folder from being served until it is fixed, and
+        // failing here would keep every other collection in the tree from
+        // opening as well. Its database stays where it is and is merged on
+        // a later start, once the file has been fixed.
+        let id = match existing_collection_id(&folder) {
+            Ok(Some(id)) => id,
+            Ok(None) => continue,
+            Err(e) => {
+                log::warn!(
+                    "Not consolidating the review history of {} for now: {e}",
+                    folder.display()
+                );
+                continue;
+            }
         };
         let path = db_dir.join(format!("{id}.db"));
         // Belt and braces: a source that *is* the target would be imported
@@ -498,6 +511,31 @@ mod tests {
             )?,
             0
         );
+        Ok(())
+    }
+
+    /// Discovery skips a folder whose metadata has no usable id, so one such
+    /// file must not fail the merge -- and with it every collection -- for
+    /// the whole tree.
+    #[test]
+    fn a_folder_with_an_unusable_id_does_not_block_the_rest_of_the_tree() -> Fallible<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let (tree, one, _two) = two_collections(data_dir)?;
+        seed(
+            &create_legacy_v7(&source(data_dir, &one))?,
+            "hash-one",
+            "2026-02-01",
+            2,
+        )?;
+        let broken = data_dir.join("cards").join(&tree).join("Broken");
+        std::fs::create_dir_all(&broken)?;
+        std::fs::write(broken.join(COLLECTION_META_FILE), "id = \"   \"\n")?;
+
+        let failures = merge_legacy_databases(data_dir);
+        assert!(failures.is_empty(), "{failures:?}");
+        let conn = Connection::open(data_dir.join("db").join(format!("{tree}.db")))?;
+        assert_eq!(count(&conn, "select count(*) from cards;")?, 1);
         Ok(())
     }
 

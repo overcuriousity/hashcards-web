@@ -279,6 +279,15 @@ fn read_entry(dir: &Path, id: TrashId) -> Fallible<TrashEntry> {
     })
 }
 
+/// One trashed entry, read without touching it.
+pub fn trashed_entry(data_dir: &Path, tree: &str, id: &TrashId) -> Fallible<TrashEntry> {
+    let dir = entry_dir(data_dir, tree, id);
+    if !dir.is_dir() {
+        return fail("That item is not in the trash any more.");
+    }
+    read_entry(&dir, id.clone())
+}
+
 /// Put a trashed entry back where it came from, and return the path it
 /// went to.
 ///

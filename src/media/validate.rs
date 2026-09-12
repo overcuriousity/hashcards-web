@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -51,27 +52,50 @@ fn extract_media_paths(markdown: &str) -> Vec<String> {
     paths
 }
 
+/// The Markdown texts of a card, each of which may reference media.
+fn markdown_texts(card: &Card) -> Vec<&str> {
+    match card.content() {
+        CardContent::Basic { question, answer } => vec![question.as_str(), answer.as_str()],
+        CardContent::Cloze { text, .. } => vec![text.as_str()],
+    }
+}
+
+/// A resolver for the media paths in `card`, a card of the collection at
+/// `base_dir`.
+fn resolver_for(card: &Card, base_dir: &Path) -> Fallible<MediaResolver> {
+    MediaResolverBuilder::new()
+        .with_collection_path(base_dir.to_path_buf())?
+        .with_deck_path(card.relative_file_path(base_dir)?)?
+        .build()
+}
+
+/// Every media file `cards` reference, relative to `base_dir`.
+///
+/// References that do not resolve are left out, external URLs among them:
+/// reporting a missing file is `validate_media_files`' job.
+pub fn referenced_media_files(cards: &[Card], base_dir: &Path) -> Fallible<BTreeSet<PathBuf>> {
+    let mut found = BTreeSet::new();
+    for card in cards {
+        let resolver = resolver_for(card, base_dir)?;
+        for markdown in markdown_texts(card) {
+            for path in extract_media_paths(markdown) {
+                if let Ok(rel) = resolver.resolve(&path) {
+                    found.insert(rel);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Validate that all media files referenced in cards exist.
 pub fn validate_media_files(cards: &[Card], base_dir: &Path) -> Fallible<()> {
     let base_dir = base_dir.to_path_buf();
     let mut missing = HashSet::new();
 
     for card in cards {
-        let resolver: MediaResolver = MediaResolverBuilder::new()
-            .with_collection_path(base_dir.clone())?
-            .with_deck_path(card.relative_file_path(&base_dir)?)?
-            .build()?;
-
-        // Extract markdown content from the card.
-        //
-        // TODO: perhaps this should be lifted to a method of the `CardContent`
-        // enum.
-        let markdown_texts = match card.content() {
-            CardContent::Basic { question, answer } => vec![question.as_str(), answer.as_str()],
-            CardContent::Cloze { text, .. } => vec![text.as_str()],
-        };
-
-        for markdown in markdown_texts {
+        let resolver: MediaResolver = resolver_for(card, &base_dir)?;
+        for markdown in markdown_texts(card) {
             for path in extract_media_paths(markdown) {
                 use crate::media::resolve::ResolveError;
                 match resolver.resolve(&path) {

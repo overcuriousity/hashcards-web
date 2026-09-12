@@ -20,6 +20,7 @@ use crate::cmd::drill::template::page_template;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::files::erase_collection_rows;
+use crate::cmd::serve::files::restore_entry;
 use crate::cmd::serve::files::user_root;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::trash::TrashEntry;
@@ -27,7 +28,6 @@ use crate::cmd::serve::trash::TrashId;
 use crate::cmd::serve::trash::list_trash;
 use crate::cmd::serve::trash::purge_all;
 use crate::cmd::serve::trash::purge_entry;
-use crate::cmd::serve::trash::restore_from_trash;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::flash::Flash;
@@ -47,10 +47,8 @@ fn data_dir(state: &AppState) -> Fallible<std::path::PathBuf> {
 }
 
 fn restore_one(state: &AppState, user: Option<&CurrentUser>, raw_id: &str) -> Fallible<String> {
-    let data_dir = data_dir(state)?;
     let id = TrashId::parse(raw_id)?;
-    let root = user_root(state, user)?;
-    let rel = restore_from_trash(&data_dir, &root, &id)?;
+    let rel = restore_entry(state, user, &id)?;
     Ok(format!("Restored `{rel}`."))
 }
 

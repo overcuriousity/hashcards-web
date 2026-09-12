@@ -435,7 +435,8 @@ impl ResolvedServeConfig {
                     let host = host.trim();
                     if host.is_empty() {
                         return fail(
-                            "configuration error: [mcp].allowed_hosts must not contain an empty                              entry",
+                            "configuration error: [mcp].allowed_hosts must not contain an empty \
+                             entry",
                         );
                     }
                     if !allowed_hosts.iter().any(|h| h == host) {
@@ -751,7 +752,11 @@ mod tests {
         let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n\n\
                     [mcp]\nallowed_hosts = [\"\"]\n";
         let config: ServeConfig = toml::from_str(toml)?;
-        assert!(ResolvedServeConfig::from_toml(config).is_err());
+        let message = match ResolvedServeConfig::from_toml(config) {
+            Ok(_) => return fail("an empty allowed host must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(!message.contains("  "), "stray spaces in: {message}");
         Ok(())
     }
 }

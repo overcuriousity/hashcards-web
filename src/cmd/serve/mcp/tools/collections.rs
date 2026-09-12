@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::cards::write_collection_overrides;
+use crate::cmd::serve::files::NewEntry;
 use crate::cmd::serve::files::create_entry;
 use crate::cmd::serve::files::delete_entry;
 use crate::cmd::serve::files::rename_entry;
@@ -39,7 +40,7 @@ pub(super) fn create_collection_for(
     // A collection is a top-level folder, so the parent is the root.
     // `create_entry` gives it an id immediately, which is what its review
     // history will be keyed by.
-    create_entry(state, user, "", name, true)
+    create_entry(state, user, "", name, NewEntry::Folder)
 }
 
 pub(super) fn rename_collection_for(

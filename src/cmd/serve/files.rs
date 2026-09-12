@@ -36,8 +36,11 @@ use crate::cmd::serve::href::encoded_path;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::migrate_sessions;
 use crate::cmd::serve::state::sessions_touching;
+use crate::cmd::serve::trash::TrashId;
 use crate::cmd::serve::trash::TrashKind;
 use crate::cmd::serve::trash::move_to_trash;
+use crate::cmd::serve::trash::restore_from_trash;
+use crate::cmd::serve::trash::trashed_entry;
 use crate::cmd::serve::upload::MEDIA_DIR;
 use crate::db::Database;
 use crate::error::Fallible;
@@ -290,7 +293,7 @@ pub async fn files_folder_handler(
                 current_user.as_ref(),
                 &form.parent,
                 &form.name,
-                true,
+                NewEntry::Folder,
             )
         })
         .await,
@@ -309,7 +312,7 @@ pub async fn files_file_handler(
                 current_user.as_ref(),
                 &form.parent,
                 &form.name,
-                false,
+                NewEntry::CardFile(CARD_TEMPLATE),
             )
         })
         .await,
@@ -375,6 +378,23 @@ fn check_collection_slug(
     name: &str,
     except: Option<&Path>,
 ) -> Fallible<()> {
+    if let Some((slug, other)) = slug_taken_by(state, user, root, name, except)? {
+        return fail(format!(
+            "`{name}` maps to the URL slug `{slug}`, which `{other}` already uses. Pick a different name."
+        ));
+    }
+    Ok(())
+}
+
+/// The slug a collection named `name` would have, and the name of whatever
+/// already answers to it, if anything does.
+fn slug_taken_by(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    root: &CardRoot,
+    name: &str,
+    except: Option<&Path>,
+) -> Fallible<Option<(String, String)>> {
     let slug = slugify(name);
     let owner = owner_key(user);
     let mut taken = reserved_slugs(state, owner.as_deref());
@@ -392,12 +412,18 @@ fn check_collection_slug(
             .filter(|c| Some(c.coll_dir.as_path()) != except)
             .map(|c| (c.slug.clone(), c.name)),
     );
-    if let Some((_, other)) = taken.iter().find(|(s, _)| *s == slug) {
-        return fail(format!(
-            "`{name}` maps to the URL slug `{slug}`, which `{other}` already uses. Pick a different name."
-        ));
-    }
-    Ok(())
+    Ok(taken
+        .into_iter()
+        .find(|(s, _)| *s == slug)
+        .map(|(_, other)| (slug, other)))
+}
+
+/// What `create_entry` makes.
+pub(crate) enum NewEntry<'a> {
+    Folder,
+    /// A card file, written with these contents: the web interface seeds
+    /// one with `CARD_TEMPLATE`, an assistant asks for an empty deck.
+    CardFile(&'a str),
 }
 
 /// Create a file or folder in the caller's tree.
@@ -411,8 +437,9 @@ pub(crate) fn create_entry(
     user: Option<&CurrentUser>,
     parent: &str,
     name: &str,
-    is_dir: bool,
+    kind: NewEntry<'_>,
 ) -> Fallible<String> {
+    let is_dir = matches!(kind, NewEntry::Folder);
     let root = user_root(state, user)?;
     let mut name = validate_name(name)?;
     if !is_dir && !name.ends_with(".md") {
@@ -461,13 +488,14 @@ pub(crate) fn create_entry(
         check_collection_slug(state, user, &root, &top, None)?;
     }
 
-    if is_dir {
-        std::fs::create_dir_all(&target)?;
-    } else {
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+    match kind {
+        NewEntry::Folder => std::fs::create_dir_all(&target)?,
+        NewEntry::CardFile(contents) => {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, contents)?;
         }
-        std::fs::write(&target, CARD_TEMPLATE)?;
     }
     // Give a new top-level folder its id immediately, so the collection it
     // becomes keeps its database across a later rename.
@@ -576,6 +604,37 @@ pub(crate) fn delete_entry(
     // must start fresh" now lives.
     move_to_trash(&data_dir, &root, &rel, kind, id, Timestamp::now())?;
     Ok(format!("Moved `{rel}` to the trash."))
+}
+
+/// Put something from the caller's trash back where it came from.
+///
+/// A restore can bring a top-level folder -- a collection -- back into
+/// being just as creating or renaming one can, so it runs the same slug
+/// check. Without it a restored collection could share its URL with a
+/// folder or saved deck made while it was in the trash, and whichever
+/// routing found first would win.
+pub(crate) fn restore_entry(
+    state: &AppState,
+    user: Option<&CurrentUser>,
+    id: &TrashId,
+) -> Fallible<String> {
+    let data_dir = data_dir(state)?;
+    let root = user_root(state, user)?;
+    let entry = trashed_entry(&data_dir, root.tree_name()?, id)?;
+    let target = root.resolve_entry(&entry.original_path)?;
+    let top = match target.rel.split('/').next() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return fail(format!("`{}` is not a valid path.", target.rel)),
+    };
+    if !root.resolve(&top)?.exists() {
+        if let Some((slug, other)) = slug_taken_by(state, user, &root, &top, None)? {
+            return fail(format!(
+                "`{top}` maps to the URL slug `{slug}`, which `{other}` now uses, so the deleted \
+                 copy was left in the trash. Rename or remove `{other}`, then restore again."
+            ));
+        }
+    }
+    restore_from_trash(&data_dir, &root, id)
 }
 
 /// Erase the review history of the collection whose id is `id`.
@@ -1267,7 +1326,7 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        let error = match create_entry(&state, None, "", &taken, true) {
+        let error = match create_entry(&state, None, "", &taken, NewEntry::Folder) {
             Ok(_) => return fail("expected a slug collision error"),
             Err(e) => e.to_string(),
         };
@@ -1283,8 +1342,8 @@ mod tests {
     fn a_new_folder_may_not_shadow_another_local_folder_slug() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Verbs 1", true)?;
-        assert!(create_entry(&state, None, "", "Verbs-1", true).is_err());
+        create_entry(&state, None, "", "Verbs 1", NewEntry::Folder)?;
+        assert!(create_entry(&state, None, "", "Verbs-1", NewEntry::Folder).is_err());
         Ok(())
     }
 
@@ -1295,8 +1354,8 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        create_entry(&state, None, "", "Languages", true)?;
-        create_entry(&state, None, "Languages", &taken, true)?;
+        create_entry(&state, None, "", "Languages", NewEntry::Folder)?;
+        create_entry(&state, None, "Languages", &taken, NewEntry::Folder)?;
         Ok(())
     }
 
@@ -1305,7 +1364,7 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
-        create_entry(&state, None, "", "Espanol", true)?;
+        create_entry(&state, None, "", "Espanol", NewEntry::Folder)?;
 
         assert!(rename_entry(&state, None, "Espanol", &taken).is_err());
         // Renaming a folder to its own name is not a collision with itself.
@@ -1627,11 +1686,29 @@ mod tests {
         let state = state_for(&dir);
         let taken = reserve_deck(&state, "Exam revision");
 
-        assert!(create_entry(&state, None, &taken, "verbs", false).is_err());
+        assert!(
+            create_entry(
+                &state,
+                None,
+                &taken,
+                "verbs",
+                NewEntry::CardFile(CARD_TEMPLATE)
+            )
+            .is_err()
+        );
         assert!(!user_root(&state, None)?.path().join(&taken).exists());
 
         // Nested folders are checked by their top-level ancestor too.
-        assert!(create_entry(&state, None, &format!("{taken}/Unit 2"), "verbs", false).is_err());
+        assert!(
+            create_entry(
+                &state,
+                None,
+                &format!("{taken}/Unit 2"),
+                "verbs",
+                NewEntry::CardFile(CARD_TEMPLATE)
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1641,7 +1718,13 @@ mod tests {
     fn a_file_creates_its_collection_with_an_id() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "Spanish/Unit 2", "verbs", false)?;
+        create_entry(
+            &state,
+            None,
+            "Spanish/Unit 2",
+            "verbs",
+            NewEntry::CardFile(CARD_TEMPLATE),
+        )?;
         let root = user_root(&state, None)?;
         assert!(root.path().join("Spanish/Unit 2/verbs.md").is_file());
         assert!(existing_collection_id(&root.path().join("Spanish"))?.is_some());
@@ -1676,7 +1759,7 @@ mod tests {
 
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let db_dir = dir.join("db");
@@ -1779,22 +1862,28 @@ mod tests {
     fn a_user_folder_inside_a_collection_may_not_be_called_media() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
 
-        let error = match create_entry(&state, None, "Spanish", MEDIA_DIR, true) {
+        let error = match create_entry(&state, None, "Spanish", MEDIA_DIR, NewEntry::Folder) {
             Ok(_) => return fail("expected `media` to be refused inside a collection"),
             Err(e) => e.to_string(),
         };
         assert!(error.contains("pasted images"), "got: {error}");
 
         // Renaming onto the same name is the same hazard.
-        create_entry(&state, None, "Spanish", "Unit 2", true)?;
+        create_entry(&state, None, "Spanish", "Unit 2", NewEntry::Folder)?;
         assert!(rename_entry(&state, None, "Spanish/Unit 2", MEDIA_DIR).is_err());
 
         // A deck called `media.md` is not a folder and stays allowed, and so
         // does a collection of the user's own called `media`.
-        create_entry(&state, None, "Spanish", MEDIA_DIR, false)?;
-        create_entry(&state, None, "", MEDIA_DIR, true)?;
+        create_entry(
+            &state,
+            None,
+            "Spanish",
+            MEDIA_DIR,
+            NewEntry::CardFile(CARD_TEMPLATE),
+        )?;
+        create_entry(&state, None, "", MEDIA_DIR, NewEntry::Folder)?;
         Ok(())
     }
 
@@ -1805,7 +1894,7 @@ mod tests {
     fn a_collection_whose_media_folder_holds_decks_is_not_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let folder = user_root(&state, None)?.path().join("Spanish");
         let hidden = folder.join(MEDIA_DIR).join("Unit 2");
         std::fs::create_dir_all(&hidden)?;
@@ -1828,7 +1917,7 @@ mod tests {
     fn a_collection_is_not_deleted_or_renamed_while_a_session_drills_it() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let path = folder.join("verbs.md");
@@ -1862,7 +1951,8 @@ mod tests {
     fn a_card_file_cannot_be_created_directly_in_the_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        let error = match create_entry(&state, None, "", "notes", false) {
+        let error = match create_entry(&state, None, "", "notes", NewEntry::CardFile(CARD_TEMPLATE))
+        {
             Ok(_) => return fail("expected a root-level file to be refused"),
             Err(e) => e.to_string(),
         };
@@ -1885,7 +1975,7 @@ mod tests {
     fn a_dotted_path_is_still_recognized_as_a_collection_root() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let folder = root.path().join("Spanish");
         let db_dir = dir.join("db");
@@ -1925,7 +2015,7 @@ mod tests {
     fn a_collection_holding_only_pasted_images_can_still_be_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let folder = user_root(&state, None)?.path().join("Spanish");
         std::fs::create_dir_all(folder.join("media"))?;
         std::fs::write(folder.join("media").join("a.png"), "x")?;
@@ -1942,7 +2032,7 @@ mod tests {
     fn deleting_a_collection_trashes_it_and_keeps_its_rows() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -1972,7 +2062,7 @@ mod tests {
     fn restoring_a_collection_brings_its_review_history_back() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -2002,7 +2092,7 @@ mod tests {
     fn purging_a_trashed_collection_erases_its_rows() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         let id = collection_id(&root.path().join("Spanish"))?;
         let db_dir = dir.join("db");
@@ -2028,7 +2118,7 @@ mod tests {
     fn a_non_empty_collection_can_be_deleted() -> Fallible<()> {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
-        create_entry(&state, None, "", "Spanish", true)?;
+        create_entry(&state, None, "", "Spanish", NewEntry::Folder)?;
         let root = user_root(&state, None)?;
         std::fs::write(
             root.path().join("Spanish").join("verbs.md"),

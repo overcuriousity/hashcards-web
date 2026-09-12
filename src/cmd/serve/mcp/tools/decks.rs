@@ -6,6 +6,8 @@
 //! them between collections is an update rather than a transfer between two
 //! database files.
 
+use std::path::PathBuf;
+
 use rmcp::ErrorData;
 use rmcp::RoleServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -18,9 +20,11 @@ use serde::Deserialize;
 
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
+use crate::cmd::serve::cards::CardRoot;
 use crate::cmd::serve::cards::user_db_path;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::edit::file_mtime_ms;
+use crate::cmd::serve::files::NewEntry;
 use crate::cmd::serve::files::create_entry;
 use crate::cmd::serve::files::delete_entry;
 use crate::cmd::serve::files::save_file;
@@ -29,12 +33,15 @@ use crate::cmd::serve::mcp::server::HashcardsMcp;
 use crate::cmd::serve::mcp::tools::read::collection_folder;
 use crate::cmd::serve::mcp::tools::read::collection_of;
 use crate::cmd::serve::mcp::tools::read::to_mcp;
+use crate::cmd::serve::reviewdb::refuse_if_unconsolidated;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::sessions_touching;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::media::validate::referenced_media_files;
 use crate::parser::parse_deck;
+use crate::types::card::Card;
 use crate::user_db::UserDatabase;
 
 pub(super) fn create_deck_for(
@@ -47,8 +54,15 @@ pub(super) fn create_deck_for(
     let root = user_root(state, user)?;
     // `create_entry` appends `.md` itself and refuses a name that would
     // escape the tree, so a deck name from a model is checked exactly as
-    // one typed into the file manager is.
-    create_entry(state, user, &collection_folder(&root, &rc)?, deck, false)
+    // one typed into the file manager is. Empty, not the file manager's
+    // template: its sample cards would be drilled like any others.
+    create_entry(
+        state,
+        user,
+        &collection_folder(&root, &rc)?,
+        deck,
+        NewEntry::CardFile(""),
+    )
 }
 
 pub(super) fn write_deck_for(
@@ -111,6 +125,16 @@ pub(super) fn move_decks_for(
     }
 
     let root = user_root(state, user)?;
+    let db_dir = match &state.config.data_dir {
+        Some(d) => d.join("db"),
+        None => return fail("No data directory is configured."),
+    };
+    let db_path = user_db_path(&root, &db_dir)?;
+    // Before anything moves, as every other write does: for a user whose
+    // startup merge failed there are no rows to carry, and the history
+    // merged later would land under the collection the deck has left.
+    refuse_if_unconsolidated(state, &db_path)?;
+
     let source = root.resolve_entry(&format!("{}/{deck}", collection_folder(&root, &from)?))?;
     if !source.path.is_file() {
         return fail(format!(
@@ -134,13 +158,22 @@ pub(super) fn move_decks_for(
     // frontmatter and, for a nested deck, find the wrong set of cards.
     // Card file paths are canonical, so the comparison is too.
     let canonical = source.path.canonicalize()?;
-    let hashes: Vec<_> = parse_deck(&from.coll_dir)?
+    let cards: Vec<Card> = parse_deck(&from.coll_dir)?
         .cards
         .into_iter()
         .filter(|c| c.file_path() == &canonical)
-        .map(|c| c.hash())
         .collect();
+    let hashes: Vec<_> = cards.iter().map(|c| c.hash()).collect();
+    let media = media_to_copy(&root, &cards, &from, &to)?;
 
+    // The media first: a copy that fails leaves the deck where its images
+    // still are, and a stray copy in the destination breaks nothing.
+    for (from_file, to_file) in &media {
+        if let Some(parent) = to_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from_file, to_file)?;
+    }
     if let Some(parent) = target.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -148,15 +181,60 @@ pub(super) fn move_decks_for(
 
     // After the bytes: if the rename fails the schedules must stay where
     // the cards still are.
-    let db_dir = match &state.config.data_dir {
-        Some(d) => d.join("db"),
-        None => return fail("No data directory is configured."),
-    };
-    let path = user_db_path(&root, &db_dir)?;
-    if path.is_file() {
-        UserDatabase::open(&path)?.move_cards(&from.collection_id, &to.collection_id, &hashes)?;
+    if db_path.is_file() {
+        UserDatabase::open(&db_path)?.move_cards(
+            &from.collection_id,
+            &to.collection_id,
+            &hashes,
+        )?;
     }
-    Ok(format!("Moved `{deck}` from `{from_slug}` to `{to_slug}`."))
+    let moved = format!("Moved `{deck}` from `{from_slug}` to `{to_slug}`.");
+    Ok(match media.len() {
+        0 => moved,
+        n => format!(
+            "{moved} Copied the {n} media file{} it uses; the originals stay in `{from_slug}`, \
+             where other decks may use them too.",
+            if n == 1 { "" } else { "s" }
+        ),
+    })
+}
+
+/// The media files `cards` use, as (source, destination) pairs, for a deck
+/// moving from `from` to `to`.
+///
+/// Media paths resolve against the collection, so a deck moved without its
+/// images points at files the destination does not have -- and a collection
+/// with missing media refuses to open at all. Copied, not moved: another
+/// deck in the source may use the same file. A different file already at a
+/// destination path refuses the move before anything is touched; an
+/// identical one is left as it is.
+fn media_to_copy(
+    root: &CardRoot,
+    cards: &[Card],
+    from: &ResolvedCollection,
+    to: &ResolvedCollection,
+) -> Fallible<Vec<(PathBuf, PathBuf)>> {
+    let to_folder = collection_folder(root, to)?;
+    let mut copies = Vec::new();
+    for rel in referenced_media_files(cards, &from.coll_dir)? {
+        let rel = rel.to_string_lossy().into_owned();
+        let source = from.coll_dir.join(&rel);
+        // Through `resolve_entry`, so a symlink in the destination cannot
+        // carry the copy outside the tree.
+        let target = root.resolve_entry(&format!("{to_folder}/{rel}"))?.path;
+        if target.exists() {
+            if target.is_file() && std::fs::read(&source)? == std::fs::read(&target)? {
+                continue;
+            }
+            return fail(format!(
+                "`{}` already has a different `{rel}`, and the deck uses the one in `{}`. Rename \
+                 one of them first.",
+                to.slug, from.slug
+            ));
+        }
+        copies.push((source, target));
+    }
+    Ok(copies)
 }
 
 /// Refuse the move while a drill session is running on either side.
@@ -273,7 +351,9 @@ impl HashcardsMcp {
     #[tool(
         description = "Move a deck from one collection to another. Its cards keep their review \
                        history. A card the destination collection already has keeps the \
-                       schedule it has there."
+                       schedule it has there. Images and other media the deck uses are copied \
+                       into the destination; the move is refused if a different file is already \
+                       at the same path there."
     )]
     async fn move_decks(
         &self,
@@ -332,6 +412,7 @@ mod tests {
     use crate::cmd::serve::mcp::tools::tests::seed_session;
     use crate::cmd::serve::mcp::tools::tests::spaced_collection;
     use crate::cmd::serve::trash::list_trash;
+    use crate::media::validate::validate_media_files;
     use crate::types::card_hash::CardHash;
     use crate::types::timestamp::Timestamp;
 
@@ -343,13 +424,107 @@ mod tests {
         Ok(())
     }
 
+    /// The file manager seeds a new card file with sample cards. A deck an
+    /// assistant creates must not: they would be drilled like any other.
     #[test]
     fn a_created_deck_is_empty_and_readable() -> Fallible<()> {
-        let (_dir, mcp) = mcp_fixture()?;
+        let (dir, mcp) = mcp_fixture()?;
         create_deck_for(&mcp.state, None, "Spanish", "nouns.md")?;
-        // The file manager seeds a new card file with a template, so what
-        // matters is that it exists and parses, not that it is empty.
+        let root = CardRoot::for_user(dir.path(), None)?;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("Spanish/nouns.md"))?,
+            ""
+        );
         read_deck_for(&mcp.state, None, "Spanish", "nouns.md")?;
+        assert_eq!(
+            list_cards_for(&mcp.state, None, "Spanish", None, false, None, 50)?.len(),
+            2
+        );
+        Ok(())
+    }
+
+    /// A deck whose images are in the source collection's folder.
+    fn deck_with_images(dir: &tempfile::TempDir) -> Fallible<std::path::PathBuf> {
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let spanish = root.path().join("Spanish");
+        std::fs::create_dir_all(spanish.join("media"))?;
+        std::fs::write(spanish.join("media/cat.png"), "cat")?;
+        std::fs::create_dir_all(spanish.join("pics"))?;
+        std::fs::write(spanish.join("pics/dog.png"), "dog")?;
+        std::fs::write(
+            spanish.join("verbs.md"),
+            "Q: gato ![](@/media/cat.png)\nA: cat\n\n---\n\nQ: perro ![](pics/dog.png)\nA: dog\n",
+        )?;
+        Ok(spanish)
+    }
+
+    /// Image paths resolve against the collection, so a deck moved without
+    /// its images points at files the destination lacks -- and a collection
+    /// with missing media refuses to open at all.
+    #[test]
+    fn a_moved_deck_takes_its_images_along() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        second_collection(&dir)?;
+        let spanish = deck_with_images(&dir)?;
+
+        move_decks_for(&mcp.state, None, "Spanish", "verbs.md", "German")?;
+
+        let german = CardRoot::for_user(dir.path(), None)?.path().join("German");
+        assert_eq!(
+            std::fs::read_to_string(german.join("media/cat.png"))?,
+            "cat"
+        );
+        assert_eq!(std::fs::read_to_string(german.join("pics/dog.png"))?, "dog");
+        validate_media_files(&parse_deck(&german)?.cards, &german)?;
+        // Copied, not moved: another deck in the source may use them too.
+        assert!(spanish.join("media/cat.png").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn a_move_onto_a_different_image_of_the_same_name_is_refused() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        second_collection(&dir)?;
+        let spanish = deck_with_images(&dir)?;
+        let german = CardRoot::for_user(dir.path(), None)?.path().join("German");
+        std::fs::create_dir_all(german.join("media"))?;
+        std::fs::write(german.join("media/cat.png"), "not a cat")?;
+
+        let err = move_decks_for(&mcp.state, None, "Spanish", "verbs.md", "German").unwrap_err();
+        assert!(err.message().contains("media/cat.png"), "{}", err.message());
+        assert!(spanish.join("verbs.md").is_file());
+        assert!(!german.join("verbs.md").exists());
+        assert!(!german.join("pics/dog.png").exists());
+        assert_eq!(
+            std::fs::read_to_string(german.join("media/cat.png"))?,
+            "not a cat"
+        );
+        Ok(())
+    }
+
+    /// Every other write refuses a user whose startup merge failed. A move
+    /// that went ahead would find no rows to carry, and the history merged
+    /// later would land under the collection the deck has left.
+    #[test]
+    fn a_deck_is_not_moved_for_a_user_whose_merge_failed() -> Fallible<()> {
+        let (dir, mut mcp) = mcp_fixture()?;
+        second_collection(&dir)?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        let db_path = user_db_path(&root, &dir.path().join("db"))?;
+        mcp.state.migration_failures = std::sync::Arc::new(
+            [(db_path, "disk is on fire".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let err = move_decks_for(&mcp.state, None, "Spanish", "verbs.md", "German").unwrap_err();
+        assert!(
+            err.message().contains("disk is on fire"),
+            "{}",
+            err.message()
+        );
+        assert!(root.path().join("Spanish/verbs.md").is_file());
+        assert!(!root.path().join("German/verbs.md").exists());
         Ok(())
     }
 
