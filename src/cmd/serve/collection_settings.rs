@@ -43,6 +43,7 @@ use crate::cmd::serve::state::AppState;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::flash::Flash;
+use crate::fsrs::Weights;
 use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::MaxInterval;
@@ -60,6 +61,8 @@ pub struct CollectionSettingsForm {
     pub max_reviews_per_day: String,
     #[serde(default)]
     pub max_new_per_day: String,
+    #[serde(default)]
+    pub weights: String,
 }
 
 fn optional_number<T>(
@@ -97,7 +100,12 @@ pub fn apply_collection_form(folder: &Path, form: &CollectionSettingsForm) -> Fa
         reviews: DailyLimits::parse(&form.max_reviews_per_day)?,
         new: DailyLimits::parse(&form.max_new_per_day)?,
     };
-    write_collection_overrides(folder, retention, max_interval, limits)
+    let weights = if form.weights.trim().is_empty() {
+        None
+    } else {
+        Some(Weights::parse_list(&form.weights)?)
+    };
+    write_collection_overrides(folder, retention, max_interval, limits, weights)
 }
 
 fn field(
@@ -181,6 +189,20 @@ pub fn render_collection_settings(
                         .unwrap_or_else(|| "no limit".to_string()),
                     (0.0, 100000.0, 1.0),
                 ))
+                div.setting {
+                    label for="weights" { "FSRS weights" }
+                    textarea.input #weights name="weights" rows="4"
+                        placeholder=(inherited_scheduling.weights.to_list()) {
+                        (overrides.weights.map(|w| w.to_list()).unwrap_or_default())
+                    }
+                    @if overrides.weights.is_none() {
+                        span.hint {
+                            "Inheriting the weights set on the "
+                            a href="/settings" { "settings page" }
+                            ", which explains what they are."
+                        }
+                    }
+                }
                 div.add-source-row {
                     input.btn.btn-primary type="submit" value="Save settings";
                 }
@@ -206,6 +228,7 @@ fn inherited_for(
         max_interval: user.max_interval.unwrap_or(defaults.max_interval),
         jitter: user.jitter.unwrap_or(defaults.jitter),
         free_days: user.free_days.unwrap_or(defaults.free_days),
+        weights: user.weights.unwrap_or(defaults.weights),
     };
     let limits = user.limits.or(state.config.defaults.limits());
     Ok((rc.name.clone(), inherited, limits, rc.overrides))
@@ -349,6 +372,7 @@ mod tests {
             Some(DesiredRetention::new(0.85)?),
             Some(MaxInterval::new(365.0)?),
             DailyLimits::default(),
+            None,
         )?;
         assert!(collection_overrides(&folder).retention.is_some());
 

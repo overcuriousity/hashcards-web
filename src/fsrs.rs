@@ -21,12 +21,119 @@ use rusqlite::types::ValueRef;
 use serde::Serialize;
 
 use crate::error::ErrorReport;
+use crate::error::Fallible;
 use crate::error::fail;
 
-pub const W: [f64; 19] = [
-    0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192, 1.01925,
-    1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621,
+/// Per-index bounds, `(low, high)` inclusive.
+///
+/// They exist because the formulas are not total: `W[4]` is a difficulty and
+/// difficulty is bounded 1..10, `W[7]` is a mixing fraction that means
+/// nothing outside 0..1, and `W[11]` multiplies the whole failure branch, so
+/// zero would collapse every lapse to no stability at all.
+///
+/// Signs follow *this* codebase, not FSRS's published table. The exponents
+/// at 9 and 12 are negated where they are used -- `s.powf(-W[9])`,
+/// `d.powf(-W[12])` -- so they are stored positive here where the published
+/// table writes them negative.
+const BOUNDS: [(f64, f64); 19] = [
+    (0.001, 100.0), // 0  initial stability, Forgot
+    (0.001, 100.0), // 1  initial stability, Hard
+    (0.001, 100.0), // 2  initial stability, Good
+    (0.001, 100.0), // 3  initial stability, Easy
+    (1.0, 10.0),    // 4  initial difficulty
+    (0.001, 4.0),   // 5  initial difficulty, grade exponent
+    (0.001, 4.0),   // 6  difficulty step per grade
+    (0.0, 0.75),    // 7  difficulty mean-reversion fraction
+    (0.0, 4.5),     // 8  stability growth, constant
+    (0.0, 0.8),     // 9  stability growth, stability exponent (negated in use)
+    (0.0, 3.0),     // 10 stability growth, retrievability
+    (0.001, 5.0),   // 11 failure, constant
+    (0.0, 0.8),     // 12 failure, difficulty exponent (negated in use)
+    (0.01, 0.9),    // 13 failure, stability exponent
+    (0.01, 3.0),    // 14 failure, retrievability
+    (0.0, 1.0),     // 15 Hard penalty
+    (1.0, 6.0),     // 16 Easy bonus
+    (0.0, 2.0),     // 17 short-term, constant
+    (0.0, 2.0),     // 18 short-term, grade
 ];
+
+/// The 19 FSRS parameters.
+///
+/// Data rather than a constant, so that a schedule can be fitted to one
+/// person's review history instead of to the population the published
+/// defaults came from. The defaults are exactly the constant that used to be
+/// compiled in, so a user who changes nothing is scheduled as they always
+/// were.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Weights([f64; 19]);
+
+impl Default for Weights {
+    fn default() -> Self {
+        Weights(Self::DEFAULT)
+    }
+}
+
+impl Weights {
+    pub const DEFAULT: [f64; 19] = [
+        0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192,
+        1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621,
+    ];
+
+    pub fn new(w: [f64; 19]) -> Fallible<Weights> {
+        for (i, value) in w.iter().enumerate() {
+            let (low, high) = BOUNDS[i];
+            if !value.is_finite() || *value < low || *value > high {
+                return fail(format!(
+                    "FSRS weight {i} must be a number between {low} and {high}, got: {value}"
+                ));
+            }
+        }
+        Ok(Weights(w))
+    }
+
+    pub fn get(&self, i: usize) -> f64 {
+        self.0[i]
+    }
+
+    pub fn as_array(&self) -> [f64; 19] {
+        self.0
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.0 == Self::DEFAULT
+    }
+
+    /// The comma-separated form an optimizer emits and the page shows.
+    pub fn parse_list(s: &str) -> Fallible<Weights> {
+        let parts: Vec<&str> = s
+            .split([',', '\n'])
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() != 19 {
+            return fail(format!(
+                "FSRS needs exactly 19 weights, found {}. Paste the whole list.",
+                parts.len()
+            ));
+        }
+        let mut w = [0.0f64; 19];
+        for (i, part) in parts.iter().enumerate() {
+            match part.parse::<f64>() {
+                Ok(v) => w[i] = v,
+                Err(_) => return fail(format!("FSRS weight {i} is not a number: {part}")),
+            }
+        }
+        Weights::new(w)
+    }
+
+    pub fn to_list(self) -> String {
+        self.0
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 pub type Recall = f64;
 pub type Stability = f64;
@@ -102,40 +209,40 @@ pub fn interval(r_d: Recall, s: Stability) -> Interval {
     (s / F) * (r_d.powf(1.0 / C) - 1.0)
 }
 
-pub fn initial_stability(g: Grade) -> Stability {
+pub fn initial_stability(g: Grade, w: &Weights) -> Stability {
     match g {
-        Grade::Forgot => W[0],
-        Grade::Hard => W[1],
-        Grade::Good => W[2],
-        Grade::Easy => W[3],
+        Grade::Forgot => w.get(0),
+        Grade::Hard => w.get(1),
+        Grade::Good => w.get(2),
+        Grade::Easy => w.get(3),
     }
 }
 
-fn s_success(d: Difficulty, s: Stability, r: Recall, g: Grade) -> Stability {
+fn s_success(d: Difficulty, s: Stability, r: Recall, g: Grade, w: &Weights) -> Stability {
     let t_d = 11.0 - d;
-    let t_s = s.powf(-W[9]);
-    let t_r = f64::exp(W[10] * (1.0 - r)) - 1.0;
-    let h = if g == Grade::Hard { W[15] } else { 1.0 };
-    let b = if g == Grade::Easy { W[16] } else { 1.0 };
-    let c = f64::exp(W[8]);
+    let t_s = s.powf(-w.get(9));
+    let t_r = f64::exp(w.get(10) * (1.0 - r)) - 1.0;
+    let h = if g == Grade::Hard { w.get(15) } else { 1.0 };
+    let b = if g == Grade::Easy { w.get(16) } else { 1.0 };
+    let c = f64::exp(w.get(8));
     let alpha = 1.0 + t_d * t_s * t_r * h * b * c;
     s * alpha
 }
 
-fn s_fail(d: Difficulty, s: Stability, r: Recall) -> Stability {
-    let d_f = d.powf(-W[12]);
-    let s_f = (s + 1.0).powf(W[13]) - 1.0;
-    let r_f = f64::exp(W[14] * (1.0 - r));
-    let c_f = W[11];
+fn s_fail(d: Difficulty, s: Stability, r: Recall, w: &Weights) -> Stability {
+    let d_f = d.powf(-w.get(12));
+    let s_f = (s + 1.0).powf(w.get(13)) - 1.0;
+    let r_f = f64::exp(w.get(14) * (1.0 - r));
+    let c_f = w.get(11);
     let s_f = d_f * s_f * r_f * c_f;
     f64::min(s_f, s)
 }
 
-pub fn new_stability(d: Difficulty, s: Stability, r: Recall, g: Grade) -> Stability {
+pub fn new_stability(d: Difficulty, s: Stability, r: Recall, g: Grade, w: &Weights) -> Stability {
     if g == Grade::Forgot {
-        s_fail(d, s, r)
+        s_fail(d, s, r, w)
     } else {
-        s_success(d, s, r, g)
+        s_success(d, s, r, g, w)
     }
 }
 
@@ -143,22 +250,22 @@ fn clamp_d(d: Difficulty) -> Difficulty {
     d.clamp(1.0, 10.0)
 }
 
-pub fn initial_difficulty(g: Grade) -> Difficulty {
+pub fn initial_difficulty(g: Grade, w: &Weights) -> Difficulty {
     let g: f64 = g.into();
-    clamp_d(W[4] - f64::exp(W[5] * (g - 1.0)) + 1.0)
+    clamp_d(w.get(4) - f64::exp(w.get(5) * (g - 1.0)) + 1.0)
 }
 
-pub fn new_difficulty(d: Difficulty, g: Grade) -> Difficulty {
-    clamp_d(W[7] * initial_difficulty(Grade::Easy) + (1.0 - W[7]) * dp(d, g))
+pub fn new_difficulty(d: Difficulty, g: Grade, w: &Weights) -> Difficulty {
+    clamp_d(w.get(7) * initial_difficulty(Grade::Easy, w) + (1.0 - w.get(7)) * dp(d, g, w))
 }
 
-fn dp(d: Difficulty, g: Grade) -> f64 {
-    d + delta_d(g) * ((10.0 - d) / 9.0)
+fn dp(d: Difficulty, g: Grade, w: &Weights) -> f64 {
+    d + delta_d(g, w) * ((10.0 - d) / 9.0)
 }
 
-fn delta_d(g: Grade) -> f64 {
+fn delta_d(g: Grade, w: &Weights) -> f64 {
     let g: f64 = g.into();
-    -W[6] * (g - 3.0)
+    -w.get(6) * (g - 3.0)
 }
 
 #[cfg(test)]
@@ -167,6 +274,76 @@ mod tests {
 
     use super::*;
     use crate::error::Fallible;
+
+    #[test]
+    fn the_default_weights_are_the_constant_that_was_compiled_in() {
+        assert_eq!(Weights::default().as_array(), Weights::DEFAULT);
+        assert!(Weights::default().is_default());
+    }
+
+    /// The bounds must admit the defaults. Obvious, and worth a test: the
+    /// first draft of `BOUNDS` took the signs from FSRS's own published
+    /// table, where `w9` and `w12` are negative. This codebase negates them
+    /// inline -- `s.powf(-W[9])` -- so it stores them positive, and three
+    /// bounds rejected the very vector they were written around.
+    #[test]
+    fn the_default_weights_are_inside_their_own_bounds() {
+        Weights::new(Weights::DEFAULT).expect("the defaults must be a valid weight vector");
+    }
+
+    /// The formulas are not total. A negative `W[9]` inverts the stability
+    /// exponent and a difficulty of zero is not a difficulty, so the bounds
+    /// are part of the type rather than a caller's responsibility.
+    #[test]
+    fn weights_outside_their_bounds_are_refused() {
+        let mut w = Weights::DEFAULT;
+        w[9] = -1.0;
+        assert!(Weights::new(w).is_err());
+
+        let mut w = Weights::DEFAULT;
+        w[4] = 0.0;
+        assert!(
+            Weights::new(w).is_err(),
+            "initial difficulty must be a difficulty"
+        );
+
+        let mut w = Weights::DEFAULT;
+        w[0] = f64::NAN;
+        assert!(Weights::new(w).is_err(), "NaN is not a weight");
+
+        let mut w = Weights::DEFAULT;
+        w[0] = f64::INFINITY;
+        assert!(Weights::new(w).is_err());
+    }
+
+    /// The error names the index, because a rejected paste of 19 numbers is
+    /// unactionable otherwise.
+    #[test]
+    fn the_weight_rejection_names_the_weight() {
+        let mut w = Weights::DEFAULT;
+        w[9] = -1.0;
+        let err = Weights::new(w).expect_err("out of bounds");
+        assert!(err.to_string().contains('9'), "message was: {err}");
+    }
+
+    /// The list format is what an optimizer emits and what the page shows.
+    #[test]
+    fn a_weight_list_round_trips() -> Fallible<()> {
+        let text = Weights::default().to_list();
+        assert_eq!(Weights::parse_list(&text)?, Weights::default());
+        // Whitespace and newlines as a paste would carry them.
+        let spaced = text.replace(", ", ",\n  ");
+        assert_eq!(Weights::parse_list(&spaced)?, Weights::default());
+        Ok(())
+    }
+
+    #[test]
+    fn a_weight_list_of_the_wrong_length_is_refused() {
+        let err = Weights::parse_list("0.4, 1.2").expect_err("two is not nineteen");
+        assert!(err.to_string().contains("19"), "message was: {err}");
+        assert!(Weights::parse_list("").is_err());
+        assert!(Weights::parse_list("a, b, c").is_err());
+    }
 
     /// Approximate equality.
     fn feq(a: f64, b: f64) -> bool {
@@ -189,7 +366,10 @@ mod tests {
     /// D_0(1) = w_4
     #[test]
     fn test_initial_difficulty_of_forgetting() {
-        assert_eq!(initial_difficulty(Grade::Forgot), W[4])
+        assert_eq!(
+            initial_difficulty(Grade::Forgot, &Weights::default()),
+            Weights::default().get(4)
+        )
     }
 
     /// A simulation step.
@@ -224,8 +404,9 @@ mod tests {
         assert!(!grades.is_empty());
         let mut grades = grades.clone();
         let g: Grade = grades.remove(0);
-        let mut s: Stability = initial_stability(g);
-        let mut d: Difficulty = initial_difficulty(g);
+        let w = Weights::default();
+        let mut s: Stability = initial_stability(g, &w);
+        let mut d: Difficulty = initial_difficulty(g, &w);
         let mut i: Interval = f64::max(interval(r_d, s).round(), 1.0);
         steps.push(Step { t, s, d, i });
 
@@ -233,8 +414,8 @@ mod tests {
         for g in grades {
             t += i;
             let r: Recall = retrievability(i, s);
-            s = new_stability(d, s, r, g);
-            d = new_difficulty(d, g);
+            s = new_stability(d, s, r, g, &w);
+            d = new_difficulty(d, g, &w);
             i = f64::max(interval(r_d, s).round(), 1.0);
             steps.push(Step { t, s, d, i });
         }

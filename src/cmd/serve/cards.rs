@@ -16,6 +16,7 @@ use crate::cmd::serve::config::slugify;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::fsrs::Weights;
 use crate::types::collection_id::CollectionId;
 use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
@@ -205,6 +206,8 @@ struct CollectionMeta {
     max_reviews_per_day: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_new_per_day: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weights: Option<toml::Value>,
 }
 
 /// The scheduling a collection asks for in its own `.hashcards.toml`.
@@ -252,6 +255,42 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
                 .and_then(|v| override_number(&v, "max_new_per_day", &meta_path))
                 .and_then(|v| card_count(v, "max_new_per_day", &meta_path)),
         },
+        weights: meta
+            .weights
+            .and_then(|v| override_weights(&v, &meta_path))
+            .and_then(|w| Weights::new(w).inspect_err(|e| complain("weights", e)).ok()),
+    }
+}
+
+/// The 19 numbers an FSRS fit is, as written in a collection file. Anything
+/// that is not 19 numbers inherits, with a warning: a half-read weight
+/// vector is not a schedule anyone asked for.
+fn override_weights(value: &toml::Value, meta_path: &Path) -> Option<[f64; 19]> {
+    let toml::Value::Array(items) = value else {
+        log::warn!(
+            "Ignoring `weights` in {}: expected an array of 19 numbers.",
+            meta_path.display()
+        );
+        return None;
+    };
+    let numbers: Vec<f64> = items
+        .iter()
+        .filter_map(|v| match v {
+            toml::Value::Float(f) => Some(*f),
+            toml::Value::Integer(i) => Some(*i as f64),
+            _ => None,
+        })
+        .collect();
+    match <[f64; 19]>::try_from(numbers.as_slice()) {
+        Ok(array) => Some(array),
+        Err(_) => {
+            log::warn!(
+                "Ignoring `weights` in {}: expected 19 numbers, found {}.",
+                meta_path.display(),
+                items.len()
+            );
+            None
+        }
     }
 }
 
@@ -290,6 +329,7 @@ pub fn write_collection_overrides(
     retention: Option<DesiredRetention>,
     max_interval: Option<MaxInterval>,
     limits: DailyLimits,
+    weights: Option<Weights>,
 ) -> Fallible<()> {
     let meta_path = folder.join(COLLECTION_META_FILE);
     if let Ok(text) = read_to_string(&meta_path) {
@@ -308,6 +348,14 @@ pub fn write_collection_overrides(
         max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
         max_reviews_per_day: limits.reviews.map(|n| toml::Value::Integer(n.into())),
         max_new_per_day: limits.new.map(|n| toml::Value::Integer(n.into())),
+        weights: weights.map(|w| {
+            toml::Value::Array(
+                w.as_array()
+                    .iter()
+                    .map(|v| toml::Value::Float(*v))
+                    .collect(),
+            )
+        }),
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     Ok(())
@@ -350,6 +398,7 @@ pub fn collection_id(folder: &Path) -> Fallible<CollectionId> {
         max_interval_days: None,
         max_reviews_per_day: None,
         max_new_per_day: None,
+        weights: None,
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     CollectionId::new(id)
@@ -913,6 +962,7 @@ mod tests {
             Some(DesiredRetention::new(0.9)?),
             None,
             DailyLimits::default(),
+            None,
         )
         .unwrap_err();
         assert!(err.message().contains("TOML"), "{}", err.message());

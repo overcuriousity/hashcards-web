@@ -22,6 +22,7 @@ use crate::fsrs::Grade;
 use crate::fsrs::Interval;
 use crate::fsrs::Recall;
 use crate::fsrs::Stability;
+use crate::fsrs::Weights;
 use crate::fsrs::initial_difficulty;
 use crate::fsrs::initial_stability;
 use crate::fsrs::interval;
@@ -128,6 +129,12 @@ pub struct Scheduling {
     /// the same reason: which days you are busy is a fact about your week,
     /// not about one collection.
     pub free_days: FreeDays,
+    /// The FSRS parameters this schedule is computed with.
+    ///
+    /// Per instance, per user and per collection, like the two numbers
+    /// beside it: a fit is only as good as the history it came from, and one
+    /// person's Spanish and their anatomy deck need not share one.
+    pub weights: Weights,
 }
 
 /// Fractional random jitter applied to computed review intervals.
@@ -217,7 +224,11 @@ pub fn update_performance(
 ) -> ReviewedPerformance {
     let today: NaiveDate = reviewed_at.date().into_inner();
     let (stability, difficulty, review_count): (Stability, Difficulty, usize) = match perf {
-        Performance::New => (initial_stability(grade), initial_difficulty(grade), 0),
+        Performance::New => (
+            initial_stability(grade, &scheduling.weights),
+            initial_difficulty(grade, &scheduling.weights),
+            0,
+        ),
         Performance::Reviewed(ReviewedPerformance {
             last_reviewed_at,
             stability,
@@ -231,8 +242,9 @@ pub fn update_performance(
             // or go NaN (BUG-28).
             let time: Interval = ((today - last_reviewed_at).num_days() as f64).max(0.0);
             let retr: Recall = retrievability(time, stability);
-            let stability: Stability = new_stability(difficulty, stability, retr, grade);
-            let difficulty: Difficulty = new_difficulty(difficulty, grade);
+            let stability: Stability =
+                new_stability(difficulty, stability, retr, grade, &scheduling.weights);
+            let difficulty: Difficulty = new_difficulty(difficulty, grade, &scheduling.weights);
             (stability, difficulty, review_count)
         }
     };

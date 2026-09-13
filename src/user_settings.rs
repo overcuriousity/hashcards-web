@@ -24,6 +24,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::params;
 
 use crate::error::Fallible;
+use crate::fsrs::Weights;
 use crate::types::free_days::FreeDays;
 use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
@@ -37,6 +38,7 @@ pub const KEY_BURY_SIBLINGS: &str = "setting.bury_siblings";
 pub const KEY_MAX_REVIEWS: &str = "setting.max_reviews_per_day";
 pub const KEY_MAX_NEW: &str = "setting.max_new_per_day";
 pub const KEY_FREE_DAYS: &str = "setting.free_days";
+pub const KEY_WEIGHTS: &str = "setting.weights";
 
 /// What one user asks for, in place of the instance's settings.
 ///
@@ -51,6 +53,7 @@ pub struct UserSettings {
     pub bury_siblings: Option<bool>,
     pub limits: DailyLimits,
     pub free_days: Option<FreeDays>,
+    pub weights: Option<Weights>,
 }
 
 /// One warning per unreadable value, naming the key, so that a setting
@@ -117,6 +120,7 @@ pub fn read_settings(conn: &Connection) -> UserSettings {
         },
         free_days: get(KEY_FREE_DAYS)
             .and_then(|v| lenient(KEY_FREE_DAYS, FreeDays::parse_list(&v))),
+        weights: get(KEY_WEIGHTS).and_then(|v| lenient(KEY_WEIGHTS, Weights::parse_list(&v))),
     }
 }
 
@@ -169,6 +173,7 @@ pub fn write_settings(conn: &mut Connection, settings: &UserSettings) -> Fallibl
             KEY_FREE_DAYS,
             settings.free_days.map(|v| v.to_list().join(",")),
         )?;
+        put(KEY_WEIGHTS, settings.weights.map(|w| w.to_list()))?;
     }
     tx.commit()?;
     Ok(())
@@ -199,6 +204,11 @@ mod tests {
                 new: Some(0),
             },
             free_days: Some(FreeDays::parse_list("sat,sun")?),
+            weights: Some(Weights::new({
+                let mut w = Weights::DEFAULT;
+                w[0] = 0.5;
+                w
+            })?),
         };
         db.save_user_settings(&settings)?;
         assert_eq!(db.user_settings(), settings);
@@ -241,6 +251,16 @@ mod tests {
             Some(MaxInterval::new(365.0)?),
             "its neighbour survives"
         );
+        Ok(())
+    }
+
+    /// A weight vector that will not parse costs the weights and nothing
+    /// else, as every other unreadable setting does.
+    #[test]
+    fn junk_weights_inherit() -> Fallible<()> {
+        let db = UserDatabase::memory()?;
+        db.put_meta_for_test(KEY_WEIGHTS, "1, 2, 3")?;
+        assert_eq!(db.user_settings().weights, None);
         Ok(())
     }
 

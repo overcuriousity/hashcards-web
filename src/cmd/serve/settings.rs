@@ -40,6 +40,7 @@ use crate::cmd::serve::state::AppState;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::flash::Flash;
+use crate::fsrs::Weights;
 use crate::types::free_days::FreeDays;
 use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
@@ -83,6 +84,8 @@ pub struct SettingsForm {
     pub free_sat: Option<String>,
     #[serde(default)]
     pub free_sun: Option<String>,
+    #[serde(default)]
+    pub weights: String,
 }
 
 /// A blank box is "inherit"; anything else is validated by the newtype that
@@ -136,8 +139,32 @@ pub fn settings_from_form(form: &SettingsForm) -> Fallible<UserSettings> {
             new: DailyLimits::parse(&form.max_new_per_day)?,
         },
         free_days: Some(FreeDays::new(free_days)?),
+        weights: parse_weights(&form.weights)?,
     })
 }
+
+/// A blank box inherits. Emptying it is how the page offers "back to the
+/// defaults": pasting today's defaults back in would freeze them into the
+/// user's settings, so that improving them later would skip this user.
+fn parse_weights(raw: &str) -> Fallible<Option<Weights>> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    Weights::parse_list(raw).map(Some)
+}
+
+/// What each block of the vector governs, so the numbers are not 19
+/// anonymous floats.
+const WEIGHT_GROUPS: [(&str, &str); 5] = [
+    ("0-3", "initial stability, one per grade"),
+    ("4-5", "initial difficulty"),
+    ("6-7", "how difficulty moves with each grade"),
+    (
+        "8-16",
+        "how stability grows on success and collapses on a lapse",
+    ),
+    ("17-18", "same-day reviews"),
+];
 
 /// What the boxes say when the user has set nothing: the value that is in
 /// force, and where it came from.
@@ -275,6 +302,30 @@ pub fn render_settings(
                                 input type="checkbox" name=(name);
                             }
                             " " (label)
+                        }
+                    }
+                }
+
+                h2 { "FSRS weights" }
+                p.hint {
+                    "The 19 numbers the scheduling formulas are built from. The defaults are \
+                     fitted to a large population of other people's reviews; these can be \
+                     fitted to yours. Paste a list from an optimizer, or empty the box to go \
+                     back to the defaults."
+                }
+                div.setting {
+                    textarea.input name="weights" rows="4"
+                        placeholder=(inherited_scheduling.weights.to_list()) {
+                        (user.weights.map(|w| w.to_list()).unwrap_or_default())
+                    }
+                    @if user.weights.is_none() {
+                        (inherited(inherited_scheduling.weights.to_list()))
+                    }
+                    table.weight-table {
+                        tbody {
+                            @for (range, what) in WEIGHT_GROUPS {
+                                tr { td { (range) } td { (what) } }
+                            }
                         }
                     }
                 }
@@ -450,6 +501,56 @@ mod tests {
         assert!(html.contains("0.85"));
         assert!(html.contains("40"));
         Ok(())
+    }
+
+    /// The box holds the whole vector in the format an optimizer emits, so
+    /// a fitted list can be pasted straight in, and the table says what the
+    /// numbers govern.
+    #[test]
+    fn the_weights_box_shows_the_vector_in_force() {
+        let html = render_settings(
+            &UserSettings::default(),
+            Scheduling::default(),
+            DailyLimits::default(),
+            None,
+        )
+        .into_string();
+        assert!(html.contains("name=\"weights\""), "{html}");
+        assert!(html.contains("0.40255"), "{html}");
+        assert!(html.contains("initial stability"), "{html}");
+    }
+
+    #[test]
+    fn a_pasted_weight_vector_is_accepted() -> Fallible<()> {
+        let mut w = Weights::DEFAULT;
+        w[0] = 0.5;
+        let parsed = settings_from_form(&SettingsForm {
+            weights: Weights::new(w)?.to_list(),
+            ..SettingsForm::default()
+        })?;
+        assert_eq!(parsed.weights, Some(Weights::new(w)?));
+        Ok(())
+    }
+
+    /// Blank clears the override, so "back to the defaults" is emptying the
+    /// box rather than pasting today's defaults in and freezing them.
+    #[test]
+    fn an_empty_weights_box_inherits() -> Fallible<()> {
+        assert_eq!(settings_from_form(&SettingsForm::default())?.weights, None);
+        Ok(())
+    }
+
+    /// A bad paste is refused with a message naming the count, because 19
+    /// numbers are hard to eyeball.
+    #[test]
+    fn a_bad_weight_paste_is_refused_with_a_count() {
+        let err = settings_from_form(&SettingsForm {
+            weights: "0.4, 1.2, 3.1".to_string(),
+            ..SettingsForm::default()
+        })
+        .expect_err("three is not nineteen");
+        assert!(err.to_string().contains("19"), "message was: {err}");
+        assert!(err.to_string().contains('3'), "message was: {err}");
     }
 
     /// A field the user has not set says what it inherits, so the page never

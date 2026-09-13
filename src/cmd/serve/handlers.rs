@@ -224,7 +224,10 @@ fn collection_get_inner(
 /// Every slug that can be drilled: a collection or a user-assembled
 /// cross-collection deck.
 pub(super) enum DrillTarget {
-    Collection(ResolvedCollection),
+    // Boxed: a `ResolvedCollection` carries a whole scheduling override
+    // including a 19-number weight vector, which made this enum several
+    // hundred bytes wide for the sake of the variant that is 96.
+    Collection(Box<ResolvedCollection>),
     Deck(ResolvedCustomDeck),
 }
 
@@ -236,7 +239,7 @@ pub(super) fn find_drill_target(
     owner: Option<&str>,
 ) -> Option<DrillTarget> {
     if let Some(rc) = find_collection(state, slug, owner) {
-        return Some(DrillTarget::Collection(rc));
+        return Some(DrillTarget::Collection(Box::new(rc)));
     }
     let decks = state.custom_decks.lock();
     find_custom_deck(&decks, slug, owner).map(DrillTarget::Deck)
@@ -461,7 +464,7 @@ fn collection_start_inner(
         DrillTarget::Collection(rc) => create_session_from_sources(
             state,
             vec![SessionSourceSpec {
-                collection: rc,
+                collection: *rc,
                 decks: selected_decks,
             }],
             limit,
@@ -1632,6 +1635,7 @@ mod tests {
                 reviews: None,
                 new: Some(4),
             },
+            None,
         )?;
         // Re-resolve, so the collection carries the overrides just written.
         let rc = find_collection(&state, "Deck", None)

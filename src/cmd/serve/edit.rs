@@ -172,7 +172,7 @@ fn card_site(
             let cards = parse_deck(&coll_dir)?.cards;
             let target_name = rc.name.clone();
             Ok(CardSite {
-                rc,
+                rc: *rc,
                 coll_dir,
                 cards,
                 target_name,

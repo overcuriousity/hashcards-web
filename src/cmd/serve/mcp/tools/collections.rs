@@ -90,12 +90,18 @@ pub(super) fn set_scheduling_for(
         Some(v) => Some(MaxInterval::new(v)?),
         None => None,
     };
-    // The limits already in the file are read back and written through:
-    // this function rewrites the whole file, so passing anything else here
-    // would erase a collection's daily limits every time a model touched
-    // its retention.
+    // The limits and weights already in the file are read back and written
+    // through: this function rewrites the whole file, so passing anything
+    // else here would erase a collection's daily limits -- and its fitted
+    // weights -- every time a model touched its retention.
     let existing = collection_overrides(&rc.coll_dir);
-    write_collection_overrides(&rc.coll_dir, retention, max_interval, existing.limits)?;
+    write_collection_overrides(
+        &rc.coll_dir,
+        retention,
+        max_interval,
+        existing.limits,
+        existing.weights,
+    )?;
     Ok(format!("Scheduling updated for `{slug}`."))
 }
 
