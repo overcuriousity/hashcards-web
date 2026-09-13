@@ -157,6 +157,10 @@ impl Jitter {
         Ok(Jitter(fraction))
     }
 
+    pub fn into_inner(self) -> f64 {
+        self.0
+    }
+
     /// No jitter: intervals are unchanged.
     #[cfg_attr(not(test), allow(dead_code))]
     pub const fn none() -> Jitter {
