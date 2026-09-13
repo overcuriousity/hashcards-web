@@ -131,6 +131,7 @@ pub async fn landing_handler(
 
     let status = LandingStatus {
         config_available,
+        tokens_available: state.auth.is_some(),
         signed_in_as: owner.clone(),
     };
     let html = render_landing_page(&rows, &resume, &status, flash);
@@ -141,6 +142,10 @@ pub async fn landing_handler(
 /// config file is in play, how the sources stand, and who is signed in.
 struct LandingStatus {
     config_available: bool,
+    /// Set when there is a token store to mint against. Without one the
+    /// tokens page can only report that it has nowhere to write, so the
+    /// link to it is not offered.
+    tokens_available: bool,
     /// The logged-in user's email, when `[oidc]` is configured. Drives the
     /// only logout control in the UI.
     signed_in_as: Option<String>,
@@ -237,6 +242,7 @@ fn render_landing_page(
 ) -> Markup {
     let LandingStatus {
         config_available,
+        tokens_available,
         ref signed_in_as,
         ..
     } = *status;
@@ -251,6 +257,9 @@ fn render_landing_page(
                 nav.app-nav {
                     @if config_available {
                         a.nav-link href="/files" { "My cards" }
+                    }
+                    @if tokens_available {
+                        a.nav-link href="/tokens" { "MCP tokens" }
                     }
                     @if signed_in_as.is_some() {
                         // POST, so a third-party page cannot log the user out
@@ -319,6 +328,38 @@ mod tests {
     use crate::cmd::serve::config::DeckMember;
     use crate::cmd::serve::decks::slug_for_deck;
     use crate::error::Fallible;
+
+    /// The MCP token store is reached from `/tokens`, and for its whole
+    /// first release nothing on any page linked there: the endpoint, the
+    /// tools and the minting page all worked, and a user who had not read
+    /// the changelog had no way to find out. The nav link is the feature's
+    /// only entrance.
+    #[test]
+    fn the_landing_page_links_to_the_tokens_page() {
+        let status = LandingStatus {
+            config_available: true,
+            tokens_available: true,
+            signed_in_as: None,
+        };
+        let html = render_landing_page(&[], &HashMap::new(), &status, None).into_string();
+        assert!(
+            html.contains("href=\"/tokens\""),
+            "the landing page must link to the tokens page: {html}"
+        );
+    }
+
+    /// Without a token store the page has nothing to mint against, so the
+    /// link would lead only to an error.
+    #[test]
+    fn no_token_store_means_no_tokens_link() {
+        let status = LandingStatus {
+            config_available: true,
+            tokens_available: false,
+            signed_in_as: None,
+        };
+        let html = render_landing_page(&[], &HashMap::new(), &status, None).into_string();
+        assert!(!html.contains("href=\"/tokens\""));
+    }
 
     /// A deck the user saved must stay on the list even when its counts
     /// cannot be worked out. It used to be logged and dropped, so a deck

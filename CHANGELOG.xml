@@ -4,7 +4,8 @@
             <change author="claude">
             **An MCP endpoint at `/mcp`,** so an AI assistant can read and
             write your cards, decks and collections through the same code
-            the web interface runs. Mint a token for yourself at `/tokens`:
+            the web interface runs. Mint a token for yourself from the **MCP
+            tokens** link on the front page:
             it is shown once and stored only as a digest, so nobody can read
             it back out of the server. Every token can write, and anyone
             holding one can do anything to your cards that you can. Cards,
