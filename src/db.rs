@@ -753,6 +753,39 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// How many cards this collection introduced today: those whose first
+    /// surviving review is today, counted once however often they have been
+    /// seen since.
+    ///
+    /// `voided = 0` inside the grouping rather than outside it, so that
+    /// undoing a card's only review makes it new again rather than leaving
+    /// it introduced by a review that no longer exists.
+    pub fn new_cards_today_count(&self, today: Date) -> Fallible<usize> {
+        let conn = self.conn.lock();
+        let sql = "select count(*) from ( \
+                     select card_hash, min(reviewed_at) as first_at from reviews \
+                     where collection_id = ? and voided = 0 group by card_hash \
+                   ) where substr(first_at, 1, 10) = ?;";
+        let count: i64 = conn.query_row(sql, params![self.collection, today], |r| r.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// The cards in this collection that have never been reviewed.
+    ///
+    /// A set rather than a count: the session builder needs to know which
+    /// card it is holding, not how many there are.
+    pub fn new_cards(&self) -> Fallible<HashSet<CardHash>> {
+        let conn = self.conn.lock();
+        let sql = "select card_hash from cards where collection_id = ? and review_count = 0;";
+        let mut stmt = conn.prepare(sql)?;
+        let mut out = HashSet::new();
+        let mut rows = stmt.query(params![self.collection])?;
+        while let Some(row) = rows.next()? {
+            out.insert(row.get::<_, CardHash>(0)?);
+        }
+        Ok(out)
+    }
+
     /// Get the list of all sessions in the database.
     pub fn get_all_sessions(&self) -> Fallible<Vec<SessionRow>> {
         let conn = self.conn.lock();
@@ -1173,10 +1206,112 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
     use crate::fsrs::Grade;
     use crate::types::collection_id::CollectionId;
     use crate::types::performance::ReviewedPerformance;
     use crate::user_db::UserDatabase;
+
+    /// A review row on `day`, written straight in.
+    /// `insert_review_immediately` is the test-only writer the surrounding
+    /// tests use.
+    fn review_on(db: &Database, session_id: i64, hash: CardHash, day: NaiveDate) -> Fallible<i64> {
+        let at = Timestamp::new(day.and_hms_opt(9, 0, 0).expect("valid time"));
+        db.insert_review_immediately(
+            session_id,
+            &ReviewRecord {
+                card_hash: hash,
+                reviewed_at: at,
+                grade: Grade::Good,
+                stability: 2.0,
+                difficulty: 5.0,
+                interval_raw: 3.0,
+                interval_days: 3,
+                due_date: Date::new(day),
+                duration_ms: None,
+            },
+        )
+    }
+
+    /// A card counts as introduced today when its *first* surviving review
+    /// is today, however many times it has been seen since. A card first
+    /// seen yesterday is not new today, even though it was reviewed today.
+    #[test]
+    fn todays_new_count_is_cards_first_seen_today() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let db = user.collection(CollectionId::new("bio")?);
+        let today = NaiveDate::from_ymd_opt(2026, 9, 13).expect("valid date");
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 12).expect("valid date");
+        let session =
+            db.create_session(Timestamp::new(today.and_hms_opt(8, 0, 0).expect("valid")))?;
+
+        let old = CardHash::hash_bytes(b"seen yesterday");
+        let fresh = CardHash::hash_bytes(b"seen today");
+        db.insert_card(old, Timestamp::now())?;
+        db.insert_card(fresh, Timestamp::now())?;
+
+        review_on(&db, session, old, yesterday)?;
+        review_on(&db, session, old, today)?;
+        review_on(&db, session, fresh, today)?;
+        review_on(&db, session, fresh, today)?;
+
+        assert_eq!(
+            db.new_cards_today_count(Date::new(today))?,
+            1,
+            "only the card first seen today, counted once"
+        );
+        Ok(())
+    }
+
+    /// An undone review is work that did not happen. Voiding the only
+    /// review a card has makes it new again, exactly as it makes the review
+    /// vanish from every other read path.
+    #[test]
+    fn a_voided_first_review_does_not_introduce_a_card() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let db = user.collection(CollectionId::new("bio")?);
+        let today = NaiveDate::from_ymd_opt(2026, 9, 13).expect("valid date");
+        let session =
+            db.create_session(Timestamp::new(today.and_hms_opt(8, 0, 0).expect("valid")))?;
+        let hash = CardHash::hash_bytes(b"undone");
+        db.insert_card(hash, Timestamp::now())?;
+        let review_id = review_on(&db, session, hash, today)?;
+
+        assert_eq!(db.new_cards_today_count(Date::new(today))?, 1);
+        db.void_review_and_restore_performance(review_id, hash, Performance::New, None)?;
+        assert_eq!(db.new_cards_today_count(Date::new(today))?, 0);
+        Ok(())
+    }
+
+    /// The set a session filters against: cards with no reviews at all.
+    #[test]
+    fn new_cards_are_the_ones_never_reviewed() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let db = user.collection(CollectionId::new("bio")?);
+        let untouched = CardHash::hash_bytes(b"never seen");
+        let seen = CardHash::hash_bytes(b"seen once");
+        let now = Timestamp::now();
+        db.insert_card(untouched, now)?;
+        db.insert_card(seen, now)?;
+        db.update_card_performance(
+            seen,
+            Performance::Reviewed(ReviewedPerformance {
+                last_reviewed_at: now,
+                stability: 2.0,
+                difficulty: 5.0,
+                interval_raw: 3.0,
+                interval_days: 3,
+                due_date: now.date(),
+                review_count: 1,
+            }),
+        )?;
+
+        let new = db.new_cards()?;
+        assert!(new.contains(&untouched));
+        assert!(!new.contains(&seen));
+        Ok(())
+    }
 
     /// The spec's central promise: the same card text in two collections
     /// keeps two schedules. Two files necessarily meant two schedules, so
