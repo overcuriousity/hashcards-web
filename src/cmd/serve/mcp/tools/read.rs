@@ -40,6 +40,7 @@ use crate::parser::parse_deck;
 use crate::types::card::Card;
 use crate::types::card::CardContent;
 use crate::types::card_hash::CardHash;
+use crate::types::date::Date;
 use crate::types::timestamp::Timestamp;
 
 /// Every tool answers a `Fallible`, and every failure reaches the model as
@@ -314,6 +315,9 @@ pub(super) fn list_cards_for(
                 continue;
             }
         }
+        if out.len() >= limit {
+            break;
+        }
         out.push(CardSummary {
             hash: card.hash().to_string(),
             deck: card.deck_name().to_string(),
@@ -321,9 +325,6 @@ pub(super) fn list_cards_for(
             kind: kind_of(card),
             due: is_due,
         });
-        if out.len() >= limit {
-            break;
-        }
     }
     Ok(out)
 }
@@ -402,6 +403,23 @@ pub(super) fn collection_stats_for(
     })
 }
 
+/// How many cards one collection holds, and how many of them are due.
+fn collection_counts(
+    state: &AppState,
+    rc: &ResolvedCollection,
+    today: Date,
+) -> Fallible<(usize, usize)> {
+    let cards = parse_deck(&rc.coll_dir)?.cards;
+    let db = open_collection_db(state, rc)?;
+    let due = db.due_today(today)?;
+    let seen = db.card_hashes()?;
+    let due_today = cards
+        .iter()
+        .filter(|c| due.contains(&c.hash()) || !seen.contains(&c.hash()))
+        .count();
+    Ok((cards.len(), due_today))
+}
+
 /// Counts across every collection the caller owns.
 ///
 /// Cheap now that one database holds them all: the connection is opened
@@ -414,18 +432,21 @@ pub(super) fn user_stats_for(
     let today = Timestamp::now().date();
     let mut collections = Vec::new();
     for rc in existing_collections_for_user(state, user) {
-        let cards = parse_deck(&rc.coll_dir)?.cards;
-        let db = open_collection_db(state, &rc)?;
-        let due = db.due_today(today)?;
-        let seen = db.card_hashes()?;
-        let due_today = cards
-            .iter()
-            .filter(|c| due.contains(&c.hash()) || !seen.contains(&c.hash()))
-            .count();
+        // One collection that will not load must not take the overview down
+        // with it: a single typo in one deck would hide every other
+        // collection the caller has. Counted as empty and logged, which is
+        // what the landing page does with the same failure.
+        let (total_cards, due_today) = match collection_counts(state, &rc, today) {
+            Ok(counts) => counts,
+            Err(e) => {
+                log::warn!("Failed to load collection '{}': {e}", rc.name);
+                (0, 0)
+            }
+        };
         collections.push(CollectionCounts {
             slug: rc.slug,
             name: rc.name,
-            total_cards: cards.len(),
+            total_cards,
             due_today,
         });
     }
@@ -726,6 +747,44 @@ mod tests {
             list_cards_for(&mcp.state, None, "Spanish", None, false, None, 1)?.len(),
             1
         );
+        Ok(())
+    }
+
+    /// Regression: the check ran after the push, so a zero limit -- which
+    /// the schema advertises as "at most this many" -- returned one card.
+    #[test]
+    fn listing_cards_with_a_limit_of_zero_returns_nothing() -> Fallible<()> {
+        let (_dir, mcp) = mcp_fixture()?;
+        assert!(list_cards_for(&mcp.state, None, "Spanish", None, false, None, 0)?.is_empty());
+        Ok(())
+    }
+
+    /// Regression: one deck that will not parse made the whole
+    /// cross-collection overview an error, so a single typo hid every other
+    /// collection. Every other aggregate path logs and carries on.
+    #[test]
+    fn a_collection_that_will_not_load_does_not_hide_the_others() -> Fallible<()> {
+        let (dir, mcp) = mcp_fixture()?;
+        let root = CardRoot::for_user(dir.path(), None)?;
+        std::fs::create_dir_all(root.path().join("German"))?;
+        std::fs::write(
+            root.path().join("German/nouns.md"),
+            "A: an answer with no question\n",
+        )?;
+        crate::cmd::serve::cards::collection_id(&root.path().join("German"))?;
+        let stats = user_stats_for(&mcp.state, None)?;
+        let spanish = stats
+            .collections
+            .iter()
+            .find(|c| c.slug == "Spanish")
+            .ok_or_else(|| ErrorReport::new("the broken collection hid the working one"))?;
+        assert_eq!(spanish.total_cards, 2);
+        let german = stats
+            .collections
+            .iter()
+            .find(|c| c.slug == "German")
+            .ok_or_else(|| ErrorReport::new("the broken collection vanished"))?;
+        assert_eq!(german.total_cards, 0);
         Ok(())
     }
 

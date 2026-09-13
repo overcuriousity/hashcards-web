@@ -250,18 +250,34 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
 ///
 /// `None` for either value removes that override, so the collection falls
 /// back to the instance default.
+///
+/// A file the parser rejects is refused rather than rewritten. Reading one
+/// is deliberately lenient -- the id is salvaged by eye so a syntax slip
+/// cannot cost a collection its history -- but writing from a salvaged id
+/// would rewrite the file as the id plus these two values and throw away
+/// whatever the user was in the middle of.
 pub fn write_collection_overrides(
     folder: &Path,
     retention: Option<DesiredRetention>,
     max_interval: Option<MaxInterval>,
 ) -> Fallible<()> {
+    let meta_path = folder.join(COLLECTION_META_FILE);
+    if let Ok(text) = read_to_string(&meta_path) {
+        if let Err(e) = toml::from_str::<CollectionMeta>(&text) {
+            return fail(format!(
+                "{} is not valid TOML ({e}), so its scheduling was left alone rather than \
+                 rewritten over what is there. Fix the file, then set the scheduling again.",
+                meta_path.display()
+            ));
+        }
+    }
     let id = collection_id(folder)?;
     let meta = CollectionMeta {
         id: id.to_string(),
         desired_retention: retention.map(|r| toml::Value::Float(r.into_inner())),
         max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
     };
-    write(folder.join(COLLECTION_META_FILE), toml::to_string(&meta)?)?;
+    write(&meta_path, toml::to_string(&meta)?)?;
     Ok(())
 }
 
@@ -840,6 +856,30 @@ mod tests {
             std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,
             broken,
             "the user's file must not be rewritten under them"
+        );
+        Ok(())
+    }
+
+    /// Regression: the overrides were rewritten from the salvaged id alone,
+    /// so setting a retention over a hand-edited file silently threw away
+    /// whatever the user was in the middle of. The same leniency that keeps
+    /// the collection readable must not license writing over it.
+    #[test]
+    fn overrides_are_refused_over_a_metadata_file_that_does_not_parse() -> Fallible<()> {
+        let (_dir, root) = fixture()?;
+        let folder = root.path().join("Spanish");
+        std::fs::create_dir_all(&folder)?;
+        let id = collection_id(&folder)?;
+        let broken = format!("id = \"{id}\"\ndesired retention = 0.95\n");
+        std::fs::write(folder.join(COLLECTION_META_FILE), &broken)?;
+
+        let err = write_collection_overrides(&folder, Some(DesiredRetention::new(0.9)?), None)
+            .unwrap_err();
+        assert!(err.message().contains("TOML"), "{}", err.message());
+        assert_eq!(
+            std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,
+            broken,
+            "the user's file was overwritten anyway"
         );
         Ok(())
     }

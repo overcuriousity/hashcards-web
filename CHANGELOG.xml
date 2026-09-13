@@ -93,6 +93,54 @@
         </breaking>
         <fixed>
             <change author="claude">
+            **Emptying the trash no longer erases the review history of a
+            deck that was moved to another collection.** Erasing a purged
+            collection's rows deleted every session it had started, and a
+            review belongs to a session: a card moved out of the collection
+            took its reviews with it, but those reviews still hung from a
+            session the old collection owned, so deleting it took them too.
+            The destination kept the card and its schedule and silently lost
+            every review behind it -- its history, its retention and its
+            forecast all blank, with nothing said and nothing to undo. A
+            session is now only deleted once no review is left hanging from
+            it.
+            </change>
+            <change author="claude">
+            **Restoring a deck whose collection is also in the trash now says
+            so instead of stranding both.** The restore recreated the missing
+            collection folder, but as a bare folder without the
+            `.hashcards.toml` still sitting in the trash with the collection
+            -- so the folder minted itself a fresh id, the restored deck's
+            review history was unreachable under it, and restoring the
+            collection afterwards failed because the name was taken. Neither
+            could be got back. The restore is now refused with a message
+            naming the collection to bring back first.
+            </change>
+            <change author="claude">
+            **Setting a collection's scheduling over a hand-edited
+            `.hashcards.toml` no longer overwrites it.** A metadata file the
+            TOML parser rejects is read leniently -- the id is found by eye,
+            so a syntax slip cannot cost a collection its review history --
+            but the rewrite then wrote the file back as that id plus the two
+            scheduling values, throwing away whatever was being edited.
+            Writing is now refused while the file does not parse.
+            </change>
+            <change author="claude">
+            **A collection that will not load no longer hides every other one
+            from an assistant.** One deck with a syntax error or a missing
+            image made the whole cross-collection overview an error. It is
+            now counted as empty and logged, which is what the front page
+            already did with the same failure.
+            </change>
+            <change author="claude">
+            **Adding a card through an assistant now notices a concurrent
+            edit.** The deck file's contents were read before its
+            modification time, so an edit landing between the two passed the
+            check made just before the write and was silently overwritten by
+            a buffer built from the older text. Also, asking an assistant for
+            at most zero cards returns none rather than one.
+            </change>
+            <change author="claude">
             **Moving a deck between collections no longer strands its review
             history when `data_dir` is reached through a symlink.** The move
             picks the cards whose schedules follow the file by comparing

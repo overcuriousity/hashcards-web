@@ -60,6 +60,13 @@ pub(super) fn create_card_for(
             "There is no deck called `{deck}` in `{slug}`. Create it first with create_deck."
         )));
     }
+    // The mtime is read before the contents, not after: `save_file`
+    // re-checks it just before the rename, and that check is only worth
+    // anything if the stamp is at least as old as the text `next` is built
+    // from. Read the other way round, a write landing in between passed the
+    // check and was silently overwritten. `locate` reads them in this order
+    // for the same reason.
+    let mtime = file_mtime_ms(&entry.path)?;
     let existing = std::fs::read_to_string(&entry.path)?;
     let trimmed = existing.trim_end();
     let mut next = String::from(trimmed);
@@ -68,9 +75,6 @@ pub(super) fn create_card_for(
     }
     next.push_str(card.trim());
     next.push('\n');
-    // The mtime is read here rather than carried by the model: `save_file`
-    // re-checks it just before the rename, which is what closes the window.
-    let mtime = file_mtime_ms(&entry.path)?;
     save_file(state, user, &entry.rel, &next, mtime)?;
     Ok(format!("Added a card to `{deck}`."))
 }

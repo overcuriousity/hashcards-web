@@ -311,12 +311,44 @@ pub fn restore_from_trash(data_dir: &Path, root: &CardRoot, id: &TrashId) -> Fal
         ));
     }
     // The collection this belonged to may itself have been deleted since.
+    // If it went to the trash rather than off the disk, recreating it as a
+    // bare folder here would be the wrong answer: it would arrive without
+    // its `.hashcards.toml`, so discovery would mint a fresh id and the
+    // restored deck's review rows would be unreachable, and the collection
+    // entry could then never be restored over the folder standing in its
+    // place. Say which one to bring back first instead.
     if let Some(parent) = target.path.parent() {
+        if !parent.is_dir() {
+            if let Some(ancestor) = trashed_ancestor(data_dir, tree, &target.rel)? {
+                return fail(format!(
+                    "`{ancestor}` is in the trash too, so `{}` has nowhere to go back to. \
+                     Restore `{ancestor}` first.",
+                    target.rel
+                ));
+            }
+        }
         ensure_dir(parent, "card folder")?;
     }
     move_path(&dir.join(CONTENT), &target.path)?;
     std::fs::remove_dir_all(&dir)?;
     Ok(target.rel)
+}
+
+/// The trashed folder or collection `rel` used to live inside, if one is
+/// still in the trash.
+///
+/// Compared segment by segment: a string prefix would call `Spanish` an
+/// ancestor of `Spanish Advanced/verbs.md`.
+fn trashed_ancestor(data_dir: &Path, tree: &str, rel: &str) -> Fallible<Option<String>> {
+    let segments: Vec<&str> = rel.split('/').collect();
+    let found = list_trash(data_dir, tree)?.into_iter().find(|entry| {
+        if entry.kind == TrashKind::File {
+            return false;
+        }
+        let theirs: Vec<&str> = entry.original_path.split('/').collect();
+        theirs.len() < segments.len() && segments.starts_with(&theirs)
+    });
+    Ok(found.map(|entry| entry.original_path))
 }
 
 /// Destroy one trashed entry.
@@ -590,6 +622,55 @@ mod tests {
         )?;
         std::fs::remove_dir_all(root.path().join("Spanish"))?;
         restore_from_trash(&data_dir, &root, &id)?;
+        assert!(root.path().join("Spanish/verbs.md").is_file());
+        Ok(())
+    }
+
+    /// Regression: the parent was recreated as a bare folder even when the
+    /// collection itself was sitting in the trash. Discovery then minted a
+    /// fresh id for it, so the restored deck's review history was
+    /// unreachable, and restoring the collection afterwards failed with
+    /// "already exists" -- the user could get neither back.
+    #[test]
+    fn restoring_into_a_collection_that_is_itself_trashed_is_refused() -> Fallible<()> {
+        let (_dir, data_dir, root) = fixture()?;
+        std::fs::write(
+            root.path().join("Spanish/.hashcards.toml"),
+            "id = \"abc12345\"\n",
+        )?;
+        let deck = move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish/verbs.md",
+            TrashKind::File,
+            None,
+            Timestamp::now(),
+        )?;
+        move_to_trash(
+            &data_dir,
+            &root,
+            "Spanish",
+            TrashKind::Collection,
+            Some(CollectionId::new("abc12345")?),
+            Timestamp::now(),
+        )?;
+
+        let err = restore_from_trash(&data_dir, &root, &deck).unwrap_err();
+        assert!(err.message().contains("Spanish"), "{}", err.message());
+        assert!(
+            !root.path().join("Spanish").exists(),
+            "the restore created a bare collection folder anyway"
+        );
+        assert_eq!(list_trash(&data_dir, "default")?.len(), 2);
+
+        // And with the collection back first, the deck restores into it.
+        let collection = list_trash(&data_dir, "default")?
+            .into_iter()
+            .find(|e| e.kind == TrashKind::Collection)
+            .map(|e| e.id)
+            .ok_or_else(|| ErrorReport::new("the collection left the trash"))?;
+        restore_from_trash(&data_dir, &root, &collection)?;
+        restore_from_trash(&data_dir, &root, &deck)?;
         assert!(root.path().join("Spanish/verbs.md").is_file());
         Ok(())
     }

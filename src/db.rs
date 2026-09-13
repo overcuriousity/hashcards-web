@@ -846,6 +846,14 @@ impl Database {
     /// cascade; the sessions have no card to hang from and are deleted
     /// explicitly. One transaction, so a collection is never half-erased.
     ///
+    /// A session is only deleted once nothing is left hanging from it. A
+    /// card moved out of this collection took its reviews with it by
+    /// `on update cascade`, but those reviews still name a session this
+    /// collection started -- and `reviews.session_id` cascades on delete, so
+    /// deleting the session unconditionally would destroy *another*
+    /// collection's history. The row left behind is an orphan session,
+    /// which is what a deleted collection's card rows are too.
+    ///
     /// This permanently destroys the collection's review history. It does
     /// not go through the `voided` audit trail that undo uses.
     pub fn erase(&self) -> Fallible<()> {
@@ -856,7 +864,8 @@ impl Database {
             params![self.collection],
         )?;
         tx.execute(
-            "delete from sessions where collection_id = ?;",
+            "delete from sessions where collection_id = ? \
+             and session_id not in (select session_id from reviews);",
             params![self.collection],
         )?;
         tx.commit()?;

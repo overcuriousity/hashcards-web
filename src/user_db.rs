@@ -603,6 +603,53 @@ mod tests {
         Ok(())
     }
 
+    /// Erasing a collection must not reach into another one's history.
+    ///
+    /// Regression: `erase` deleted every session row the collection owned,
+    /// and `reviews.session_id` cascades on delete. A card moved out of the
+    /// collection took its reviews with it by `on update cascade`, but those
+    /// reviews still hung from a session the *source* owned -- so deleting
+    /// the source and emptying the trash silently destroyed the
+    /// destination's review log while leaving its schedule in place.
+    #[test]
+    fn erasing_a_collection_keeps_the_reviews_of_cards_moved_out_of_it() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let from = CollectionId::new("aaaaaaaa")?;
+        let to = CollectionId::new("bbbbbbbb")?;
+        let hash = CardHash::hash_bytes(b"a card");
+        let now = Timestamp::now();
+
+        let source = user.collection(from.clone());
+        source.insert_card(hash, now)?;
+        let session = source.create_session(now)?;
+        source.insert_review_immediately(
+            session,
+            &ReviewRecord {
+                card_hash: hash,
+                reviewed_at: now,
+                grade: Grade::Good,
+                stability: 1.0,
+                difficulty: 2.0,
+                interval_raw: 1.0,
+                interval_days: 1,
+                due_date: now.date(),
+                duration_ms: None,
+            },
+        )?;
+        assert_eq!(user.move_cards(&from, &to, &[hash])?, 1);
+
+        user.collection(from).erase()?;
+
+        let dest = user.collection(to);
+        assert!(dest.card_hashes()?.contains(&hash));
+        assert_eq!(
+            dest.reviews_for_card(hash)?.len(),
+            1,
+            "erasing the source collection destroyed the destination's review history"
+        );
+        Ok(())
+    }
+
     #[test]
     fn moving_a_card_to_where_it_already_is_does_nothing() -> Fallible<()> {
         let user = UserDatabase::memory()?;
