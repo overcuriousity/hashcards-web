@@ -17,5 +17,6 @@ pub mod card;
 pub mod card_hash;
 pub mod collection_id;
 pub mod date;
+pub mod free_days;
 pub mod performance;
 pub mod timestamp;
