@@ -786,6 +786,44 @@ impl Database {
         Ok(out)
     }
 
+    /// Every card's surviving reviews, in order, as `(days since that
+    /// card's previous review, grade)`.
+    ///
+    /// The optimizer's input. Elapsed time comes from the timestamps, so it
+    /// is the *real* gap: a free-day shift or a review taken late is
+    /// accounted for rather than assumed away.
+    ///
+    /// Ordered by card and then by time, so one pass builds the sequences.
+    pub fn review_sequences(&self) -> Fallible<Vec<Vec<(f64, Grade)>>> {
+        let conn = self.conn.lock();
+        let sql = "select card_hash, reviewed_at, grade from reviews \
+                   where collection_id = ? and voided = 0 \
+                   order by card_hash, reviewed_at;";
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![self.collection])?;
+        let mut out: Vec<Vec<(f64, Grade)>> = Vec::new();
+        let mut current: Option<(CardHash, Timestamp)> = None;
+        while let Some(row) = rows.next()? {
+            let hash: CardHash = row.get(0)?;
+            let at: Timestamp = row.get(1)?;
+            let grade: Grade = row.get(2)?;
+            let same_card = matches!(&current, Some((prev, _)) if *prev == hash);
+            match (&current, out.last_mut()) {
+                (Some((_, prev_at)), Some(seq)) if same_card => {
+                    // Clamped for the reason `update_performance` clamps: a
+                    // clock rollback must not make time run backwards.
+                    let days = (at.date().into_inner() - prev_at.date().into_inner())
+                        .num_days()
+                        .max(0) as f64;
+                    seq.push((days, grade));
+                }
+                _ => out.push(vec![(0.0, grade)]),
+            }
+            current = Some((hash, at));
+        }
+        Ok(out)
+    }
+
     /// Get the list of all sessions in the database.
     pub fn get_all_sessions(&self) -> Fallible<Vec<SessionRow>> {
         let conn = self.conn.lock();
@@ -1232,6 +1270,61 @@ mod tests {
                 duration_ms: None,
             },
         )
+    }
+
+    /// The optimizer's input: per card, in order, how long since that card
+    /// was last seen and what the grade was.
+    #[test]
+    fn review_sequences_are_per_card_and_in_order() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let db = user.collection(CollectionId::new("bio")?);
+        let day = |n: i64| {
+            NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date") + chrono::Duration::days(n)
+        };
+        let session =
+            db.create_session(Timestamp::new(day(0).and_hms_opt(8, 0, 0).expect("valid")))?;
+        let a = CardHash::hash_bytes(b"card a");
+        let b = CardHash::hash_bytes(b"card b");
+        db.insert_card(a, Timestamp::now())?;
+        db.insert_card(b, Timestamp::now())?;
+
+        review_on(&db, session, a, day(0))?;
+        review_on(&db, session, a, day(3))?;
+        review_on(&db, session, a, day(10))?;
+        let voided = review_on(&db, session, b, day(1))?;
+        review_on(&db, session, b, day(5))?;
+        db.void_review_and_restore_performance(voided, b, Performance::New, None)?;
+
+        let mut seqs = db.review_sequences()?;
+        seqs.sort_by_key(|s| s.len());
+
+        assert_eq!(seqs.len(), 2);
+        // Card b: one surviving review, the voided one gone entirely.
+        assert_eq!(seqs[0].len(), 1);
+        assert_eq!(seqs[0][0].0, 0.0, "a card's first review has no gap");
+        // Card a: three reviews, gaps 0, 3, 7.
+        let gaps: Vec<f64> = seqs[1].iter().map(|(dt, _)| *dt).collect();
+        assert_eq!(gaps, vec![0.0, 3.0, 7.0]);
+        Ok(())
+    }
+
+    /// A card with a single review teaches the fit nothing about intervals,
+    /// but it is still a first observation and must not be dropped.
+    #[test]
+    fn a_single_review_is_still_a_sequence() -> Fallible<()> {
+        let user = UserDatabase::memory()?;
+        let db = user.collection(CollectionId::new("bio")?);
+        let day = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let session =
+            db.create_session(Timestamp::new(day.and_hms_opt(8, 0, 0).expect("valid")))?;
+        let hash = CardHash::hash_bytes(b"lonely");
+        db.insert_card(hash, Timestamp::now())?;
+        review_on(&db, session, hash, day)?;
+
+        let seqs = db.review_sequences()?;
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0].len(), 1);
+        Ok(())
     }
 
     /// A card counts as introduced today when its *first* surviving review

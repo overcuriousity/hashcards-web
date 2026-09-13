@@ -20,6 +20,8 @@ use rusqlite::types::ToSqlOutput;
 use rusqlite::types::ValueRef;
 use serde::Serialize;
 
+pub mod optimize;
+
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
@@ -35,7 +37,7 @@ use crate::error::fail;
 /// at 9 and 12 are negated where they are used -- `s.powf(-W[9])`,
 /// `d.powf(-W[12])` -- so they are stored positive here where the published
 /// table writes them negative.
-const BOUNDS: [(f64, f64); 19] = [
+pub(crate) const BOUNDS: [(f64, f64); 19] = [
     (0.001, 100.0), // 0  initial stability, Forgot
     (0.001, 100.0), // 1  initial stability, Hard
     (0.001, 100.0), // 2  initial stability, Good
