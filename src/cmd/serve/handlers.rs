@@ -716,9 +716,10 @@ fn bury_for(state: &AppState, sources: &[SessionSourceSpec]) -> bool {
 pub(super) fn deck_card_counts(
     state: &AppState,
     sources: &[SessionSourceSpec],
-) -> Fallible<(usize, usize)> {
+) -> Fallible<(usize, usize, usize)> {
     let today = Timestamp::now().date();
     let mut due_total = 0;
+    let mut due_uncapped = 0;
     let mut card_total = 0;
     // The due count is the size of the session this deck's Drill button
     // starts, so it is filtered exactly as the queue is: one card per
@@ -769,16 +770,16 @@ pub(super) fn deck_card_counts(
             .filter(|c| wanted.contains(c.deck_name().as_str()))
         {
             card_total += 1;
-            if due.contains(&card.hash())
-                && queued.insert(card.hash())
-                && burial.admits(card)
-                && budget.admits(new_cards.contains(&card.hash()))
-            {
-                due_total += 1;
+            if due.contains(&card.hash()) && queued.insert(card.hash()) && burial.admits(card) {
+                // What is really waiting, before any cap.
+                due_uncapped += 1;
+                if budget.admits(new_cards.contains(&card.hash())) {
+                    due_total += 1;
+                }
             }
         }
     }
-    Ok((due_total, card_total))
+    Ok((due_total, due_uncapped, card_total))
 }
 
 /// The start page for a custom deck: what it contains, how much is due, and
@@ -1699,7 +1700,7 @@ mod tests {
 
         let sources = deck_sources(&state, &deck, None);
         assert_eq!(sources.len(), 2, "both collections must contribute");
-        let (due, _) = super::deck_card_counts(&state, &sources)?;
+        let (due, _, _) = super::deck_card_counts(&state, &sources)?;
 
         let session = create_session_from_sources(&state, sources, None)?
             .ok_or_else(|| ErrorReport::new("the session held no cards"))?;

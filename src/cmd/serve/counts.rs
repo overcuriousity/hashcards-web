@@ -36,6 +36,19 @@ use crate::user_settings::UserSettings;
 /// cards the session will never show: "Start (12 due)" opening on
 /// "0 of 7". Counting and queueing therefore run through this same filter.
 ///
+/// What a collection's row says about its cards.
+///
+/// `due_today` is the size of the session its Drill button starts;
+/// `due_uncapped` is what is really waiting behind any daily limit. They
+/// differ only when a limit trimmed the queue, and the page shows both so
+/// that a growing backlog is never hidden by a cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CollectionCounts {
+    pub total_cards: usize,
+    pub due_today: usize,
+    pub due_uncapped: usize,
+}
+
 /// Everything a resolved collection says about which due cards actually
 /// reach a queue: whether to bury siblings, and how many cards it will hand
 /// out today.
@@ -63,8 +76,9 @@ impl QueuePolicy {
         }
     }
 
-    /// The instance's answers alone. For the paths that have no user to
-    /// consult -- and for tests.
+    /// The instance's answers alone, for tests. Production always has a
+    /// user to consult, even if it is the one who set nothing.
+    #[cfg(test)]
     pub fn from_defaults(defaults: &DefaultsSection) -> Self {
         Self {
             bury_siblings: defaults.bury_siblings,
@@ -145,19 +159,20 @@ pub fn refresh_collection_info(
             );
             compute_collection_counts(&rc.coll_dir, db, policy)
         });
-        let (total_cards, due_today) = match counts {
+        let counts = match counts {
             Ok(counts) => counts,
             Err(e) => {
                 log::warn!("Failed to load collection '{}': {e}", rc.name);
-                (0, 0)
+                CollectionCounts::default()
             }
         };
 
         infos.push(CollectionInfo {
             name: rc.name.clone(),
             slug: rc.slug.clone(),
-            total_cards,
-            due_today,
+            total_cards: counts.total_cards,
+            due_today: counts.due_today,
+            due_uncapped: counts.due_uncapped,
             owner: rc.owner.clone(),
         });
     }
@@ -194,9 +209,9 @@ pub fn compute_collection_counts(
     coll_dir: &Path,
     db: Database,
     policy: QueuePolicy,
-) -> Fallible<(usize, usize)> {
+) -> Fallible<CollectionCounts> {
     if !coll_dir.exists() {
-        return Ok((0, 0));
+        return Ok(CollectionCounts::default());
     }
 
     let collection = Collection::open(coll_dir.to_path_buf(), db)?;
@@ -219,15 +234,31 @@ pub fn compute_collection_counts(
     // applies them. Filtering in a different order here would count a
     // different set.
     let (mut budget, new_cards) = budget_for(&collection.db, policy.limits, today)?;
-    let due_today = collection
+    // Both counts come from one pass, because `burial.admits` is spent as
+    // it is asked: a second pass would bury against a used-up filter.
+    let mut due_today = 0;
+    let mut due_uncapped = 0;
+    for card in collection
         .cards
         .iter()
         .filter(|c| due_hashes.contains(&c.hash()))
-        .filter(|c| burial.admits(c))
-        .filter(|c| budget.admits(new_cards.contains(&c.hash())))
-        .count();
+    {
+        if !burial.admits(card) {
+            continue;
+        }
+        // What is really waiting, before any cap. A limit must never make a
+        // backlog look like a finished day.
+        due_uncapped += 1;
+        if budget.admits(new_cards.contains(&card.hash())) {
+            due_today += 1;
+        }
+    }
 
-    Ok((total_cards, due_today))
+    Ok(CollectionCounts {
+        total_cards,
+        due_today,
+        due_uncapped,
+    })
 }
 
 #[cfg(test)]

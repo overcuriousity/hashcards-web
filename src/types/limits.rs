@@ -94,12 +94,6 @@ impl DailyBudget {
             }
         }
     }
-
-    /// Whether any limit is in force, so a page can say a count was capped
-    /// rather than silently showing a smaller number.
-    pub fn is_limited(&self) -> bool {
-        self.reviews_left.is_some() || self.new_left.is_some()
-    }
 }
 
 #[cfg(test)]
@@ -119,7 +113,6 @@ mod tests {
             assert!(b.admits(false));
             assert!(b.admits(true));
         }
-        assert!(!b.is_limited());
     }
 
     #[test]

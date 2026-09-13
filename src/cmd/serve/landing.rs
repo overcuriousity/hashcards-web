@@ -86,6 +86,7 @@ pub async fn landing_handler(
             slug: c.slug.clone(),
             counts: Some(RowCounts {
                 due_today: c.due_today,
+                due_uncapped: c.due_uncapped,
                 total_cards: c.total_cards,
             }),
             is_deck: false,
@@ -99,7 +100,8 @@ pub async fn landing_handler(
         let uncounted = deck.clone();
         let counts = tokio::task::spawn_blocking(move || {
             let sources = deck_sources(&state, &deck, user.as_ref().map(|u| u.email.as_str()));
-            deck_card_counts(&state, &sources).map(|(due, total)| (deck, due, total))
+            deck_card_counts(&state, &sources)
+                .map(|(due, uncapped, total)| (deck, due, uncapped, total))
         })
         .await;
         // Counting can fail either way — the collection would not load, or
@@ -113,11 +115,12 @@ pub async fn landing_handler(
         // with it, and must not vanish from it either: a deck the user saved
         // and can still open is listed, uncounted, and says so.
         match counted {
-            Ok((deck, due_today, total_cards)) => rows.push(DrillRow {
+            Ok((deck, due_today, due_uncapped, total_cards)) => rows.push(DrillRow {
                 name: deck.name.clone(),
                 slug: deck.slug.clone(),
                 counts: Some(RowCounts {
                     due_today,
+                    due_uncapped,
                     total_cards,
                 }),
                 is_deck: true,
@@ -167,7 +170,10 @@ struct DrillRow {
 
 /// What a row says about its cards, when it could be worked out.
 struct RowCounts {
+    /// The size of the session the row's Drill button starts.
     due_today: usize,
+    /// What is really due, before any daily limit trimmed it.
+    due_uncapped: usize,
     total_cards: usize,
 }
 
@@ -199,6 +205,7 @@ fn row_class(row: &DrillRow, resume: &HashMap<String, usize>) -> &'static str {
 fn row_meta(counts: &Option<RowCounts>) -> Markup {
     let Some(RowCounts {
         due_today,
+        due_uncapped,
         total_cards,
     }) = counts
     else {
@@ -207,7 +214,13 @@ fn row_meta(counts: &Option<RowCounts>) -> Markup {
         };
     };
     html! {
-        @if *due_today > 0 {
+        @if *due_uncapped > *due_today {
+            // A cap must never make a backlog look like a finished day, so
+            // the row says what it will hand out *and* what is waiting.
+            span.row-due {
+                (format!("{due_today} of {due_uncapped} due \u{2014} daily cap"))
+            }
+        } @else if *due_today > 0 {
             span.row-due { (format!("{due_today} due")) }
         } @else {
             span.row-due.muted { "Nothing due" }
@@ -258,6 +271,7 @@ fn render_landing_page(
                     @if config_available {
                         a.nav-link href="/files" { "My cards" }
                     }
+                    a.nav-link href="/settings" { "Settings" }
                     @if tokens_available {
                         a.nav-link href="/tokens" { "MCP tokens" }
                     }
@@ -346,6 +360,56 @@ mod tests {
             html.contains("href=\"/tokens\""),
             "the landing page must link to the tokens page: {html}"
         );
+    }
+
+    /// A page nobody can reach is a page nobody has -- the lesson the tokens
+    /// page taught, whose whole first release shipped with nothing linking
+    /// to it. The nav link is this feature's only entrance.
+    #[test]
+    fn the_landing_page_links_to_the_settings_page() {
+        let status = LandingStatus {
+            config_available: true,
+            tokens_available: true,
+            signed_in_as: None,
+        };
+        let html = render_landing_page(&[], &HashMap::new(), &status, None).into_string();
+        assert!(
+            html.contains("href=\"/settings\""),
+            "the landing page must link to the settings page: {html}"
+        );
+    }
+
+    /// A daily limit must never make a backlog look like a finished day. The
+    /// row says what it will hand out *and* what is really waiting, so a
+    /// pile growing behind a cap stays visible.
+    #[test]
+    fn a_capped_row_says_it_was_capped() {
+        let counts = Some(RowCounts {
+            due_today: 40,
+            due_uncapped: 312,
+            total_cards: 900,
+        });
+        let html = row_meta(&counts).into_string();
+        assert!(html.contains("40"), "the session size: {html}");
+        assert!(
+            html.contains("312"),
+            "the real backlog stays visible: {html}"
+        );
+        assert!(html.contains("daily cap"), "and says why: {html}");
+    }
+
+    /// With no cap in force the row reads exactly as it always has, rather
+    /// than growing a redundant "40 of 40".
+    #[test]
+    fn an_uncapped_row_is_unchanged() {
+        let counts = Some(RowCounts {
+            due_today: 36,
+            due_uncapped: 36,
+            total_cards: 900,
+        });
+        let html = row_meta(&counts).into_string();
+        assert!(html.contains("36 due"), "{html}");
+        assert!(!html.contains("daily cap"), "{html}");
     }
 
     /// Without a token store the page has nothing to mint against, so the

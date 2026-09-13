@@ -112,7 +112,11 @@ pub struct CollectionInfo {
     pub name: String,
     pub slug: String,
     pub total_cards: usize,
+    /// The size of the session this collection's Drill button starts.
     pub due_today: usize,
+    /// What is really due, before any daily limit trimmed it. Equal to
+    /// `due_today` unless a cap is in force.
+    pub due_uncapped: usize,
     pub owner: Option<String>,
 }
 

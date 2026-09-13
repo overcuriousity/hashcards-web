@@ -2,6 +2,38 @@
     <unreleased>
         <added>
             <change author="claude">
+            **A settings page,** reached from **Settings** on the front
+            page. Everything that shapes a schedule was configurable only by
+            editing `hashcards.toml` by hand or asking an assistant over
+            MCP; now you can set it yourself. Desired retention, the maximum
+            interval and interval jitter are yours to set, and each says
+            what it does in plain terms rather than naming an FSRS
+            parameter. Settings apply to every collection you own, and a
+            collection can override the two scheduling numbers and the daily
+            limits from its own **Settings** button. A blank box means
+            "inherit", and says what it is inheriting, so clearing a field
+            hands it back rather than freezing today's value into it.
+            </change>
+            <change author="claude">
+            **Daily limits.** Cap how many reviews and how many new cards a
+            collection hands you in a day; the rest wait for tomorrow. The
+            limits are per collection, as Anki's are per deck, so drilling
+            one never spends another's allowance. A cap never hides a
+            backlog: a capped row reads "40 of 312 due -- daily cap", so a
+            pile growing behind it stays visible. An empty box is no limit;
+            zero is a limit of zero, which is a real answer for new cards.
+            </change>
+            <change author="claude">
+            **Free weekdays.** Name the days you are not available and no
+            card is scheduled to come due on them -- it moves to the nearest
+            day that is open, preferring the later one, since seeing a card
+            early is the more harmful mistake. Set once for you rather than
+            per collection: which days you are busy is a fact about your
+            week. A card already at its maximum interval is pulled earlier
+            rather than pushed past the ceiling, and at least one day has to
+            stay open.
+            </change>
+            <change author="claude">
             **An MCP endpoint at `/mcp`,** so an AI assistant can read and
             write your cards, decks and collections through the same code
             the web interface runs. Mint a token for yourself from the **MCP
