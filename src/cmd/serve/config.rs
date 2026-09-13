@@ -10,6 +10,7 @@ use crate::cmd::drill::render::AnswerControls;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::collection_id::CollectionId;
+use crate::types::free_days::FreeDays;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::Jitter;
 use crate::types::performance::MaxInterval;
@@ -202,6 +203,7 @@ impl DefaultsSection {
             retention: DesiredRetention::new(self.desired_retention)?,
             max_interval: MaxInterval::new(self.max_interval_days)?,
             jitter: Jitter::new(self.jitter)?,
+            free_days: FreeDays::none(),
         })
     }
 }
@@ -311,6 +313,7 @@ impl ResolvedCollection {
             retention: self.overrides.retention.unwrap_or(defaults.retention),
             max_interval: self.overrides.max_interval.unwrap_or(defaults.max_interval),
             jitter: defaults.jitter,
+            free_days: defaults.free_days,
         }
     }
 }
