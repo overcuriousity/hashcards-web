@@ -72,6 +72,7 @@ use crate::cmd::serve::landing::landing_handler;
 use crate::cmd::serve::mcp::mcp_routes;
 use crate::cmd::serve::merge::merge_legacy_databases;
 use crate::cmd::serve::settings::settings_get_handler;
+use crate::cmd::serve::settings::settings_optimize_handler;
 use crate::cmd::serve::settings::settings_post_handler;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
@@ -306,6 +307,7 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         )
         .route("/settings", get(settings_get_handler))
         .route("/settings", post(settings_post_handler))
+        .route("/settings/optimize", post(settings_optimize_handler))
         .route("/tokens", get(tokens_get_handler))
         .route("/tokens/new", post(tokens_mint_handler))
         .route("/tokens/revoke", post(tokens_revoke_handler))

@@ -18,8 +18,12 @@
 //! under it and a collection's `.hashcards.toml` sits over it, so a blank
 //! field is not an empty value but an inherited one.
 
+use crate::cmd::serve::decks::owned_collections;
+use crate::fsrs::Grade;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::path::PathBuf;
 
 use axum::Form;
 use axum::extract::Query;
@@ -41,6 +45,9 @@ use crate::error::Fallible;
 use crate::error::fail;
 use crate::flash::Flash;
 use crate::fsrs::Weights;
+use crate::fsrs::optimize::FitOutcome;
+use crate::fsrs::optimize::MIN_REVIEWS;
+use crate::fsrs::optimize::fit;
 use crate::types::free_days::FreeDays;
 use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
@@ -153,6 +160,38 @@ fn parse_weights(raw: &str) -> Fallible<Option<Weights>> {
     Weights::parse_list(raw).map(Some)
 }
 
+/// A fit the user has not accepted yet.
+///
+/// Shown in the weight box with a notice saying what it would buy. Nothing
+/// is stored until they submit the form: a schedule changing because a
+/// button was pressed once is not something anyone asked for.
+pub struct Proposal {
+    pub weights: Weights,
+    pub loss_before: f64,
+    pub loss_after: f64,
+    pub reviews: usize,
+}
+
+/// A fit is only offered when it beats the weights already in force.
+///
+/// Proposing a worse schedule as an improvement is the one outcome this
+/// feature must never produce, so the check lives here rather than in the
+/// page that renders it.
+pub fn proposal_from(outcome: FitOutcome) -> Fallible<Proposal> {
+    if outcome.loss_after >= outcome.loss_before {
+        return fail(
+            "Your current weights already explain your reviews as well as anything this fit \
+             could find, so nothing is proposed. That is a good sign, not a failure.",
+        );
+    }
+    Ok(Proposal {
+        weights: outcome.weights,
+        loss_before: outcome.loss_before,
+        loss_after: outcome.loss_after,
+        reviews: outcome.reviews,
+    })
+}
+
 /// What each block of the vector governs, so the numbers are not 19
 /// anonymous floats.
 const WEIGHT_GROUPS: [(&str, &str); 5] = [
@@ -200,6 +239,16 @@ pub fn render_settings(
     user: &UserSettings,
     inherited_scheduling: Scheduling,
     inherited_limits: DailyLimits,
+    flash: Option<Flash>,
+) -> Markup {
+    render_settings_with(user, inherited_scheduling, inherited_limits, None, flash)
+}
+
+pub fn render_settings_with(
+    user: &UserSettings,
+    inherited_scheduling: Scheduling,
+    inherited_limits: DailyLimits,
+    proposal: Option<&Proposal>,
     flash: Option<Flash>,
 ) -> Markup {
     let free = user.free_days.unwrap_or(inherited_scheduling.free_days);
@@ -314,11 +363,26 @@ pub fn render_settings(
                      back to the defaults."
                 }
                 div.setting {
+                    @if let Some(p) = proposal {
+                        div.notice {
+                            p {
+                                (format!(
+                                    "Fitted to {} of your reviews. Predicted-recall error \
+                                     falls from {:.4} to {:.4}.",
+                                    p.reviews, p.loss_before, p.loss_after
+                                ))
+                            }
+                            p { strong { "Nothing is saved until you press Save settings." } }
+                        }
+                    }
                     textarea.input name="weights" rows="4"
                         placeholder=(inherited_scheduling.weights.to_list()) {
-                        (user.weights.map(|w| w.to_list()).unwrap_or_default())
+                        @match proposal {
+                            Some(p) => (p.weights.to_list()),
+                            None => (user.weights.map(|w| w.to_list()).unwrap_or_default()),
+                        }
                     }
-                    @if user.weights.is_none() {
+                    @if user.weights.is_none() && proposal.is_none() {
                         (inherited(inherited_scheduling.weights.to_list()))
                     }
                     table.weight-table {
@@ -348,6 +412,23 @@ pub fn render_settings(
 
                 div.add-source-row {
                     input.btn.btn-primary type="submit" value="Save settings";
+                }
+            }
+
+            // A separate form, so pressing Optimize cannot save the rest of
+            // the page as a side effect.
+            form.add-source-form action="/settings/optimize" method="post" {
+                div.add-source-row {
+                    input.btn.btn-secondary type="submit"
+                        value="Fit the weights to my reviews";
+                }
+                p.hint {
+                    (format!(
+                        "Reads your whole review history and looks for weights that predict \
+                         it better than the ones in force. Needs at least {} reviews. It \
+                         proposes; you decide.",
+                        MIN_REVIEWS
+                    ))
                 }
             }
         }
@@ -422,6 +503,83 @@ pub async fn settings_get_handler(
         ),
     };
     (StatusCode::OK, Html(markup.into_string()))
+}
+
+/// Every review this user has, across every collection they own.
+///
+/// One fit over the whole tree rather than one per collection: 19
+/// parameters need every observation there is, and a person's forgetting is
+/// more theirs than it is their Spanish deck's.
+fn user_review_sequences(
+    state: &AppState,
+    owner: Option<&str>,
+) -> Fallible<Vec<Vec<(f64, Grade)>>> {
+    let mut opened: HashMap<PathBuf, UserDatabase> = HashMap::new();
+    let mut sequences = Vec::new();
+    for rc in owned_collections(state, owner) {
+        let user_db = match opened.entry(rc.db_path.clone()) {
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(slot) => {
+                refuse_if_unconsolidated(state, &rc.db_path)?;
+                slot.insert(UserDatabase::open(&rc.db_path)?)
+            }
+        };
+        sequences.extend(
+            user_db
+                .collection(rc.collection_id.clone())
+                .review_sequences()?,
+        );
+    }
+    Ok(sequences)
+}
+
+/// Fit the weights currently in force to this user's history.
+fn optimize_for(state: &AppState, owner: Option<&str>) -> Fallible<Proposal> {
+    let sequences = user_review_sequences(state, owner)?;
+    let user = load_settings(state, owner)?;
+    let (scheduling, _) = inherited_from_instance(state);
+    let in_force = user.weights.unwrap_or(scheduling.weights);
+    proposal_from(fit(&sequences, &in_force)?)
+}
+
+pub async fn settings_optimize_handler(
+    State(state): State<AppState>,
+    current_user: Option<CurrentUser>,
+) -> (StatusCode, Html<String>) {
+    let owner = current_user.map(|u| u.email);
+    let state2 = state.clone();
+    // A bounded fit, but a fit: SQLite and a few thousand replays have no
+    // business on the async executor.
+    let outcome = run_blocking(move || {
+        let proposal = optimize_for(&state2, owner.as_deref())?;
+        let settings = load_settings(&state2, owner.as_deref())?;
+        Ok((proposal, settings))
+    })
+    .await;
+    let (scheduling, limits) = inherited_from_instance(&state);
+    match outcome {
+        Ok((proposal, settings)) => (
+            StatusCode::OK,
+            Html(
+                render_settings_with(&settings, scheduling, limits, Some(&proposal), None)
+                    .into_string(),
+            ),
+        ),
+        // Too short a history and an unimprovable one are both ordinary
+        // answers rather than errors, and both already say so in words.
+        Err(e) => (
+            StatusCode::OK,
+            Html(
+                render_settings(
+                    &UserSettings::default(),
+                    scheduling,
+                    limits,
+                    Some(Flash::error(e.to_string())),
+                )
+                .into_string(),
+            ),
+        ),
+    }
 }
 
 pub async fn settings_post_handler(
@@ -551,6 +709,84 @@ mod tests {
         .expect_err("three is not nineteen");
         assert!(err.to_string().contains("19"), "message was: {err}");
         assert!(err.to_string().contains('3'), "message was: {err}");
+    }
+
+    /// The proposal is shown, not applied: the box holds the fitted vector
+    /// and the notice says what it would buy, but nothing is stored until
+    /// the user submits the form.
+    #[test]
+    fn a_proposal_is_shown_rather_than_saved() -> Fallible<()> {
+        let mut w = Weights::DEFAULT;
+        w[2] = 4.0;
+        let proposal = Proposal {
+            weights: Weights::new(w)?,
+            loss_before: 0.4231,
+            loss_after: 0.3122,
+            reviews: 1200,
+        };
+        let html = render_settings_with(
+            &UserSettings::default(),
+            Scheduling::default(),
+            DailyLimits::default(),
+            Some(&proposal),
+            None,
+        )
+        .into_string();
+        assert!(html.contains("1200"), "says what it fitted on: {html}");
+        assert!(html.contains("0.4231") && html.contains("0.3122"), "{html}");
+        assert!(
+            html.contains(&proposal.weights.to_list()),
+            "the box holds the proposal"
+        );
+        assert!(
+            html.contains("Nothing is saved until"),
+            "and says it is not saved: {html}"
+        );
+        Ok(())
+    }
+
+    /// A fit that did not improve is refused rather than offered. Proposing
+    /// a worse schedule as an improvement is the one outcome this feature
+    /// must never produce.
+    #[test]
+    fn a_fit_that_does_not_improve_is_refused() {
+        let outcome = FitOutcome {
+            weights: Weights::default(),
+            loss_before: 0.30,
+            loss_after: 0.30,
+            reviews: 900,
+        };
+        assert!(proposal_from(outcome).is_err());
+
+        let worse = FitOutcome {
+            weights: Weights::default(),
+            loss_before: 0.30,
+            loss_after: 0.31,
+            reviews: 900,
+        };
+        assert!(proposal_from(worse).is_err());
+    }
+
+    /// Without a proposal the page is exactly what it was, so the optimizer
+    /// is invisible until it is asked for.
+    #[test]
+    fn no_proposal_leaves_the_box_showing_the_users_own_weights() -> Fallible<()> {
+        let mut w = Weights::DEFAULT;
+        w[2] = 4.0;
+        let mine = Weights::new(w)?;
+        let html = render_settings(
+            &UserSettings {
+                weights: Some(mine),
+                ..UserSettings::default()
+            },
+            Scheduling::default(),
+            DailyLimits::default(),
+            None,
+        )
+        .into_string();
+        assert!(html.contains(&mine.to_list()), "{html}");
+        assert!(!html.contains("Nothing is saved until"), "{html}");
+        Ok(())
     }
 
     /// A field the user has not set says what it inherits, so the page never

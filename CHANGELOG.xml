@@ -2,6 +2,24 @@
     <unreleased>
         <added>
             <change author="claude">
+            **The FSRS weights are yours to set,** on the settings page. The
+            19 numbers the scheduling formulas are built from used to be
+            compiled into the binary; now they are shown, explained group by
+            group, and editable. Paste a vector from any FSRS optimizer, or
+            empty the box to go back to the defaults. A collection can carry
+            its own set, for material that behaves differently from the rest.
+            </change>
+            <change author="claude">
+            **Fit the weights to your own reviews.** **Fit the weights to my
+            reviews** on the settings page reads your whole review history
+            and looks for parameters that predict it better than the ones in
+            force. It needs at least 400 reviews to say anything, it tells
+            you what it found -- how many reviews it fitted, and how much the
+            predicted-recall error falls -- and it refuses to offer a fit
+            that is not an improvement. Nothing is saved until you press
+            **Save settings**: it proposes, you decide.
+            </change>
+            <change author="claude">
             **A settings page,** reached from **Settings** on the front
             page. Everything that shapes a schedule was configurable only by
             editing `hashcards.toml` by hand or asking an assistant over
