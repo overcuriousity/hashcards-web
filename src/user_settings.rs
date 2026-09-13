@@ -129,7 +129,7 @@ pub fn read_settings(conn: &Connection) -> UserSettings {
 pub fn write_settings(conn: &mut Connection, settings: &UserSettings) -> Fallible<()> {
     let tx = conn.transaction()?;
     {
-        let mut put = |key: &str, value: Option<String>| -> Fallible<()> {
+        let put = |key: &str, value: Option<String>| -> Fallible<()> {
             match value {
                 Some(v) => {
                     tx.execute(
