@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::cmd::serve::config::DefaultsSection;
 use crate::cmd::serve::config::ResolvedCollection;
+use crate::cmd::serve::reviewdb::user_settings_for;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::CollectionInfo;
 use crate::collection::Collection;
@@ -21,8 +22,11 @@ use crate::error::fail;
 use crate::types::card::Card;
 use crate::types::card_hash::CardHash;
 use crate::types::date::Date;
+use crate::types::limits::DailyBudget;
+use crate::types::limits::DailyLimits;
 use crate::types::timestamp::Timestamp;
 use crate::user_db::UserDatabase;
+use crate::user_settings::UserSettings;
 
 /// The instance's sibling-burying policy, applied one card at a time.
 ///
@@ -32,6 +36,61 @@ use crate::user_db::UserDatabase;
 /// cards the session will never show: "Start (12 due)" opening on
 /// "0 of 7". Counting and queueing therefore run through this same filter.
 ///
+/// Everything a resolved collection says about which due cards actually
+/// reach a queue: whether to bury siblings, and how many cards it will hand
+/// out today.
+///
+/// Resolved once, then used by the session builder *and* by every counter
+/// that claims to describe it. A count filtered differently from the queue
+/// is the bug this type exists to prevent.
+#[derive(Clone, Copy, Debug)]
+pub struct QueuePolicy {
+    pub bury_siblings: bool,
+    pub limits: DailyLimits,
+}
+
+impl QueuePolicy {
+    /// The instance's answers, with the user's and the collection's laid
+    /// over them.
+    pub fn resolve(
+        defaults: &DefaultsSection,
+        user: &UserSettings,
+        rc: &ResolvedCollection,
+    ) -> Self {
+        Self {
+            bury_siblings: user.bury_siblings.unwrap_or(defaults.bury_siblings),
+            limits: rc.limits(defaults.limits(), user),
+        }
+    }
+
+    /// The instance's answers alone. For the paths that have no user to
+    /// consult -- and for tests.
+    pub fn from_defaults(defaults: &DefaultsSection) -> Self {
+        Self {
+            bury_siblings: defaults.bury_siblings,
+            limits: defaults.limits(),
+        }
+    }
+}
+
+/// What this collection has left of its limits today, and which of its cards
+/// are new.
+///
+/// The two are read together because they are spent together: a card is new
+/// or it is not, and which budget it spends follows from that.
+pub fn budget_for(
+    db: &Database,
+    limits: DailyLimits,
+    today: Date,
+) -> Fallible<(DailyBudget, HashSet<CardHash>)> {
+    let budget = DailyBudget::new(
+        limits,
+        db.count_reviews_in_date(today)?,
+        db.new_cards_today_count(today)?,
+    );
+    Ok((budget, db.new_cards()?))
+}
+
 /// One `Burial` covers everything a single session would draw on: a family
 /// is buried across the whole queue, not once per topic, and a cloze note
 /// written into two collections is one family in both.
@@ -41,10 +100,10 @@ pub struct Burial {
 }
 
 impl Burial {
-    /// Burying as `defaults` asks for it.
-    pub fn new(defaults: &DefaultsSection) -> Self {
+    /// Burying as the resolved settings ask for it.
+    pub fn new(bury_siblings: bool) -> Self {
         Self {
-            enabled: defaults.bury_siblings,
+            enabled: bury_siblings,
             seen: HashSet::new(),
         }
     }
@@ -78,8 +137,14 @@ pub fn refresh_collection_info(
     let mut opened: HashMap<PathBuf, UserDatabase> = HashMap::new();
     let mut infos = Vec::new();
     for rc in collections {
-        let counts = open_user_db(state, rc, &mut opened)
-            .and_then(|db| compute_collection_counts(&rc.coll_dir, db, &state.config.defaults));
+        let counts = open_user_db(state, rc, &mut opened).and_then(|db| {
+            let policy = QueuePolicy::resolve(
+                &state.config.defaults,
+                &user_settings_for(state, &rc.db_path),
+                rc,
+            );
+            compute_collection_counts(&rc.coll_dir, db, policy)
+        });
         let (total_cards, due_today) = match counts {
             Ok(counts) => counts,
             Err(e) => {
@@ -128,7 +193,7 @@ fn open_user_db(
 pub fn compute_collection_counts(
     coll_dir: &Path,
     db: Database,
-    defaults: &DefaultsSection,
+    policy: QueuePolicy,
 ) -> Fallible<(usize, usize)> {
     if !coll_dir.exists() {
         return Ok((0, 0));
@@ -149,12 +214,17 @@ pub fn compute_collection_counts(
     }
 
     let due_hashes = collection.db.due_today(today)?;
-    let mut burial = Burial::new(defaults);
+    let mut burial = Burial::new(policy.bury_siblings);
+    // Burial first, then the budget, in the order the session builder
+    // applies them. Filtering in a different order here would count a
+    // different set.
+    let (mut budget, new_cards) = budget_for(&collection.db, policy.limits, today)?;
     let due_today = collection
         .cards
         .iter()
         .filter(|c| due_hashes.contains(&c.hash()))
         .filter(|c| burial.admits(c))
+        .filter(|c| budget.admits(new_cards.contains(&c.hash())))
         .count();
 
     Ok((total_cards, due_today))

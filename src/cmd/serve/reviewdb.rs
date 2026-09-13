@@ -12,6 +12,7 @@ use crate::db::Database;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::user_db::UserDatabase;
+use crate::user_settings::UserSettings;
 
 /// Refuse to touch the review database at `db_path` when this user's
 /// startup merge failed.
@@ -86,5 +87,25 @@ mod tests {
         assert!(message.contains("disk is on fire"), "{message}");
         assert!(message.contains("legacy"), "{message}");
         Ok(())
+    }
+}
+
+/// The settings of the user whose database this is, or the inherit-
+/// everything default when it cannot be read.
+///
+/// Never an error. A settings layer that cannot be read must not take down
+/// the page it decorates, and the layer below it is already a complete
+/// answer. The merge gate still applies: a tree whose startup merge failed
+/// reports no settings rather than opening the file.
+pub fn user_settings_for(state: &AppState, db_path: &Path) -> UserSettings {
+    if refuse_if_unconsolidated(state, db_path).is_err() {
+        return UserSettings::default();
+    }
+    match UserDatabase::open(db_path) {
+        Ok(db) => db.user_settings(),
+        Err(e) => {
+            log::warn!("Could not read settings from {}: {e}", db_path.display());
+            UserSettings::default()
+        }
     }
 }

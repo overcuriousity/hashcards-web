@@ -44,11 +44,14 @@ use crate::cmd::serve::browse::build_deck_tree;
 use crate::cmd::serve::browse::render_browse_page;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::counts::Burial;
+use crate::cmd::serve::counts::QueuePolicy;
+use crate::cmd::serve::counts::budget_for;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
 use crate::cmd::serve::decks::find_custom_deck;
 use crate::cmd::serve::files::existing_collections_for_user;
 use crate::cmd::serve::reviewdb::open_user_db;
 use crate::cmd::serve::reviewdb::refuse_if_unconsolidated;
+use crate::cmd::serve::reviewdb::user_settings_for;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::DrillSession;
 use crate::cmd::serve::state::SessionKey;
@@ -63,6 +66,7 @@ use crate::rng::shuffle;
 use crate::types::card::Card;
 use crate::types::card_hash::CardHash;
 use crate::types::date::Date;
+use crate::types::limits::DailyBudget;
 use crate::types::timestamp::Timestamp;
 use crate::user_db::UserDatabase;
 
@@ -156,7 +160,7 @@ fn collection_get_inner(
         let browse = build_deck_tree(
             &rc.coll_dir,
             user_db.collection(rc.collection_id.clone()),
-            &state.config.defaults,
+            QueuePolicy::resolve(&state.config.defaults, &user_db.user_settings(), &rc),
         )?;
         let db = user_db.collection(rc.collection_id.clone());
         // FEAT-03: report the session rows the startup sweep closed. The
@@ -516,6 +520,13 @@ pub(super) fn create_session_from_sources(
     let mut session_dbs: Vec<SessionDb> = Vec::new();
     let mut routes: HashMap<CardHash, usize> = HashMap::new();
     let mut due_cards: Vec<Card> = Vec::new();
+    // One budget per source, indexed as `routes` indexes them.
+    let mut budgets: Vec<(DailyBudget, HashSet<CardHash>)> = Vec::new();
+    // A deck draws on collections that may disagree about burying. One
+    // `Burial` covers the whole queue, so the queue buries only when every
+    // collection in it asks to -- the reading that never hides a card the
+    // user asked to see.
+    let mut bury = true;
     let mut cache = Cache::new();
     let mut first_directory: Option<PathBuf> = None;
     let mut macros: Vec<(String, String)> = Vec::new();
@@ -538,6 +549,7 @@ pub(super) fn create_session_from_sources(
         // them. One read per source rather than per card, and never a
         // second connection.
         let user_settings = user_db.user_settings();
+        let policy = QueuePolicy::resolve(&state.config.defaults, &user_settings, &rc);
         let collection = Collection::open(
             rc.coll_dir.clone(),
             user_db.collection(rc.collection_id.clone()),
@@ -584,6 +596,12 @@ pub(super) fn create_session_from_sources(
             due_cards.push(card);
         }
 
+        // This collection's allowance for today. Per source, because a
+        // limit is per collection: a deck spanning two collections spends
+        // each one's allowance separately.
+        budgets.push(budget_for(&collection.db, policy.limits, today)?);
+        bury = bury && policy.bury_siblings;
+
         // Open this collection's session row immediately, so reviews can be
         // written as they happen.
         let session_id = collection.db.create_session(session_started_at)?;
@@ -610,8 +628,18 @@ pub(super) fn create_session_from_sources(
         }
     }
 
-    let mut burial = Burial::new(&state.config.defaults);
+    let mut burial = Burial::new(bury);
     due_cards.retain(|card| burial.admits(card));
+    // Then each source's daily limit, over what burial left. Every counter
+    // that describes this session applies the same two filters in the same
+    // order.
+    due_cards.retain(|card| match routes.get(&card.hash()) {
+        Some(index) => match budgets.get_mut(*index) {
+            Some((budget, new_cards)) => budget.admits(new_cards.contains(&card.hash())),
+            None => true,
+        },
+        None => true,
+    });
 
     if due_cards.is_empty() {
         // The session rows opened above would otherwise linger as dangling
@@ -666,6 +694,20 @@ fn due_card_count(state: &AppState, sources: &[SessionSourceSpec]) -> Fallible<u
     Ok(deck_card_counts(state, sources)?.0)
 }
 
+/// Whether a queue over these sources buries siblings.
+///
+/// A deck can draw on collections belonging to one user, so in practice
+/// there is one answer; it is folded rather than assumed so that a deck
+/// spanning users would bury only where every source asks to, which is the
+/// reading that never hides a card the user asked to see. Matches the fold
+/// the session builder does.
+fn bury_for(state: &AppState, sources: &[SessionSourceSpec]) -> bool {
+    sources.iter().all(|spec| {
+        let user = user_settings_for(state, &spec.collection.db_path);
+        QueuePolicy::resolve(&state.config.defaults, &user, &spec.collection).bury_siblings
+    })
+}
+
 /// `(due today, total)` over the topics a custom deck names.
 ///
 /// A deck is a selection, not a collection, so its counts cannot be cached
@@ -682,8 +724,11 @@ pub(super) fn deck_card_counts(
     // starts, so it is filtered exactly as the queue is: one card per
     // family, and one card per content address however many collections
     // offer it. Both run across the whole deck, not per source.
-    let mut burial = Burial::new(&state.config.defaults);
+    let mut burial = Burial::new(bury_for(state, sources));
     let mut queued: HashSet<CardHash> = HashSet::new();
+    // One budget per source, spent in source order, as the session builder
+    // spends them.
+    let mut budgets: Vec<(DailyBudget, HashSet<CardHash>)> = Vec::new();
     // One connection per database rather than one per source: a deck's
     // collections all belong to one user and so name one file, and this
     // runs once per source on every render of the landing page.
@@ -712,6 +757,11 @@ pub(super) fn deck_card_counts(
             }
         }
         let due: HashSet<CardHash> = collection.db.due_today(today)?;
+        let policy = QueuePolicy::resolve(&state.config.defaults, &user_db.user_settings(), rc);
+        budgets.push(budget_for(&collection.db, policy.limits, today)?);
+        let (budget, new_cards) = budgets.last_mut().ok_or_else(|| {
+            ErrorReport::new("a budget was pushed for this source and is not there")
+        })?;
         let wanted: HashSet<&str> = spec.decks.iter().map(|d| d.as_str()).collect();
         for card in collection
             .cards
@@ -719,7 +769,11 @@ pub(super) fn deck_card_counts(
             .filter(|c| wanted.contains(c.deck_name().as_str()))
         {
             card_total += 1;
-            if due.contains(&card.hash()) && queued.insert(card.hash()) && burial.admits(card) {
+            if due.contains(&card.hash())
+                && queued.insert(card.hash())
+                && burial.admits(card)
+                && budget.admits(new_cards.contains(&card.hash()))
+            {
                 due_total += 1;
             }
         }
@@ -1492,6 +1546,7 @@ mod tests {
     #[test]
     fn the_due_count_on_the_page_matches_the_session_it_starts() -> Fallible<()> {
         use crate::cmd::serve::browse::build_deck_tree;
+        use crate::cmd::serve::counts::QueuePolicy;
         use crate::cmd::serve::handlers::find_collection;
 
         let dir = tempfile::tempdir()?;
@@ -1508,7 +1563,7 @@ mod tests {
         crate::cmd::serve::counts::compute_collection_counts(
             &rc.coll_dir,
             db,
-            &state.config.defaults,
+            QueuePolicy::from_defaults(&state.config.defaults),
         )?;
         let scheduled = open_collection_db(&state, &rc)?
             .due_today(crate::types::timestamp::Timestamp::now().date())?
@@ -1518,10 +1573,79 @@ mod tests {
         let browse = build_deck_tree(
             &rc.coll_dir,
             open_collection_db(&state, &rc)?,
-            &state.config.defaults,
+            QueuePolicy::from_defaults(&state.config.defaults),
         )?;
         let shown = browse.tree.due_today_recursive();
         assert_eq!(shown, 1, "the page counts the queue, one card per family");
+
+        let session = create_session_from_sources(
+            &state,
+            vec![SessionSourceSpec {
+                collection: rc,
+                decks: Vec::new(),
+            }],
+            None,
+        )?
+        .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
+
+        assert_eq!(
+            shown, session.total_cards,
+            "the page promised {shown} cards and the session holds {}",
+            session.total_cards
+        );
+        Ok(())
+    }
+
+    /// The count a page shows is the size of the session its Drill button
+    /// starts -- with a daily limit in force exactly as without one. A count
+    /// that overstates the session is the bug this arrangement exists to
+    /// prevent: "Start (10 due)" opening on "0 of 4".
+    #[test]
+    fn a_limited_collections_count_matches_the_session_it_starts() -> Fallible<()> {
+        use crate::cmd::serve::browse::build_deck_tree;
+        use crate::cmd::serve::cards::write_collection_overrides;
+        use crate::cmd::serve::counts::QueuePolicy;
+        use crate::cmd::serve::handlers::find_collection;
+        use crate::types::limits::DailyLimits;
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().canonicalize()?;
+        // Ten plain cards, no cloze families, so burying cannot be what
+        // trims the count below.
+        let mut markdown = String::new();
+        for i in 0..10 {
+            markdown.push_str(&format!("Q: Question {i}\nA: Answer {i}\n\n"));
+        }
+        card_collection(&data_dir, None, "Deck", &markdown)?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(data_dir.clone());
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not discovered"))?;
+
+        // Every card here is new -- nothing has been reviewed -- so the new
+        // limit is the one that bites. A review limit would cap nothing.
+        write_collection_overrides(
+            &rc.coll_dir,
+            None,
+            None,
+            DailyLimits {
+                reviews: None,
+                new: Some(4),
+            },
+        )?;
+        // Re-resolve, so the collection carries the overrides just written.
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not discovered"))?;
+        assert_eq!(
+            rc.overrides.limits.new,
+            Some(4),
+            "the override must reach the resolved collection"
+        );
+
+        let user = crate::cmd::serve::reviewdb::user_settings_for(&state, &rc.db_path);
+        let policy = QueuePolicy::resolve(&state.config.defaults, &user, &rc);
+        let browse = build_deck_tree(&rc.coll_dir, open_collection_db(&state, &rc)?, policy)?;
+        let shown = browse.tree.due_today_recursive();
+        assert_eq!(shown, 4, "the page counts what the cap allows");
 
         let session = create_session_from_sources(
             &state,

@@ -114,7 +114,7 @@ impl FreeDays {
         FreeDays::new(days)
     }
 
-    pub fn to_list(&self) -> Vec<&'static str> {
+    pub fn to_list(self) -> Vec<&'static str> {
         NAMES
             .iter()
             .enumerate()
