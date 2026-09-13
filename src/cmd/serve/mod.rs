@@ -16,6 +16,7 @@ mod mcp;
 mod merge;
 mod reviewdb;
 pub mod server;
+mod settings;
 mod state;
 mod tokens;
 mod trash;

@@ -69,6 +69,8 @@ use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
 use crate::cmd::serve::mcp::mcp_routes;
 use crate::cmd::serve::merge::merge_legacy_databases;
+use crate::cmd::serve::settings::settings_get_handler;
+use crate::cmd::serve::settings::settings_post_handler;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
@@ -300,6 +302,8 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
             "/files/media/{*path}",
             post(media_upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/settings", get(settings_get_handler))
+        .route("/settings", post(settings_post_handler))
         .route("/tokens", get(tokens_get_handler))
         .route("/tokens/new", post(tokens_mint_handler))
         .route("/tokens/revoke", post(tokens_revoke_handler))
