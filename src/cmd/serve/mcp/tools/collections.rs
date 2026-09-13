@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::cmd::run_blocking;
 use crate::cmd::serve::auth::CurrentUser;
+use crate::cmd::serve::cards::collection_overrides;
 use crate::cmd::serve::cards::write_collection_overrides;
 use crate::cmd::serve::files::NewEntry;
 use crate::cmd::serve::files::create_entry;
@@ -89,7 +90,12 @@ pub(super) fn set_scheduling_for(
         Some(v) => Some(MaxInterval::new(v)?),
         None => None,
     };
-    write_collection_overrides(&rc.coll_dir, retention, max_interval)?;
+    // The limits already in the file are read back and written through:
+    // this function rewrites the whole file, so passing anything else here
+    // would erase a collection's daily limits every time a model touched
+    // its retention.
+    let existing = collection_overrides(&rc.coll_dir);
+    write_collection_overrides(&rc.coll_dir, retention, max_interval, existing.limits)?;
     Ok(format!("Scheduling updated for `{slug}`."))
 }
 

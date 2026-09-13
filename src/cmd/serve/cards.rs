@@ -17,6 +17,7 @@ use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::collection_id::CollectionId;
+use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::MaxInterval;
 use crate::utils::ensure_dir;
@@ -200,6 +201,10 @@ struct CollectionMeta {
     desired_retention: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_interval_days: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_reviews_per_day: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_new_per_day: Option<toml::Value>,
 }
 
 /// The scheduling a collection asks for in its own `.hashcards.toml`.
@@ -237,7 +242,31 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
                     .inspect_err(|e| complain("max_interval_days", e))
                     .ok()
             }),
+        limits: DailyLimits {
+            reviews: meta
+                .max_reviews_per_day
+                .and_then(|v| override_number(&v, "max_reviews_per_day", &meta_path))
+                .and_then(|v| card_count(v, "max_reviews_per_day", &meta_path)),
+            new: meta
+                .max_new_per_day
+                .and_then(|v| override_number(&v, "max_new_per_day", &meta_path))
+                .and_then(|v| card_count(v, "max_new_per_day", &meta_path)),
+        },
     }
+}
+
+/// A daily limit as written in a collection file. A negative or fractional
+/// value is not a count of cards, and inherits rather than being rounded
+/// into something the user did not ask for.
+fn card_count(value: f64, what: &str, meta_path: &Path) -> Option<u32> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
+        log::warn!(
+            "Ignoring `{what}` in {}: expected a whole number of cards, found {value}.",
+            meta_path.display()
+        );
+        return None;
+    }
+    Some(value as u32)
 }
 
 /// Rewrite a collection's `.hashcards.toml` with new scheduling overrides.
@@ -260,6 +289,7 @@ pub fn write_collection_overrides(
     folder: &Path,
     retention: Option<DesiredRetention>,
     max_interval: Option<MaxInterval>,
+    limits: DailyLimits,
 ) -> Fallible<()> {
     let meta_path = folder.join(COLLECTION_META_FILE);
     if let Ok(text) = read_to_string(&meta_path) {
@@ -276,6 +306,8 @@ pub fn write_collection_overrides(
         id: id.to_string(),
         desired_retention: retention.map(|r| toml::Value::Float(r.into_inner())),
         max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
+        max_reviews_per_day: limits.reviews.map(|n| toml::Value::Integer(n.into())),
+        max_new_per_day: limits.new.map(|n| toml::Value::Integer(n.into())),
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     Ok(())
@@ -316,6 +348,8 @@ pub fn collection_id(folder: &Path) -> Fallible<CollectionId> {
         id: id.clone(),
         desired_retention: None,
         max_interval_days: None,
+        max_reviews_per_day: None,
+        max_new_per_day: None,
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     CollectionId::new(id)
@@ -522,6 +556,7 @@ mod tests {
     use super::*;
     use crate::helper::create_tmp_directory;
     use crate::types::performance::Scheduling;
+    use crate::user_settings::UserSettings;
 
     /// `create_tmp_directory` returns a `PathBuf`, not a `TempDir`.
     fn fixture() -> Fallible<(PathBuf, CardRoot)> {
@@ -745,7 +780,7 @@ mod tests {
 
         let found =
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
-        let scheduling = found[0].scheduling(Scheduling::default());
+        let scheduling = found[0].scheduling(Scheduling::default(), &UserSettings::default());
         assert_eq!(scheduling.retention.into_inner(), 0.95);
         assert_eq!(
             scheduling.max_interval.into_inner(),
@@ -773,7 +808,7 @@ mod tests {
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(
             found[0]
-                .scheduling(Scheduling::default())
+                .scheduling(Scheduling::default(), &UserSettings::default())
                 .retention
                 .into_inner(),
             DesiredRetention::DEFAULT
@@ -801,7 +836,7 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(found[0].collection_id, id);
-        let scheduling = found[0].scheduling(Scheduling::default());
+        let scheduling = found[0].scheduling(Scheduling::default(), &UserSettings::default());
         assert_eq!(scheduling.retention.into_inner(), DesiredRetention::DEFAULT);
         assert_eq!(scheduling.max_interval.into_inner(), MaxInterval::DEFAULT);
         Ok(())
@@ -824,7 +859,7 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(
             found[0]
-                .scheduling(Scheduling::default())
+                .scheduling(Scheduling::default(), &UserSettings::default())
                 .max_interval
                 .into_inner(),
             256.0
@@ -873,8 +908,13 @@ mod tests {
         let broken = format!("id = \"{id}\"\ndesired retention = 0.95\n");
         std::fs::write(folder.join(COLLECTION_META_FILE), &broken)?;
 
-        let err = write_collection_overrides(&folder, Some(DesiredRetention::new(0.9)?), None)
-            .unwrap_err();
+        let err = write_collection_overrides(
+            &folder,
+            Some(DesiredRetention::new(0.9)?),
+            None,
+            DailyLimits::default(),
+        )
+        .unwrap_err();
         assert!(err.message().contains("TOML"), "{}", err.message());
         assert_eq!(
             std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,

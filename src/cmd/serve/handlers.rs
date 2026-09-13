@@ -534,6 +534,10 @@ pub(super) fn create_session_from_sources(
                 slot.insert(UserDatabase::open(&rc.db_path)?)
             }
         };
+        // The owner's settings, read from the database already open for
+        // them. One read per source rather than per card, and never a
+        // second connection.
+        let user_settings = user_db.user_settings();
         let collection = Collection::open(
             rc.coll_dir.clone(),
             user_db.collection(rc.collection_id.clone()),
@@ -598,7 +602,7 @@ pub(super) fn create_session_from_sources(
             // instance's elsewhere. Resolved per database, so a deck
             // spanning collections schedules each card by the collection it
             // came from.
-            scheduling: rc.scheduling(defaults),
+            scheduling: rc.scheduling(defaults, &user_settings),
         });
         if first_directory.is_none() {
             first_directory = Some(collection.directory);

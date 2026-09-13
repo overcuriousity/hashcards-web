@@ -11,10 +11,12 @@ use crate::error::Fallible;
 use crate::error::fail;
 use crate::types::collection_id::CollectionId;
 use crate::types::free_days::FreeDays;
+use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::Jitter;
 use crate::types::performance::MaxInterval;
 use crate::types::performance::Scheduling;
+use crate::user_settings::UserSettings;
 
 // --- TOML deserialization structs ---
 
@@ -191,6 +193,15 @@ pub struct DefaultsSection {
     pub desired_retention: f64,
     #[serde(default = "default_max_interval_days")]
     pub max_interval_days: f64,
+    #[serde(default)]
+    pub max_reviews_per_day: Option<u32>,
+    #[serde(default)]
+    pub max_new_per_day: Option<u32>,
+    /// `"sat,sun"`. Validated in `scheduling()` rather than here, so that
+    /// the error names the weekday it could not read instead of a serde
+    /// path.
+    #[serde(default)]
+    pub free_days: String,
 }
 
 impl DefaultsSection {
@@ -203,8 +214,17 @@ impl DefaultsSection {
             retention: DesiredRetention::new(self.desired_retention)?,
             max_interval: MaxInterval::new(self.max_interval_days)?,
             jitter: Jitter::new(self.jitter)?,
-            free_days: FreeDays::none(),
+            free_days: FreeDays::parse_list(&self.free_days)?,
         })
+    }
+
+    /// The instance-wide daily limits, which every collection inherits
+    /// unless the user or the collection says otherwise.
+    pub fn limits(&self) -> DailyLimits {
+        DailyLimits {
+            reviews: self.max_reviews_per_day,
+            new: self.max_new_per_day,
+        }
     }
 }
 
@@ -228,6 +248,9 @@ impl Default for DefaultsSection {
             jitter: default_jitter(),
             desired_retention: default_desired_retention(),
             max_interval_days: default_max_interval_days(),
+            max_reviews_per_day: None,
+            max_new_per_day: None,
+            free_days: String::new(),
         }
     }
 }
@@ -283,6 +306,7 @@ pub fn load_config(path: &Path) -> Fallible<ServeConfig> {
 pub struct SchedulingOverrides {
     pub retention: Option<DesiredRetention>,
     pub max_interval: Option<MaxInterval>,
+    pub limits: DailyLimits,
 }
 
 #[derive(Clone)]
@@ -308,13 +332,32 @@ impl ResolvedCollection {
     /// Jitter is never overridden. It spreads one person's review peaks
     /// across all their collections, so a collection deciding it alone would
     /// be deciding nothing.
-    pub fn scheduling(&self, defaults: Scheduling) -> Scheduling {
+    pub fn scheduling(&self, defaults: Scheduling, user: &UserSettings) -> Scheduling {
         Scheduling {
-            retention: self.overrides.retention.unwrap_or(defaults.retention),
-            max_interval: self.overrides.max_interval.unwrap_or(defaults.max_interval),
-            jitter: defaults.jitter,
-            free_days: defaults.free_days,
+            retention: self
+                .overrides
+                .retention
+                .or(user.retention)
+                .unwrap_or(defaults.retention),
+            max_interval: self
+                .overrides
+                .max_interval
+                .or(user.max_interval)
+                .unwrap_or(defaults.max_interval),
+            jitter: user.jitter.unwrap_or(defaults.jitter),
+            free_days: user.free_days.unwrap_or(defaults.free_days),
         }
+    }
+
+    /// How many cards this collection hands out today: its own answer, then
+    /// the user's, then the instance's.
+    ///
+    /// Per collection rather than per user on purpose, as Anki's are per
+    /// deck: the user's value is the default each collection inherits, not a
+    /// shared pool, so drilling one collection never silently spends
+    /// another's allowance.
+    pub fn limits(&self, defaults: DailyLimits, user: &UserSettings) -> DailyLimits {
+        self.overrides.limits.or(user.limits).or(defaults)
     }
 }
 
@@ -477,6 +520,122 @@ mod tests {
     use super::*;
     use crate::error::ErrorReport;
     use crate::error::Fallible;
+
+    use crate::types::limits::DailyLimits;
+    use crate::user_settings::UserSettings;
+
+    /// A collection with the given overrides and nothing else of interest.
+    fn test_collection(overrides: SchedulingOverrides) -> ResolvedCollection {
+        ResolvedCollection {
+            name: "Spanish".to_string(),
+            slug: "spanish".to_string(),
+            coll_dir: PathBuf::from("/tmp/spanish"),
+            db_path: PathBuf::from("/tmp/db/default.db"),
+            collection_id: CollectionId::new("esp").expect("a valid id"),
+            owner: None,
+            overrides,
+        }
+    }
+
+    /// Collection beats user beats instance, field by field.
+    #[test]
+    fn the_three_layers_resolve_in_order() -> Fallible<()> {
+        let instance = Scheduling {
+            retention: DesiredRetention::new(0.90)?,
+            max_interval: MaxInterval::new(100.0)?,
+            jitter: Jitter::new(0.05)?,
+            free_days: FreeDays::none(),
+        };
+        let user = UserSettings {
+            retention: Some(DesiredRetention::new(0.85)?),
+            max_interval: Some(MaxInterval::new(200.0)?),
+            jitter: Some(Jitter::new(0.2)?),
+            free_days: Some(FreeDays::parse_list("sun")?),
+            ..UserSettings::default()
+        };
+        let rc = test_collection(SchedulingOverrides {
+            retention: Some(DesiredRetention::new(0.80)?),
+            ..SchedulingOverrides::default()
+        });
+
+        let resolved = rc.scheduling(instance, &user);
+        assert_eq!(
+            resolved.retention,
+            DesiredRetention::new(0.80)?,
+            "collection wins"
+        );
+        assert_eq!(resolved.max_interval, MaxInterval::new(200.0)?, "user wins");
+        assert_eq!(resolved.jitter, Jitter::new(0.2)?, "jitter is the user's");
+        assert_eq!(resolved.free_days, FreeDays::parse_list("sun")?);
+        Ok(())
+    }
+
+    /// An untouched user layer schedules exactly as the instance does. This
+    /// is the property that says adding the layer moved nobody's cards.
+    #[test]
+    fn an_empty_user_layer_changes_nothing() -> Fallible<()> {
+        let instance = Scheduling {
+            retention: DesiredRetention::new(0.93)?,
+            max_interval: MaxInterval::new(512.0)?,
+            jitter: Jitter::new(0.07)?,
+            free_days: FreeDays::none(),
+        };
+        let rc = test_collection(SchedulingOverrides::default());
+        assert_eq!(rc.scheduling(instance, &UserSettings::default()), instance);
+        Ok(())
+    }
+
+    /// Jitter and free days have no collection layer at all: they exist to
+    /// spread one person's peaks across every collection they own.
+    #[test]
+    fn a_collection_cannot_override_jitter_or_free_days() -> Fallible<()> {
+        let instance = Scheduling {
+            jitter: Jitter::new(0.01)?,
+            free_days: FreeDays::parse_list("sat")?,
+            ..Scheduling::default()
+        };
+        let rc = test_collection(SchedulingOverrides::default());
+        let resolved = rc.scheduling(instance, &UserSettings::default());
+        assert_eq!(resolved.jitter, Jitter::new(0.01)?);
+        assert_eq!(resolved.free_days, FreeDays::parse_list("sat")?);
+        Ok(())
+    }
+
+    #[test]
+    fn limits_resolve_in_the_same_order() -> Fallible<()> {
+        let instance = DailyLimits {
+            reviews: Some(100),
+            new: Some(10),
+        };
+        let user = UserSettings {
+            limits: DailyLimits {
+                reviews: Some(50),
+                new: None,
+            },
+            ..UserSettings::default()
+        };
+        let rc = test_collection(SchedulingOverrides {
+            limits: DailyLimits {
+                reviews: None,
+                new: Some(3),
+            },
+            ..SchedulingOverrides::default()
+        });
+        let resolved = rc.limits(instance, &user);
+        assert_eq!(resolved.reviews, Some(50), "user over instance");
+        assert_eq!(resolved.new, Some(3), "collection over both");
+        Ok(())
+    }
+
+    /// `free_days` in `[defaults]` is validated at startup rather than
+    /// forgiven: an administrator is there to read the message.
+    #[test]
+    fn a_bad_free_days_list_is_a_configuration_error() {
+        let toml = "[server]\ndata_dir = \"/var/lib/hashcards\"\n\n\
+                    [defaults]\nfree_days = \"caturday\"\n";
+        let config: ServeConfig = toml::from_str(toml).expect("parses");
+        assert!(config.defaults.scheduling().is_err());
+    }
 
     /// The two FSRS knobs default to what the hardcoded constants were, so a
     /// config that says nothing about scheduling schedules as it always did.
