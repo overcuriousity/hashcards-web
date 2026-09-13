@@ -2,6 +2,7 @@ mod auth;
 mod bookmarks;
 mod browse;
 mod cards;
+mod collection_settings;
 pub mod config;
 mod counts;
 mod decks;

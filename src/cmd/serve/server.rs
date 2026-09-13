@@ -42,6 +42,8 @@ use crate::cmd::serve::bookmarks::bookmark_delete_handler;
 use crate::cmd::serve::bookmarks::bookmark_list_handler;
 use crate::cmd::serve::bookmarks::bookmark_note_handler;
 use crate::cmd::serve::cards::discover_all_collections;
+use crate::cmd::serve::collection_settings::collection_settings_get_handler;
+use crate::cmd::serve::collection_settings::collection_settings_post_handler;
 use crate::cmd::serve::config::MIN_SESSION_SECRET_BYTES;
 use crate::cmd::serve::config::ResolvedOidc;
 use crate::cmd::serve::config::ResolvedServeConfig;
@@ -317,6 +319,14 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         .route("/collection/{slug}", get(collection_get_handler))
         .route("/collection/{slug}", post(collection_post_handler))
         .route("/collection/{slug}/start", post(collection_start_handler))
+        .route(
+            "/collection/{slug}/settings",
+            get(collection_settings_get_handler),
+        )
+        .route(
+            "/collection/{slug}/settings",
+            post(collection_settings_post_handler),
+        )
         .route("/collection/{slug}/stats", get(collection_stats_handler))
         .route("/collection/{slug}/export", get(collection_export_handler))
         .route("/collection/{slug}/bookmarks", get(bookmark_list_handler))

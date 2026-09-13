@@ -311,6 +311,9 @@ pub fn render_browse_page(
                     a.btn.btn-secondary href=(format!("/collection/{slug}/stats")) {
                         "Stats"
                     }
+                    a.btn.btn-secondary href=(format!("/collection/{slug}/settings")) {
+                        "Settings"
+                    }
                     @if bookmark_count > 0 {
                         a.btn.btn-secondary href=(format!("/collection/{slug}/bookmarks")) {
                             "\u{2605} Bookmarks (" (bookmark_count) ")"
