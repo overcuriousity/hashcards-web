@@ -1,7 +1,10 @@
 <changelog>
     <unreleased>
-        <added>
-            <change author="claude">
+        </unreleased>
+    <releases>
+        <release version="0.5.1" date="2026-09-14">
+            <added>
+                <change author="claude">
             **The FSRS weights are yours to set,** on the settings page. The
             19 numbers the scheduling formulas are built from used to be
             compiled into the binary; now they are shown, explained group by
@@ -9,7 +12,7 @@
             empty the box to go back to the defaults. A collection can carry
             its own set, for material that behaves differently from the rest.
             </change>
-            <change author="claude">
+                <change author="claude">
             **Fit the weights to your own reviews.** **Fit the weights to my
             reviews** on the settings page reads your whole review history
             and looks for parameters that predict it better than the ones in
@@ -19,7 +22,7 @@
             that is not an improvement. Nothing is saved until you press
             **Save settings**: it proposes, you decide.
             </change>
-            <change author="claude">
+                <change author="claude">
             **A settings page,** reached from **Settings** on the front
             page. Everything that shapes a schedule was configurable only by
             editing `hashcards.toml` by hand or asking an assistant over
@@ -32,7 +35,7 @@
             "inherit", and says what it is inheriting, so clearing a field
             hands it back rather than freezing today's value into it.
             </change>
-            <change author="claude">
+                <change author="claude">
             **Daily limits.** Cap how many reviews and how many new cards a
             collection hands you in a day; the rest wait for tomorrow. The
             limits are per collection, as Anki's are per deck, so drilling
@@ -41,7 +44,7 @@
             pile growing behind it stays visible. An empty box is no limit;
             zero is a limit of zero, which is a real answer for new cards.
             </change>
-            <change author="claude">
+                <change author="claude">
             **Free weekdays.** Name the days you are not available and no
             card is scheduled to come due on them -- it moves to the nearest
             day that is open, preferring the later one, since seeing a card
@@ -51,9 +54,9 @@
             rather than pushed past the ceiling, and at least one day has to
             stay open.
             </change>
-        </added>
-        <fixed>
-            <change author="claude">
+            </added>
+            <fixed>
+                <change author="claude">
             **A symbolic link pointing nowhere can no longer be written
             through.** The file manager checked the deepest part of a path
             that already existed, and asked that question in a way that
@@ -63,13 +66,13 @@
             wherever it pointed, outside the card folder entirely. Existence
             is now asked of the link itself.
             </change>
-            <change author="claude">
+                <change author="claude">
             **Pasting an image needs a card file to paste it into.** The
             endpoint took the path on its word and made the collection's
             `media/` folder for it, so a request naming a deck that does not
             exist left a media folder behind for a deck nobody can open.
             </change>
-            <change author="claude">
+                <change author="claude">
             **A collection whose `.hashcards.toml` cannot be read still owns
             its name.** Whether a name was free was answered by the same
             listing that skips a folder it cannot make sense of, so while a
@@ -78,7 +81,7 @@
             listing, with only a line in the log to say which. The question
             is now asked of the folders themselves.
             </change>
-            <change author="claude">
+                <change author="claude">
             **Collection pages no longer hold up the server while they look
             themselves up.** Finding a collection reads your card folder, and
             two of the busiest handlers -- the collection page and the script
@@ -87,9 +90,8 @@
             for each collection it draws on, on every render and every card
             graded.
             </change>
-        </fixed>
-        </unreleased>
-    <releases>
+            </fixed>
+        </release>
         <release version="0.5.0" date="2026-09-13">
             <added>
                 <change author="claude">
