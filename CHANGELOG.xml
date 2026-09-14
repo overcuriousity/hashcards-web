@@ -52,6 +52,42 @@
             stay open.
             </change>
         </added>
+        <fixed>
+            <change author="claude">
+            **A symbolic link pointing nowhere can no longer be written
+            through.** The file manager checked the deepest part of a path
+            that already existed, and asked that question in a way that
+            follows links -- so a link whose target did not exist yet
+            answered "I am not here" and was skipped over. Creating or
+            saving a file at that name then followed the link and wrote
+            wherever it pointed, outside the card folder entirely. Existence
+            is now asked of the link itself.
+            </change>
+            <change author="claude">
+            **Pasting an image needs a card file to paste it into.** The
+            endpoint took the path on its word and made the collection's
+            `media/` folder for it, so a request naming a deck that does not
+            exist left a media folder behind for a deck nobody can open.
+            </change>
+            <change author="claude">
+            **A collection whose `.hashcards.toml` cannot be read still owns
+            its name.** Whether a name was free was answered by the same
+            listing that skips a folder it cannot make sense of, so while a
+            collection was in trouble a new folder could take its URL -- and
+            repairing the file then made one of the two disappear from the
+            listing, with only a line in the log to say which. The question
+            is now asked of the folders themselves.
+            </change>
+            <change author="claude">
+            **Collection pages no longer hold up the server while they look
+            themselves up.** Finding a collection reads your card folder, and
+            two of the busiest handlers -- the collection page and the script
+            every page loads -- did that on a thread that is meant never to
+            wait. A custom deck compounded it, reading the whole folder once
+            for each collection it draws on, on every render and every card
+            graded.
+            </change>
+        </fixed>
         </unreleased>
     <releases>
         <release version="0.5.0" date="2026-09-13">

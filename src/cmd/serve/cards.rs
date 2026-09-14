@@ -126,9 +126,12 @@ impl CardRoot {
         let joined = self.root.join(&normalized);
 
         // Walk up to the deepest ancestor that exists and canonicalize that:
-        // the leaf may legitimately be missing.
+        // the leaf may legitimately be missing. Existence is asked of the
+        // link itself, not of its target: `exists()` follows symlinks, so a
+        // *dangling* one answers "no" and the walk steps straight past the
+        // one component the check below exists to catch.
         let mut existing = joined.as_path();
-        while !existing.exists() {
+        while existing.symlink_metadata().is_err() {
             existing = match existing.parent() {
                 Some(p) => p,
                 None => return fail(format!("Path is outside your card folder: `{trimmed}`")),
@@ -490,9 +493,9 @@ fn salvage_id(text: &str) -> Option<CollectionId> {
 ///
 /// A folder hashcards cannot make sense of is skipped with a warning rather
 /// than failing the whole listing: one malformed `.hashcards.toml` must not
-/// make every other collection disappear from the landing page. Folders are
-/// visited in name order, so which of two names that slugify alike wins does
-/// not depend on the order the filesystem happened to list them in.
+/// make every other collection disappear from the landing page -- though a
+/// folder skipped here still holds its slug against a new one, which is why
+/// `collection_folder_names` is what the file manager asks.
 pub fn discover_local_collections(
     root: &CardRoot,
     db_dir: &Path,
@@ -504,21 +507,7 @@ pub fn discover_local_collections(
         return Ok(collections);
     }
     let db_path = user_db_path(root, db_dir)?;
-    let mut names = Vec::new();
-    for entry in read_dir(root.path())? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() || path.is_symlink() {
-            continue;
-        }
-        match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if !n.starts_with('.') => names.push(n.to_string()),
-            _ => continue,
-        }
-    }
-    names.sort();
-
-    for name in names {
+    for name in collection_folder_names(root)? {
         let path = root.path().join(&name);
         let id = match folder_id(&path, policy) {
             Ok(Some(id)) => id,
@@ -547,6 +536,34 @@ pub fn discover_local_collections(
         });
     }
     Ok(collections)
+}
+
+/// The name of every top-level folder in `root`, in name order.
+///
+/// A collection is a top-level folder and nothing else, so this is the whole
+/// slug namespace of a tree -- including the folders discovery gives up on.
+/// Whoever asks "is this slug free?" has to ask here rather than of
+/// discovery, which skips a folder whose metadata it cannot read.
+pub fn collection_folder_names(root: &CardRoot) -> Fallible<Vec<String>> {
+    let mut names = Vec::new();
+    if !root.path().exists() {
+        return Ok(names);
+    }
+    for entry in read_dir(root.path())? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() || path.is_symlink() {
+            continue;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.starts_with('.') => names.push(n.to_string()),
+            _ => continue,
+        }
+    }
+    // Sorted, so which of two names that slugify alike wins does not depend
+    // on the order the filesystem happened to list them in.
+    names.sort();
+    Ok(names)
 }
 
 /// The review database of the user whose tree this is.
@@ -731,6 +748,25 @@ mod tests {
         std::fs::create_dir_all(&outside)?;
         std::os::unix::fs::symlink(&outside, root.path().join("link"))?;
         assert!(root.resolve("link/evil.md").is_err());
+        Ok(())
+    }
+
+    /// A symlink whose target does not exist reports `exists() == false`,
+    /// so a walk up to the "deepest existing ancestor" steps straight past
+    /// it and checks its parent instead. Writing to the path that comes
+    /// back then follows the link and creates the file outside the tree.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn rejects_escape_through_a_dangling_symlink() -> Fallible<()> {
+        let (dir, root) = fixture()?;
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside)?;
+        // The link itself is the leaf: `create_entry` would write through it.
+        std::os::unix::fs::symlink(outside.join("evil.md"), root.path().join("link"))?;
+        assert!(root.resolve("link").is_err());
+        // And the link is an interior component of a longer path.
+        std::os::unix::fs::symlink(dir.join("gone"), root.path().join("dir"))?;
+        assert!(root.resolve("dir/evil.md").is_err());
         Ok(())
     }
 

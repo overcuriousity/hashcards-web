@@ -83,19 +83,25 @@ pub async fn collection_get_handler(
 ) -> (StatusCode, Html<String>) {
     let flash = Flash::from_query(&query);
     let owner = current_user.map(|u| u.email);
-    // A slug that isn't the caller's (wrong owner, or doesn't exist at all)
-    // 404s before touching the session map, so an active session belonging
-    // to a different owner is never reachable by slug alone.
-    if find_drill_target(&state, &slug, owner.as_deref()).is_none() {
-        return (StatusCode::NOT_FOUND, collection_not_found_page());
-    }
     let state2 = state.clone();
     let slug2 = slug.clone();
     let owner2 = owner.clone();
-    match run_blocking(move || collection_get_inner(&state2, &slug2, flash, owner2.as_deref()))
-        .await
-    {
-        Ok(html) => (StatusCode::OK, Html(html)),
+    // Resolving the slug reads the caller's card folder, so it happens on
+    // the blocking pool together with the rendering rather than on the
+    // executor. A slug that isn't the caller's (wrong owner, or doesn't
+    // exist at all) 404s before the session map is touched, so an active
+    // session belonging to a different owner is never reachable by slug
+    // alone.
+    let rendered = run_blocking(move || {
+        if find_drill_target(&state2, &slug2, owner2.as_deref()).is_none() {
+            return Ok(None);
+        }
+        collection_get_inner(&state2, &slug2, flash, owner2.as_deref()).map(Some)
+    })
+    .await;
+    match rendered {
+        Ok(None) => (StatusCode::NOT_FOUND, collection_not_found_page()),
+        Ok(Some(html)) => (StatusCode::OK, Html(html)),
         Err(e) => {
             let html = page_template(html! {
                 div.error {
@@ -256,8 +262,16 @@ pub(super) fn deck_sources(
     owner: Option<&str>,
 ) -> Vec<SessionSourceSpec> {
     let mut by_collection: Vec<SessionSourceSpec> = Vec::new();
+    // Read once, not once per member: resolving a slug reads the caller's
+    // card folder and a `.hashcards.toml` per collection in it, and this
+    // runs on every render of the deck and on every grade posted to it.
+    let available = existing_collections_for_user(state, current_user_for(owner).as_ref());
     for member in &deck.members {
-        let Some(rc) = find_collection(state, &member.collection_slug, owner) else {
+        let Some(rc) = available
+            .iter()
+            .find(|c| c.slug == member.collection_slug && c.owner.as_deref() == owner)
+            .cloned()
+        else {
             continue;
         };
         match by_collection
@@ -1049,23 +1063,29 @@ pub async fn collection_script_handler(
             include_str!("../drill/script.js")
         )
     };
-    if find_drill_target(&state, &slug, owner.as_deref()).is_none() {
-        return (
-            StatusCode::OK,
-            [
-                (CONTENT_TYPE, "text/javascript"),
-                (CACHE_CONTROL, CACHE_CONTROL_REVALIDATE),
-            ],
-            script(&[]),
-        );
-    }
-    let key = SessionKey::new(owner.as_deref(), &slug);
-    let session: Option<SharedSession> = state.sessions.lock().get(&key).cloned();
-    let macros: Vec<(String, String)> = match session {
-        Some(session) => session.lock().macros.clone(),
-        // No active session; serve the script without macros.
-        None => Vec::new(),
-    };
+    // Resolving the slug reads the caller's card folder: every page load
+    // fetches this script, so doing it on the executor blocks a worker once
+    // per page. An unknown slug is served the script without macros.
+    let state2 = state.clone();
+    let slug2 = slug.clone();
+    let owner2 = owner.clone();
+    let macros: Vec<(String, String)> = run_blocking(move || {
+        if find_drill_target(&state2, &slug2, owner2.as_deref()).is_none() {
+            return Ok(Vec::new());
+        }
+        let key = SessionKey::new(owner2.as_deref(), &slug2);
+        let session: Option<SharedSession> = state2.sessions.lock().get(&key).cloned();
+        Ok(match session {
+            Some(session) => session.lock().macros.clone(),
+            // No active session; serve the script without macros.
+            None => Vec::new(),
+        })
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("Reading the macros for `{slug}` failed: {e}");
+        Vec::new()
+    });
     (
         StatusCode::OK,
         [

@@ -18,6 +18,7 @@ use crate::cmd::serve::auth::CurrentUser;
 use crate::cmd::serve::cards::COLLECTION_META_FILE;
 use crate::cmd::serve::cards::CardRoot;
 use crate::cmd::serve::cards::IdPolicy;
+use crate::cmd::serve::cards::collection_folder_names;
 use crate::cmd::serve::cards::collection_id;
 use crate::cmd::serve::cards::discover_local_collections;
 use crate::cmd::serve::cards::existing_collection_id;
@@ -398,19 +399,16 @@ fn slug_taken_by(
     let slug = slugify(name);
     let owner = owner_key(user);
     let mut taken = reserved_slugs(state, owner.as_deref());
-    let db_dir = match &state.config.data_dir {
-        Some(d) => d.join("db"),
-        None => return fail("No data directory is configured."),
-    };
-    // `CreateMissing`, not `ExistingOnly`: a folder dropped in by hand has
-    // no id yet, and it still owns its slug.
-    let siblings =
-        discover_local_collections(root, &db_dir, owner.as_deref(), IdPolicy::CreateMissing)?;
+    // Asked of the folders on disk rather than of discovery: discovery
+    // *skips* a folder whose metadata it cannot read, and a folder in
+    // trouble still owns its slug. Handing the slug to a new folder would
+    // mean that repairing the metadata makes one of the two vanish from the
+    // listing, with only a log line to say which.
     taken.extend(
-        siblings
+        collection_folder_names(root)?
             .into_iter()
-            .filter(|c| Some(c.coll_dir.as_path()) != except)
-            .map(|c| (c.slug.clone(), c.name)),
+            .filter(|n| except != Some(root.path().join(n).as_path()))
+            .map(|n| (slugify(&n), n)),
     );
     Ok(taken
         .into_iter()
@@ -1343,6 +1341,26 @@ mod tests {
         let dir = create_tmp_directory()?;
         let state = state_for(&dir);
         create_entry(&state, None, "", "Verbs 1", NewEntry::Folder)?;
+        assert!(create_entry(&state, None, "", "Verbs-1", NewEntry::Folder).is_err());
+        Ok(())
+    }
+
+    /// Discovery skips a folder it cannot make sense of, so asking it which
+    /// slugs are taken loses exactly the folders that are in trouble. The
+    /// folder is still there, still owns its slug, and giving that slug away
+    /// means one of the two disappears from the listing for good once the
+    /// metadata is repaired.
+    #[test]
+    fn a_folder_with_unreadable_metadata_still_owns_its_slug() -> Fallible<()> {
+        let dir = create_tmp_directory()?;
+        let state = state_for(&dir);
+        create_entry(&state, None, "", "Verbs 1", NewEntry::Folder)?;
+        let root = user_root(&state, None)?;
+        std::fs::write(
+            root.path().join("Verbs 1").join(COLLECTION_META_FILE),
+            "this is not = = toml\n",
+        )?;
+
         assert!(create_entry(&state, None, "", "Verbs-1", NewEntry::Folder).is_err());
         Ok(())
     }
