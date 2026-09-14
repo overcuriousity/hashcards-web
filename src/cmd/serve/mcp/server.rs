@@ -115,6 +115,22 @@ impl HashcardsMcp {
             .map(|t| t.name.to_string())
             .collect()
     }
+
+    /// Every tool's name paired with the output schema it advertises.
+    #[cfg(test)]
+    pub fn tool_output_schemas(&self) -> Vec<(String, Option<serde_json::Value>)> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let schema = t
+                    .output_schema
+                    .as_ref()
+                    .map(|s| serde_json::Value::Object((**s).clone()));
+                (t.name.to_string(), schema)
+            })
+            .collect()
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

@@ -31,6 +31,14 @@ use crate::cmd::serve::trash::list_trash;
 use crate::error::Fallible;
 use crate::error::fail;
 
+/// `list_trash`'s return value. Wrapped because the MCP specification
+/// requires an `outputSchema` of type `object`, and a bare array makes a
+/// validating client reject the whole server.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TrashList {
+    pub items: Vec<TrashedItem>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TrashedItem {
     /// What restore_from_trash takes.
@@ -95,12 +103,12 @@ impl HashcardsMcp {
     async fn list_trash(
         &self,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<Vec<TrashedItem>>, ErrorData> {
+    ) -> Result<Json<TrashList>, ErrorData> {
         let caller = self.caller(&ctx)?;
         let state = self.state.clone();
         run_blocking(move || list_trash_for(&state, caller.current_user().as_ref()))
             .await
-            .map(Json)
+            .map(|items| Json(TrashList { items }))
             .map_err(to_mcp)
     }
 
@@ -270,6 +278,29 @@ mod tests {
         }
         assert!(names.iter().any(|n| n == "restore_from_trash"));
         assert!(names.iter().any(|n| n == "list_trash"));
+        Ok(())
+    }
+
+    /// The MCP specification requires `outputSchema` to be a JSON Schema
+    /// of type `object`. A tool returning a bare `Vec` advertises an
+    /// `array` instead, and a client that validates the tool list rejects
+    /// the whole server -- every tool, not just the offending one.
+    #[test]
+    fn every_output_schema_is_an_object() -> Fallible<()> {
+        let (_dir, mcp) = mcp_fixture()?;
+        for (name, schema) in mcp.tool_output_schemas() {
+            let Some(schema) = schema else {
+                continue;
+            };
+            let kind = schema.get("type").and_then(|t| t.as_str());
+            assert_eq!(
+                kind,
+                Some("object"),
+                "`{name}` advertises an outputSchema of type {kind:?}. The MCP specification \
+                 requires `object`, and a client that validates it refuses the whole server. \
+                 Wrap the return value in a struct with one named field."
+            );
+        }
         Ok(())
     }
 

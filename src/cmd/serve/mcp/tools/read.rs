@@ -61,6 +61,24 @@ pub struct CollectionSummary {
     pub name: String,
 }
 
+/// `list_collections`'s return value.
+///
+/// The MCP specification requires a tool's `outputSchema` to be a JSON
+/// Schema of type `object`, so a list is returned under a named field
+/// rather than as a bare array. A client that validates the tool list
+/// rejects the entire server otherwise.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CollectionList {
+    pub collections: Vec<CollectionSummary>,
+}
+
+/// `list_cards`'s return value. Wrapped for the reason [`CollectionList`]
+/// gives.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CardList {
+    pub cards: Vec<CardSummary>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CardSummary {
     /// The card's content address. It changes when the card's text changes.
@@ -503,12 +521,12 @@ impl HashcardsMcp {
     async fn list_collections(
         &self,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<Vec<CollectionSummary>>, ErrorData> {
+    ) -> Result<Json<CollectionList>, ErrorData> {
         let caller = self.caller(&ctx)?;
         let state = self.state.clone();
         run_blocking(move || list_collections_for(&state, caller.current_user().as_ref()))
             .await
-            .map(Json)
+            .map(|collections| Json(CollectionList { collections }))
             .map_err(to_mcp)
     }
 
@@ -566,7 +584,7 @@ impl HashcardsMcp {
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListCardsArgs>,
-    ) -> Result<Json<Vec<CardSummary>>, ErrorData> {
+    ) -> Result<Json<CardList>, ErrorData> {
         let caller = self.caller(&ctx)?;
         let state = self.state.clone();
         run_blocking(move || {
@@ -581,7 +599,7 @@ impl HashcardsMcp {
             )
         })
         .await
-        .map(Json)
+        .map(|cards| Json(CardList { cards }))
         .map_err(to_mcp)
     }
 

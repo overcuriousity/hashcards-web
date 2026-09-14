@@ -1,5 +1,15 @@
 <changelog>
     <unreleased>
+        <fixed>
+                <change author="claude">
+            **The MCP endpoint works with strict clients again.** The four
+            `list_` tools returned a bare array, but the MCP specification
+            requires a tool's output schema to describe an object. A client
+            that checks refused the entire server -- all twenty-three tools,
+            not just the four. Each list now comes back under a named field:
+            `collections`, `cards`, `saved_decks`, `items`.
+            </change>
+        </fixed>
         </unreleased>
     <releases>
         <release version="0.5.1" date="2026-09-14">

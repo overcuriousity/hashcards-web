@@ -41,6 +41,14 @@ use crate::error::Fallible;
 use crate::error::fail;
 use crate::parser::parse_deck;
 
+/// `list_saved_decks`'s return value. Wrapped because the MCP
+/// specification requires an `outputSchema` of type `object`, and a bare
+/// array makes a validating client reject the whole server.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SavedDeckList {
+    pub saved_decks: Vec<SavedDeck>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SavedDeck {
     pub name: String,
@@ -220,12 +228,12 @@ impl HashcardsMcp {
     async fn list_saved_decks(
         &self,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<Vec<SavedDeck>>, ErrorData> {
+    ) -> Result<Json<SavedDeckList>, ErrorData> {
         let caller = self.caller(&ctx)?;
         let state = self.state.clone();
         run_blocking(move || list_saved_decks_for(&state, caller.current_user().as_ref()))
             .await
-            .map(Json)
+            .map(|saved_decks| Json(SavedDeckList { saved_decks }))
             .map_err(to_mcp)
     }
 
