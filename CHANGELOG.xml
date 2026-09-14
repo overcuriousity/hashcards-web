@@ -1,6 +1,9 @@
 <changelog>
     <unreleased>
-        <fixed>
+        </unreleased>
+    <releases>
+        <release version="0.5.2" date="2026-09-14">
+            <fixed>
                 <change author="claude">
             **The MCP endpoint works with strict clients again.** The four
             `list_` tools returned a bare array, but the MCP specification
@@ -9,9 +12,8 @@
             not just the four. Each list now comes back under a named field:
             `collections`, `cards`, `saved_decks`, `items`.
             </change>
-        </fixed>
-        </unreleased>
-    <releases>
+            </fixed>
+        </release>
         <release version="0.5.1" date="2026-09-14">
             <added>
                 <change author="claude">
