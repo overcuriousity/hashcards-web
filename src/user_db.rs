@@ -34,6 +34,9 @@ use crate::error::fail;
 use crate::types::card_hash::CardHash;
 use crate::types::collection_id::CollectionId;
 use crate::types::timestamp::Timestamp;
+use crate::user_settings::UserSettings;
+use crate::user_settings::read_settings;
+use crate::user_settings::write_settings;
 
 /// How long a connection waits for a lock held by another connection before
 /// giving up with SQLITE_BUSY. WAL removes most of the contention this was
@@ -93,6 +96,34 @@ impl UserDatabase {
     /// A view of one collection on this database's connection.
     pub fn collection(&self, id: CollectionId) -> Database {
         Database::new_view(Arc::clone(&self.conn), id)
+    }
+
+    /// This user's settings, forgiving anything unreadable.
+    ///
+    /// Takes the lock once and calls a free function under it: the mutex is
+    /// not reentrant.
+    pub fn user_settings(&self) -> UserSettings {
+        let conn = self.conn.lock();
+        read_settings(&conn)
+    }
+
+    /// Replace this user's settings wholesale, clearing the ones they no
+    /// longer set.
+    pub fn save_user_settings(&self, settings: &UserSettings) -> Fallible<()> {
+        let mut conn = self.conn.lock();
+        write_settings(&mut conn, settings)
+    }
+
+    /// Plant a raw `meta` value, to test that an unreadable one is forgiven.
+    #[cfg(test)]
+    pub fn put_meta_for_test(&self, key: &str, value: &str) -> Fallible<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "insert into meta (key, value) values (?, ?) \
+             on conflict (key) do update set value = excluded.value;",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Move some cards' review history from one collection to another.

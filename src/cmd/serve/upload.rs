@@ -62,6 +62,13 @@ pub fn store_pasted_image(root: &CardRoot, rel: &str, bytes: &[u8]) -> Fallible<
         ));
     }
     let extension = sniff_image(bytes)?;
+    // The path is the deck the image is being pasted into. A path that
+    // names no card file is not an edit in progress, and storing for it
+    // would create a collection's media folder on the strength of a name
+    // nothing answers to.
+    if !root.resolve(rel)?.is_file() {
+        return fail(format!("`{rel}` is not a card file in your collection."));
+    }
     let media = collection_folder(root, rel)?.join(MEDIA_DIR);
     ensure_dir(&media, "collection media directory")?;
 
@@ -217,6 +224,25 @@ mod tests {
         let (_dir, root) = fixture()?;
         std::fs::write(root.path().join("loose.md"), "Q: a\nA: b\n")?;
         assert!(store_pasted_image(&root, "loose.md", &png()).is_err());
+        Ok(())
+    }
+
+    /// The path names the deck being edited, so a path naming no deck at
+    /// all is a request that cannot have come from the editor. Storing for
+    /// it anyway materializes a `media/` folder inside a collection for a
+    /// file that does not exist -- and, for a top-level name that is not a
+    /// collection either, invents the collection folder's media directory.
+    #[test]
+    fn a_paste_for_a_deck_that_does_not_exist_is_refused() -> Fallible<()> {
+        let (_dir, root) = fixture()?;
+        assert!(store_pasted_image(&root, "Spanish/nope.md", &png()).is_err());
+        assert!(
+            !root.path().join("Spanish").join("media").exists(),
+            "a refused paste must write nothing"
+        );
+        // A directory is not a deck either.
+        std::fs::create_dir_all(root.path().join("Spanish").join("Unit 2"))?;
+        assert!(store_pasted_image(&root, "Spanish/Unit 2", &png()).is_err());
         Ok(())
     }
 

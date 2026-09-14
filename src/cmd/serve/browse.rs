@@ -8,8 +8,9 @@ use maud::Markup;
 use maud::html;
 
 use crate::cmd::drill::template::page_template;
-use crate::cmd::serve::config::DefaultsSection;
 use crate::cmd::serve::counts::Burial;
+use crate::cmd::serve::counts::QueuePolicy;
+use crate::cmd::serve::counts::budget_for;
 use crate::cmd::serve::href::encoded_path;
 use crate::collection::Collection;
 use crate::db::Database;
@@ -87,11 +88,7 @@ pub struct BrowseData {
 /// The due counts are what a drill would actually queue: this page's Start
 /// button carries their sum, and a sum that ignored sibling burying would
 /// name more cards than the session behind the button ever holds.
-pub fn build_deck_tree(
-    coll_dir: &Path,
-    db: Database,
-    defaults: &DefaultsSection,
-) -> Fallible<BrowseData> {
+pub fn build_deck_tree(coll_dir: &Path, db: Database, policy: QueuePolicy) -> Fallible<BrowseData> {
     let collection = Collection::open(coll_dir.to_path_buf(), db)?;
     let session_started_at = Timestamp::now();
     let today: Date = session_started_at.date();
@@ -107,7 +104,11 @@ pub fn build_deck_tree(
     let due_hashes: HashSet<CardHash> = collection.db.due_today(today)?;
     // One burial across the whole collection, as a session over it would
     // have: a family is buried once, not once per topic.
-    let mut burial = Burial::new(defaults);
+    let mut burial = Burial::new(policy.bury_siblings);
+    // Burial first, then the budget, in the order the session builder
+    // applies them: a count filtered in a different order counts a
+    // different set.
+    let (mut budget, new_cards) = budget_for(&collection.db, policy.limits, today)?;
 
     // Count per deck
     let mut counts: HashMap<String, DeckCounts> = HashMap::new();
@@ -118,7 +119,10 @@ pub fn build_deck_tree(
             .entry(card.deck_name().clone())
             .or_insert(DeckCounts { total: 0, due: 0 });
         entry.total += 1;
-        if due_hashes.contains(&card.hash()) && burial.admits(card) {
+        if due_hashes.contains(&card.hash())
+            && burial.admits(card)
+            && budget.admits(new_cards.contains(&card.hash()))
+        {
             entry.due += 1;
         }
         let rel = card.relative_file_path(&collection.directory).ok();
@@ -307,6 +311,9 @@ pub fn render_browse_page(
                     a.btn.btn-secondary href=(format!("/collection/{slug}/stats")) {
                         "Stats"
                     }
+                    a.btn.btn-secondary href=(format!("/collection/{slug}/settings")) {
+                        "Settings"
+                    }
                     @if bookmark_count > 0 {
                         a.btn.btn-secondary href=(format!("/collection/{slug}/bookmarks")) {
                             "\u{2605} Bookmarks (" (bookmark_count) ")"
@@ -474,6 +481,7 @@ function updateDrillButton() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::serve::config::DefaultsSection;
     use crate::helper::create_tmp_directory;
     use crate::types::collection_id::CollectionId;
     use crate::user_db::UserDatabase;
@@ -498,7 +506,7 @@ mod tests {
         let browse = build_deck_tree(
             &dir,
             open_test_db(&dir.join("test.db"))?,
-            &DefaultsSection::default(),
+            QueuePolicy::from_defaults(&DefaultsSection::default()),
         )?;
         let html = render_browse_page("My Cards", "My-Cards", &browse, 0, 0, None).into_string();
         assert!(
@@ -520,7 +528,7 @@ mod tests {
         let browse = build_deck_tree(
             &dir,
             open_test_db(&dir.join("hashcards.db"))?,
-            &DefaultsSection::default(),
+            QueuePolicy::from_defaults(&DefaultsSection::default()),
         )?;
         assert_eq!(
             browse.duplicates.len(),

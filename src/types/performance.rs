@@ -22,6 +22,7 @@ use crate::fsrs::Grade;
 use crate::fsrs::Interval;
 use crate::fsrs::Recall;
 use crate::fsrs::Stability;
+use crate::fsrs::Weights;
 use crate::fsrs::initial_difficulty;
 use crate::fsrs::initial_stability;
 use crate::fsrs::interval;
@@ -30,6 +31,7 @@ use crate::fsrs::new_stability;
 use crate::fsrs::retrievability;
 use crate::rng::TinyRng;
 use crate::types::date::Date;
+use crate::types::free_days::FreeDays;
 use crate::types::timestamp::Timestamp;
 
 /// The minimum review interval in days.
@@ -120,6 +122,19 @@ pub struct Scheduling {
     pub retention: DesiredRetention,
     pub max_interval: MaxInterval,
     pub jitter: Jitter,
+    /// The weekdays that take no due dates.
+    ///
+    /// Per instance and per user, never per collection -- see the note on
+    /// jitter in `ResolvedCollection::scheduling`, which applies here for
+    /// the same reason: which days you are busy is a fact about your week,
+    /// not about one collection.
+    pub free_days: FreeDays,
+    /// The FSRS parameters this schedule is computed with.
+    ///
+    /// Per instance, per user and per collection, like the two numbers
+    /// beside it: a fit is only as good as the history it came from, and one
+    /// person's Spanish and their anatomy deck need not share one.
+    pub weights: Weights,
 }
 
 /// Fractional random jitter applied to computed review intervals.
@@ -147,6 +162,10 @@ impl Jitter {
             ));
         }
         Ok(Jitter(fraction))
+    }
+
+    pub fn into_inner(self) -> f64 {
+        self.0
     }
 
     /// No jitter: intervals are unchanged.
@@ -205,7 +224,11 @@ pub fn update_performance(
 ) -> ReviewedPerformance {
     let today: NaiveDate = reviewed_at.date().into_inner();
     let (stability, difficulty, review_count): (Stability, Difficulty, usize) = match perf {
-        Performance::New => (initial_stability(grade), initial_difficulty(grade), 0),
+        Performance::New => (
+            initial_stability(grade, &scheduling.weights),
+            initial_difficulty(grade, &scheduling.weights),
+            0,
+        ),
         Performance::Reviewed(ReviewedPerformance {
             last_reviewed_at,
             stability,
@@ -219,8 +242,9 @@ pub fn update_performance(
             // or go NaN (BUG-28).
             let time: Interval = ((today - last_reviewed_at).num_days() as f64).max(0.0);
             let retr: Recall = retrievability(time, stability);
-            let stability: Stability = new_stability(difficulty, stability, retr, grade);
-            let difficulty: Difficulty = new_difficulty(difficulty, grade);
+            let stability: Stability =
+                new_stability(difficulty, stability, retr, grade, &scheduling.weights);
+            let difficulty: Difficulty = new_difficulty(difficulty, grade, &scheduling.weights);
             (stability, difficulty, review_count)
         }
     };
@@ -234,8 +258,16 @@ pub fn update_performance(
     let interval_clamped: Interval =
         interval_rounded.clamp(MIN_INTERVAL, scheduling.max_interval.into_inner());
     let interval_days: i64 = interval_clamped as i64;
-    let interval_duration: Duration = Duration::days(interval_days);
-    let due_date: Date = Date::new(today + interval_duration);
+    let ideal: NaiveDate = today + Duration::days(interval_days);
+    // The ceiling outranks the free-day preference: a card already at the
+    // maximum interval is pulled earlier rather than pushed past it.
+    let not_after: NaiveDate = today + Duration::days(scheduling.max_interval.into_inner() as i64);
+    let shifted: NaiveDate = scheduling.free_days.shift(ideal, not_after);
+    // Recomputed rather than carried, so `interval_days` always describes
+    // the date actually written. `interval_raw` stays unshifted for the
+    // reason it stays un-jittered.
+    let interval_days: i64 = (shifted - today).num_days();
+    let due_date: Date = Date::new(shifted);
     ReviewedPerformance {
         last_reviewed_at: reviewed_at,
         stability,
@@ -250,6 +282,101 @@ pub fn update_performance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
+    use chrono::Weekday;
+
+    use crate::types::free_days::FreeDays;
+
+    fn scheduling_with_free(days: [bool; 7]) -> Fallible<Scheduling> {
+        Ok(Scheduling {
+            free_days: FreeDays::new(days)?,
+            ..Scheduling::default()
+        })
+    }
+
+    fn weekend_free() -> Fallible<Scheduling> {
+        let mut days = [false; 7];
+        days[5] = true;
+        days[6] = true;
+        scheduling_with_free(days)
+    }
+
+    fn at_nine(day: NaiveDate) -> Timestamp {
+        Timestamp::new(day.and_hms_opt(9, 0, 0).expect("valid time"))
+    }
+
+    /// A weekend-free schedule never lands a card on Saturday or Sunday,
+    /// over a long run of reviews at many different stabilities.
+    #[test]
+    fn free_days_keep_due_dates_off_those_days() -> Fallible<()> {
+        let scheduling = weekend_free()?;
+        let mut rng = TinyRng::from_seed(42);
+        for day in 0..60 {
+            let start =
+                NaiveDate::from_ymd_opt(2026, 9, 14).expect("valid date") + Duration::days(day);
+            let result = update_performance(
+                Performance::New,
+                Grade::Good,
+                at_nine(start),
+                scheduling,
+                &mut rng,
+            );
+            let weekday = result.due_date.into_inner().weekday();
+            assert!(
+                weekday != Weekday::Sat && weekday != Weekday::Sun,
+                "landed on {weekday:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `interval_days` describes the date actually written, so the two can
+    /// never disagree; `interval_raw` stays the unshifted truth, exactly as
+    /// it stays un-jittered.
+    #[test]
+    fn a_shifted_due_date_and_its_interval_agree() -> Fallible<()> {
+        let scheduling = weekend_free()?;
+        let mut rng = TinyRng::from_seed(7);
+        for day in 0..30 {
+            let start =
+                NaiveDate::from_ymd_opt(2026, 9, 14).expect("valid date") + Duration::days(day);
+            let result = update_performance(
+                Performance::New,
+                Grade::Good,
+                at_nine(start),
+                scheduling,
+                &mut rng,
+            );
+            assert_eq!(
+                result.due_date.into_inner() - start,
+                Duration::days(result.interval_days),
+                "interval_days must describe the date written"
+            );
+        }
+        Ok(())
+    }
+
+    /// A schedule with no free days is the schedule this codebase had
+    /// before free days existed.
+    #[test]
+    fn no_free_days_changes_no_due_date() {
+        let mut a = TinyRng::from_seed(99);
+        let mut b = TinyRng::from_seed(99);
+        let at = at_nine(NaiveDate::from_ymd_opt(2026, 9, 19).expect("valid date"));
+        let plain = update_performance(
+            Performance::New,
+            Grade::Good,
+            at,
+            Scheduling::default(),
+            &mut a,
+        );
+        let explicit = Scheduling {
+            free_days: FreeDays::none(),
+            ..Scheduling::default()
+        };
+        let same = update_performance(Performance::New, Grade::Good, at, explicit, &mut b);
+        assert_eq!(plain, same);
+    }
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-2

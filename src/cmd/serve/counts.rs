@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::cmd::serve::config::DefaultsSection;
 use crate::cmd::serve::config::ResolvedCollection;
+use crate::cmd::serve::reviewdb::user_settings_for;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::CollectionInfo;
 use crate::collection::Collection;
@@ -21,8 +22,11 @@ use crate::error::fail;
 use crate::types::card::Card;
 use crate::types::card_hash::CardHash;
 use crate::types::date::Date;
+use crate::types::limits::DailyBudget;
+use crate::types::limits::DailyLimits;
 use crate::types::timestamp::Timestamp;
 use crate::user_db::UserDatabase;
+use crate::user_settings::UserSettings;
 
 /// The instance's sibling-burying policy, applied one card at a time.
 ///
@@ -32,6 +36,75 @@ use crate::user_db::UserDatabase;
 /// cards the session will never show: "Start (12 due)" opening on
 /// "0 of 7". Counting and queueing therefore run through this same filter.
 ///
+/// What a collection's row says about its cards.
+///
+/// `due_today` is the size of the session its Drill button starts;
+/// `due_uncapped` is what is really waiting behind any daily limit. They
+/// differ only when a limit trimmed the queue, and the page shows both so
+/// that a growing backlog is never hidden by a cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CollectionCounts {
+    pub total_cards: usize,
+    pub due_today: usize,
+    pub due_uncapped: usize,
+}
+
+/// Everything a resolved collection says about which due cards actually
+/// reach a queue: whether to bury siblings, and how many cards it will hand
+/// out today.
+///
+/// Resolved once, then used by the session builder *and* by every counter
+/// that claims to describe it. A count filtered differently from the queue
+/// is the bug this type exists to prevent.
+#[derive(Clone, Copy, Debug)]
+pub struct QueuePolicy {
+    pub bury_siblings: bool,
+    pub limits: DailyLimits,
+}
+
+impl QueuePolicy {
+    /// The instance's answers, with the user's and the collection's laid
+    /// over them.
+    pub fn resolve(
+        defaults: &DefaultsSection,
+        user: &UserSettings,
+        rc: &ResolvedCollection,
+    ) -> Self {
+        Self {
+            bury_siblings: user.bury_siblings.unwrap_or(defaults.bury_siblings),
+            limits: rc.limits(defaults.limits(), user),
+        }
+    }
+
+    /// The instance's answers alone, for tests. Production always has a
+    /// user to consult, even if it is the one who set nothing.
+    #[cfg(test)]
+    pub fn from_defaults(defaults: &DefaultsSection) -> Self {
+        Self {
+            bury_siblings: defaults.bury_siblings,
+            limits: defaults.limits(),
+        }
+    }
+}
+
+/// What this collection has left of its limits today, and which of its cards
+/// are new.
+///
+/// The two are read together because they are spent together: a card is new
+/// or it is not, and which budget it spends follows from that.
+pub fn budget_for(
+    db: &Database,
+    limits: DailyLimits,
+    today: Date,
+) -> Fallible<(DailyBudget, HashSet<CardHash>)> {
+    let budget = DailyBudget::new(
+        limits,
+        db.count_reviews_in_date(today)?,
+        db.new_cards_today_count(today)?,
+    );
+    Ok((budget, db.new_cards()?))
+}
+
 /// One `Burial` covers everything a single session would draw on: a family
 /// is buried across the whole queue, not once per topic, and a cloze note
 /// written into two collections is one family in both.
@@ -41,10 +114,10 @@ pub struct Burial {
 }
 
 impl Burial {
-    /// Burying as `defaults` asks for it.
-    pub fn new(defaults: &DefaultsSection) -> Self {
+    /// Burying as the resolved settings ask for it.
+    pub fn new(bury_siblings: bool) -> Self {
         Self {
-            enabled: defaults.bury_siblings,
+            enabled: bury_siblings,
             seen: HashSet::new(),
         }
     }
@@ -78,21 +151,28 @@ pub fn refresh_collection_info(
     let mut opened: HashMap<PathBuf, UserDatabase> = HashMap::new();
     let mut infos = Vec::new();
     for rc in collections {
-        let counts = open_user_db(state, rc, &mut opened)
-            .and_then(|db| compute_collection_counts(&rc.coll_dir, db, &state.config.defaults));
-        let (total_cards, due_today) = match counts {
+        let counts = open_user_db(state, rc, &mut opened).and_then(|db| {
+            let policy = QueuePolicy::resolve(
+                &state.config.defaults,
+                &user_settings_for(state, &rc.db_path),
+                rc,
+            );
+            compute_collection_counts(&rc.coll_dir, db, policy)
+        });
+        let counts = match counts {
             Ok(counts) => counts,
             Err(e) => {
                 log::warn!("Failed to load collection '{}': {e}", rc.name);
-                (0, 0)
+                CollectionCounts::default()
             }
         };
 
         infos.push(CollectionInfo {
             name: rc.name.clone(),
             slug: rc.slug.clone(),
-            total_cards,
-            due_today,
+            total_cards: counts.total_cards,
+            due_today: counts.due_today,
+            due_uncapped: counts.due_uncapped,
             owner: rc.owner.clone(),
         });
     }
@@ -128,10 +208,10 @@ fn open_user_db(
 pub fn compute_collection_counts(
     coll_dir: &Path,
     db: Database,
-    defaults: &DefaultsSection,
-) -> Fallible<(usize, usize)> {
+    policy: QueuePolicy,
+) -> Fallible<CollectionCounts> {
     if !coll_dir.exists() {
-        return Ok((0, 0));
+        return Ok(CollectionCounts::default());
     }
 
     let collection = Collection::open(coll_dir.to_path_buf(), db)?;
@@ -149,15 +229,36 @@ pub fn compute_collection_counts(
     }
 
     let due_hashes = collection.db.due_today(today)?;
-    let mut burial = Burial::new(defaults);
-    let due_today = collection
+    let mut burial = Burial::new(policy.bury_siblings);
+    // Burial first, then the budget, in the order the session builder
+    // applies them. Filtering in a different order here would count a
+    // different set.
+    let (mut budget, new_cards) = budget_for(&collection.db, policy.limits, today)?;
+    // Both counts come from one pass, because `burial.admits` is spent as
+    // it is asked: a second pass would bury against a used-up filter.
+    let mut due_today = 0;
+    let mut due_uncapped = 0;
+    for card in collection
         .cards
         .iter()
         .filter(|c| due_hashes.contains(&c.hash()))
-        .filter(|c| burial.admits(c))
-        .count();
+    {
+        if !burial.admits(card) {
+            continue;
+        }
+        // What is really waiting, before any cap. A limit must never make a
+        // backlog look like a finished day.
+        due_uncapped += 1;
+        if budget.admits(new_cards.contains(&card.hash())) {
+            due_today += 1;
+        }
+    }
 
-    Ok((total_cards, due_today))
+    Ok(CollectionCounts {
+        total_cards,
+        due_today,
+        due_uncapped,
+    })
 }
 
 #[cfg(test)]

@@ -16,7 +16,9 @@ use crate::cmd::serve::config::slugify;
 use crate::error::ErrorReport;
 use crate::error::Fallible;
 use crate::error::fail;
+use crate::fsrs::Weights;
 use crate::types::collection_id::CollectionId;
+use crate::types::limits::DailyLimits;
 use crate::types::performance::DesiredRetention;
 use crate::types::performance::MaxInterval;
 use crate::utils::ensure_dir;
@@ -124,9 +126,12 @@ impl CardRoot {
         let joined = self.root.join(&normalized);
 
         // Walk up to the deepest ancestor that exists and canonicalize that:
-        // the leaf may legitimately be missing.
+        // the leaf may legitimately be missing. Existence is asked of the
+        // link itself, not of its target: `exists()` follows symlinks, so a
+        // *dangling* one answers "no" and the walk steps straight past the
+        // one component the check below exists to catch.
         let mut existing = joined.as_path();
-        while !existing.exists() {
+        while existing.symlink_metadata().is_err() {
             existing = match existing.parent() {
                 Some(p) => p,
                 None => return fail(format!("Path is outside your card folder: `{trimmed}`")),
@@ -200,6 +205,12 @@ struct CollectionMeta {
     desired_retention: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_interval_days: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_reviews_per_day: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_new_per_day: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weights: Option<toml::Value>,
 }
 
 /// The scheduling a collection asks for in its own `.hashcards.toml`.
@@ -237,7 +248,67 @@ pub fn collection_overrides(folder: &Path) -> SchedulingOverrides {
                     .inspect_err(|e| complain("max_interval_days", e))
                     .ok()
             }),
+        limits: DailyLimits {
+            reviews: meta
+                .max_reviews_per_day
+                .and_then(|v| override_number(&v, "max_reviews_per_day", &meta_path))
+                .and_then(|v| card_count(v, "max_reviews_per_day", &meta_path)),
+            new: meta
+                .max_new_per_day
+                .and_then(|v| override_number(&v, "max_new_per_day", &meta_path))
+                .and_then(|v| card_count(v, "max_new_per_day", &meta_path)),
+        },
+        weights: meta
+            .weights
+            .and_then(|v| override_weights(&v, &meta_path))
+            .and_then(|w| Weights::new(w).inspect_err(|e| complain("weights", e)).ok()),
     }
+}
+
+/// The 19 numbers an FSRS fit is, as written in a collection file. Anything
+/// that is not 19 numbers inherits, with a warning: a half-read weight
+/// vector is not a schedule anyone asked for.
+fn override_weights(value: &toml::Value, meta_path: &Path) -> Option<[f64; 19]> {
+    let toml::Value::Array(items) = value else {
+        log::warn!(
+            "Ignoring `weights` in {}: expected an array of 19 numbers.",
+            meta_path.display()
+        );
+        return None;
+    };
+    let numbers: Vec<f64> = items
+        .iter()
+        .filter_map(|v| match v {
+            toml::Value::Float(f) => Some(*f),
+            toml::Value::Integer(i) => Some(*i as f64),
+            _ => None,
+        })
+        .collect();
+    match <[f64; 19]>::try_from(numbers.as_slice()) {
+        Ok(array) => Some(array),
+        Err(_) => {
+            log::warn!(
+                "Ignoring `weights` in {}: expected 19 numbers, found {}.",
+                meta_path.display(),
+                items.len()
+            );
+            None
+        }
+    }
+}
+
+/// A daily limit as written in a collection file. A negative or fractional
+/// value is not a count of cards, and inherits rather than being rounded
+/// into something the user did not ask for.
+fn card_count(value: f64, what: &str, meta_path: &Path) -> Option<u32> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
+        log::warn!(
+            "Ignoring `{what}` in {}: expected a whole number of cards, found {value}.",
+            meta_path.display()
+        );
+        return None;
+    }
+    Some(value as u32)
 }
 
 /// Rewrite a collection's `.hashcards.toml` with new scheduling overrides.
@@ -260,6 +331,8 @@ pub fn write_collection_overrides(
     folder: &Path,
     retention: Option<DesiredRetention>,
     max_interval: Option<MaxInterval>,
+    limits: DailyLimits,
+    weights: Option<Weights>,
 ) -> Fallible<()> {
     let meta_path = folder.join(COLLECTION_META_FILE);
     if let Ok(text) = read_to_string(&meta_path) {
@@ -276,6 +349,16 @@ pub fn write_collection_overrides(
         id: id.to_string(),
         desired_retention: retention.map(|r| toml::Value::Float(r.into_inner())),
         max_interval_days: max_interval.map(|m| toml::Value::Float(m.into_inner())),
+        max_reviews_per_day: limits.reviews.map(|n| toml::Value::Integer(n.into())),
+        max_new_per_day: limits.new.map(|n| toml::Value::Integer(n.into())),
+        weights: weights.map(|w| {
+            toml::Value::Array(
+                w.as_array()
+                    .iter()
+                    .map(|v| toml::Value::Float(*v))
+                    .collect(),
+            )
+        }),
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     Ok(())
@@ -316,6 +399,9 @@ pub fn collection_id(folder: &Path) -> Fallible<CollectionId> {
         id: id.clone(),
         desired_retention: None,
         max_interval_days: None,
+        max_reviews_per_day: None,
+        max_new_per_day: None,
+        weights: None,
     };
     write(&meta_path, toml::to_string(&meta)?)?;
     CollectionId::new(id)
@@ -407,9 +493,9 @@ fn salvage_id(text: &str) -> Option<CollectionId> {
 ///
 /// A folder hashcards cannot make sense of is skipped with a warning rather
 /// than failing the whole listing: one malformed `.hashcards.toml` must not
-/// make every other collection disappear from the landing page. Folders are
-/// visited in name order, so which of two names that slugify alike wins does
-/// not depend on the order the filesystem happened to list them in.
+/// make every other collection disappear from the landing page -- though a
+/// folder skipped here still holds its slug against a new one, which is why
+/// `collection_folder_names` is what the file manager asks.
 pub fn discover_local_collections(
     root: &CardRoot,
     db_dir: &Path,
@@ -421,21 +507,7 @@ pub fn discover_local_collections(
         return Ok(collections);
     }
     let db_path = user_db_path(root, db_dir)?;
-    let mut names = Vec::new();
-    for entry in read_dir(root.path())? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() || path.is_symlink() {
-            continue;
-        }
-        match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if !n.starts_with('.') => names.push(n.to_string()),
-            _ => continue,
-        }
-    }
-    names.sort();
-
-    for name in names {
+    for name in collection_folder_names(root)? {
         let path = root.path().join(&name);
         let id = match folder_id(&path, policy) {
             Ok(Some(id)) => id,
@@ -464,6 +536,34 @@ pub fn discover_local_collections(
         });
     }
     Ok(collections)
+}
+
+/// The name of every top-level folder in `root`, in name order.
+///
+/// A collection is a top-level folder and nothing else, so this is the whole
+/// slug namespace of a tree -- including the folders discovery gives up on.
+/// Whoever asks "is this slug free?" has to ask here rather than of
+/// discovery, which skips a folder whose metadata it cannot read.
+pub fn collection_folder_names(root: &CardRoot) -> Fallible<Vec<String>> {
+    let mut names = Vec::new();
+    if !root.path().exists() {
+        return Ok(names);
+    }
+    for entry in read_dir(root.path())? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() || path.is_symlink() {
+            continue;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.starts_with('.') => names.push(n.to_string()),
+            _ => continue,
+        }
+    }
+    // Sorted, so which of two names that slugify alike wins does not depend
+    // on the order the filesystem happened to list them in.
+    names.sort();
+    Ok(names)
 }
 
 /// The review database of the user whose tree this is.
@@ -522,6 +622,7 @@ mod tests {
     use super::*;
     use crate::helper::create_tmp_directory;
     use crate::types::performance::Scheduling;
+    use crate::user_settings::UserSettings;
 
     /// `create_tmp_directory` returns a `PathBuf`, not a `TempDir`.
     fn fixture() -> Fallible<(PathBuf, CardRoot)> {
@@ -650,6 +751,25 @@ mod tests {
         Ok(())
     }
 
+    /// A symlink whose target does not exist reports `exists() == false`,
+    /// so a walk up to the "deepest existing ancestor" steps straight past
+    /// it and checks its parent instead. Writing to the path that comes
+    /// back then follows the link and creates the file outside the tree.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn rejects_escape_through_a_dangling_symlink() -> Fallible<()> {
+        let (dir, root) = fixture()?;
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside)?;
+        // The link itself is the leaf: `create_entry` would write through it.
+        std::os::unix::fs::symlink(outside.join("evil.md"), root.path().join("link"))?;
+        assert!(root.resolve("link").is_err());
+        // And the link is an interior component of a longer path.
+        std::os::unix::fs::symlink(dir.join("gone"), root.path().join("dir"))?;
+        assert!(root.resolve("dir/evil.md").is_err());
+        Ok(())
+    }
+
     #[test]
     fn collection_id_is_created_once_and_then_reused() -> Fallible<()> {
         let (_dir, root) = fixture()?;
@@ -745,7 +865,7 @@ mod tests {
 
         let found =
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
-        let scheduling = found[0].scheduling(Scheduling::default());
+        let scheduling = found[0].scheduling(Scheduling::default(), &UserSettings::default());
         assert_eq!(scheduling.retention.into_inner(), 0.95);
         assert_eq!(
             scheduling.max_interval.into_inner(),
@@ -773,7 +893,7 @@ mod tests {
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(
             found[0]
-                .scheduling(Scheduling::default())
+                .scheduling(Scheduling::default(), &UserSettings::default())
                 .retention
                 .into_inner(),
             DesiredRetention::DEFAULT
@@ -801,7 +921,7 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(found.len(), 1, "the collection must still be listed");
         assert_eq!(found[0].collection_id, id);
-        let scheduling = found[0].scheduling(Scheduling::default());
+        let scheduling = found[0].scheduling(Scheduling::default(), &UserSettings::default());
         assert_eq!(scheduling.retention.into_inner(), DesiredRetention::DEFAULT);
         assert_eq!(scheduling.max_interval.into_inner(), MaxInterval::DEFAULT);
         Ok(())
@@ -824,7 +944,7 @@ mod tests {
             discover_local_collections(&root, &dir.join("db"), None, IdPolicy::CreateMissing)?;
         assert_eq!(
             found[0]
-                .scheduling(Scheduling::default())
+                .scheduling(Scheduling::default(), &UserSettings::default())
                 .max_interval
                 .into_inner(),
             256.0
@@ -873,8 +993,14 @@ mod tests {
         let broken = format!("id = \"{id}\"\ndesired retention = 0.95\n");
         std::fs::write(folder.join(COLLECTION_META_FILE), &broken)?;
 
-        let err = write_collection_overrides(&folder, Some(DesiredRetention::new(0.9)?), None)
-            .unwrap_err();
+        let err = write_collection_overrides(
+            &folder,
+            Some(DesiredRetention::new(0.9)?),
+            None,
+            DailyLimits::default(),
+            None,
+        )
+        .unwrap_err();
         assert!(err.message().contains("TOML"), "{}", err.message());
         assert_eq!(
             std::fs::read_to_string(folder.join(COLLECTION_META_FILE))?,

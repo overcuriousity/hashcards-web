@@ -42,6 +42,8 @@ use crate::cmd::serve::bookmarks::bookmark_delete_handler;
 use crate::cmd::serve::bookmarks::bookmark_list_handler;
 use crate::cmd::serve::bookmarks::bookmark_note_handler;
 use crate::cmd::serve::cards::discover_all_collections;
+use crate::cmd::serve::collection_settings::collection_settings_get_handler;
+use crate::cmd::serve::collection_settings::collection_settings_post_handler;
 use crate::cmd::serve::config::MIN_SESSION_SECRET_BYTES;
 use crate::cmd::serve::config::ResolvedOidc;
 use crate::cmd::serve::config::ResolvedServeConfig;
@@ -69,6 +71,9 @@ use crate::cmd::serve::handlers::collection_start_handler;
 use crate::cmd::serve::landing::landing_handler;
 use crate::cmd::serve::mcp::mcp_routes;
 use crate::cmd::serve::merge::merge_legacy_databases;
+use crate::cmd::serve::settings::settings_get_handler;
+use crate::cmd::serve::settings::settings_optimize_handler;
+use crate::cmd::serve::settings::settings_post_handler;
 use crate::cmd::serve::state::AppState;
 use crate::cmd::serve::state::SessionKey;
 use crate::cmd::serve::state::SharedSession;
@@ -300,6 +305,9 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
             "/files/media/{*path}",
             post(media_upload_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/settings", get(settings_get_handler))
+        .route("/settings", post(settings_post_handler))
+        .route("/settings/optimize", post(settings_optimize_handler))
         .route("/tokens", get(tokens_get_handler))
         .route("/tokens/new", post(tokens_mint_handler))
         .route("/tokens/revoke", post(tokens_revoke_handler))
@@ -313,6 +321,14 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         .route("/collection/{slug}", get(collection_get_handler))
         .route("/collection/{slug}", post(collection_post_handler))
         .route("/collection/{slug}/start", post(collection_start_handler))
+        .route(
+            "/collection/{slug}/settings",
+            get(collection_settings_get_handler),
+        )
+        .route(
+            "/collection/{slug}/settings",
+            post(collection_settings_post_handler),
+        )
         .route("/collection/{slug}/stats", get(collection_stats_handler))
         .route("/collection/{slug}/export", get(collection_export_handler))
         .route("/collection/{slug}/bookmarks", get(bookmark_list_handler))
