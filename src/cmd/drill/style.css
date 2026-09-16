@@ -48,6 +48,15 @@
   --radius-sm: 3px;
   --radius-md: 6px;
 
+  /* What Android's system bars take out of an installed app's viewport when
+     the app is asked and is told nothing. A gesture bar is 24dp and a
+     three-button bar 48dp, so the bottom reserves the larger of the two: the
+     cost of over-reserving is a strip of the card the eye never misses, and
+     the cost of under-reserving is the grade bar drawn where it cannot be
+     pressed. The status bar is 24dp everywhere. */
+  --system-bar-top: 24px;
+  --system-bar-bottom: 48px;
+
   /* The light half of the palette, on the same bare `:root`: one block,
      because two `:root` blocks in a row are one block written twice. */
   --color-bg-base: #f8f6f1;
@@ -185,6 +194,35 @@ body {
   line-height: 1.5;
 }
 
+/* Reserving what the insets report is only as good as the report. An
+   installed app on Android is drawn edge to edge, and Chromium fills
+   `env(safe-area-inset-*)` from the display cutout — so a phone with no notch
+   can answer `0px` for every edge while the gesture bar is covering the
+   bottom of the app all the same. Nothing in the page can measure that: the
+   layout viewport, and every `dvh` taken from it, spans the bars. The drill
+   ends up drawing its grade bar in a band of its own viewport that is not on
+   the screen, which is why this was only ever reported from the installed
+   app and never from a tab, where the browser lays the page out above its own
+   chrome.
+
+   So in an installed app the reservation has a floor. `max()` takes the
+   report when there is one — a notched phone reserves its cutout once, not
+   twice — and the floor when there is not. `display-mode` is the only thing
+   that distinguishes the two, and it is exactly the distinction the bug
+   follows. */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  body {
+    padding-top: max(env(safe-area-inset-top, 0px), var(--system-bar-top));
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--system-bar-bottom));
+  }
+  /* Fixed, so the body's padding cannot reach it: it clears the floor itself
+     or it sits under the status bar with everything else that trusted the
+     report. */
+  .theme-toggle {
+    top: calc(0.625rem + max(env(safe-area-inset-top, 0px), var(--system-bar-top)));
+  }
+}
+
 /* The drill is the one screen that is a fixed frame rather than a document:
    header, card, controls, with the card scrolling between two pinned bars. It
    claims the viewport; every other page is prose and scrolls normally.
@@ -196,7 +234,18 @@ body {
    the colour they are next to rather than a seam of the page behind it. */
 body:has(.root) {
   height: 100dvh; overflow: hidden;
+  display: flex; flex-direction: column;
   background: var(--color-bg-surface);
+}
+
+/* A flash is the drill's sibling, above it. It is a column row of its own so
+   the session shrinks by exactly its height: laid out any other way it adds
+   to a frame that already claims the whole screen, and the overflow the body
+   hides is the bottom of the grade bar. */
+body:has(.root) > .flash {
+  flex: none;
+  margin: 1rem;
+  width: auto; max-width: 56rem; align-self: center;
 }
 
 h1, h2, h3, h4 { margin: 0; font-weight: 600; }
@@ -550,12 +599,14 @@ input[type="checkbox"] { accent-color: var(--color-accent); }
    Three rows: progress, card, controls. The card is the only one that
    scrolls, so the grade buttons are always where the hand left them.
 
-   Its height is the body's content box, not the screen: the body is already
-   exactly the screen less the insets, and asking for `100dvh` here would
-   measure the screen a second time and hang the bottom of the grade bar —
-   and the End button under it — off the bottom edge again. */
+   Its height is what is left of the body's content box, not the screen: the
+   body is already exactly the screen less the insets, and asking for `100dvh`
+   here would measure the screen a second time and hang the bottom of the
+   grade bar — and the End button under it — off the bottom edge again. The
+   same band goes missing if it takes the whole box while a flash sits above
+   it, so it takes the rest of the column instead. */
 .root {
-  height: 100%;
+  flex: 1; min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-base);

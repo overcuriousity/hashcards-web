@@ -302,21 +302,90 @@ mod tests {
         }
     }
 
-    /// The drill fills the body's content box rather than the screen. Asking
-    /// for `100dvh` here would measure the screen a second time, inside a
-    /// body already shortened by the insets, and hang the same band of the
-    /// session off the bottom again.
+    /// The drill fills what is left of the body's content box rather than the
+    /// screen. Asking for `100dvh` here would measure the screen a second
+    /// time, inside a body already shortened by the insets, and hang the same
+    /// band of the session off the bottom again.
     #[test]
     fn test_the_drill_fills_the_reserved_viewport() {
         let root = rule(".root");
         assert!(
-            root.contains("height: 100%"),
-            "the drill does not fill the body's content box: {root}"
+            root.contains("flex: 1"),
+            "the drill does not take the rest of the body's content box: {root}"
         );
         assert!(
             !root.contains("dvh"),
             "the drill measures the screen again, past the insets: {root}"
         );
+    }
+
+    /// A flash renders as the drill's sibling, above it. While the drill
+    /// claimed the body's whole content box it did not shrink to make room,
+    /// so the banner's height pushed the grade bar — and the End button under
+    /// it — out through a body that hides its overflow. The body is a column
+    /// instead: the banner takes its own row and the session takes the rest.
+    #[test]
+    fn test_a_flash_shrinks_the_drill_rather_than_pushing_it_off_screen() {
+        let body = rule("body:has(.root)");
+        assert!(
+            body.contains("display: flex") && body.contains("flex-direction: column"),
+            "the drill's body does not share its height with a flash: {body}"
+        );
+        let root = rule(".root");
+        assert!(
+            root.contains("min-height: 0"),
+            "the drill refuses to shrink below its content: {root}"
+        );
+        let flash = rule("body:has(.root) > .flash");
+        assert!(
+            flash.contains("flex: none"),
+            "the banner is squeezed instead of sized by its text: {flash}"
+        );
+    }
+
+    /// The block of a `@media` rule, found by the start of its query.
+    fn media_block(query: &str) -> String {
+        let css: &str = &STYLE_CSS;
+        let start = css
+            .find(query)
+            .unwrap_or_else(|| panic!("no `@media {query}` block"));
+        let end = start
+            + css[start..]
+                .find("\n}")
+                .expect("unterminated media block");
+        css[start..end].to_string()
+    }
+
+    /// Android draws an installed app edge to edge, and `env(safe-area-inset-*)`
+    /// is the only thing that reports how much of its own viewport the system
+    /// bars are covering. Where that reports nothing for a system bar the
+    /// drill cannot tell, and it draws the grade bar in a band of the screen
+    /// the gesture bar owns. So the reservation is floored in an installed
+    /// app: `max()`, so a device that reports honestly still reserves once.
+    #[test]
+    fn test_the_installed_app_floors_the_system_bar_reservation() {
+        let block = media_block("@media (display-mode: standalone)");
+        for edge in ["top", "bottom"] {
+            let floored = format!(
+                "max(env(safe-area-inset-{edge}, 0px), var(--system-bar-{edge}))"
+            );
+            assert!(
+                block.contains(&floored),
+                "the installed app trusts a {edge} inset that may read zero: {block}"
+            );
+        }
+        let root = rule(":root");
+        for edge in ["top", "bottom"] {
+            let token = format!("--system-bar-{edge}:");
+            let Some(rest) = root.split_once(&token).map(|(_, r)| r) else {
+                panic!("no `{token}` token");
+            };
+            let value = rest.split(';').next().unwrap_or("").trim();
+            assert!(
+                value.ends_with("px") && value != "0px",
+                "the {edge} floor reserves nothing: `{value}`"
+            );
+        }
     }
 
     /// A fixed element is positioned against the viewport, not against the

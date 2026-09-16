@@ -1,5 +1,28 @@
 <changelog>
     <unreleased>
+        <fixed>
+                <change author="claude">
+            **A banner no longer pushes the grade buttons off the screen.**
+            The drill claims exactly the height of the screen, and a message
+            like *Card saved* is drawn above it -- so the session was pushed
+            down by the height of the banner and the bottom of the grade row,
+            with the **End session** link under it, fell off the bottom edge.
+            The banner now takes its own strip and the session takes what is
+            left.
+            </change>
+                <change author="claude">
+            **The grade buttons stay on the screen in the installed app.**
+            Reserving what `env(safe-area-inset-*)` reports only works if it
+            reports anything: Chromium fills those values from the display
+            cutout, so a phone without a notch answers `0px` for every edge
+            while the gesture bar covers the bottom of the app regardless.
+            Nothing in the page can measure that -- which is why this was only
+            ever seen in the installed app and never in a browser tab. The
+            reservation now has a floor when the app is installed: a status
+            bar's worth at the top, a navigation bar's worth at the bottom, or
+            whatever the phone reports, whichever is larger.
+            </change>
+            </fixed>
         </unreleased>
     <releases>
         <release version="0.5.2" date="2026-09-14">
