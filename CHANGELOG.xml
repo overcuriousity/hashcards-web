@@ -1,6 +1,9 @@
 <changelog>
     <unreleased>
-        <fixed>
+        </unreleased>
+    <releases>
+        <release version="0.5.3" date="2026-09-16">
+            <fixed>
                 <change author="claude">
             **A banner no longer pushes the grade buttons off the screen.**
             The drill claims exactly the height of the screen, and a message
@@ -23,8 +26,7 @@
             whatever the phone reports, whichever is larger.
             </change>
             </fixed>
-        </unreleased>
-    <releases>
+        </release>
         <release version="0.5.2" date="2026-09-14">
             <fixed>
                 <change author="claude">
