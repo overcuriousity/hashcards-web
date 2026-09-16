@@ -1,5 +1,16 @@
 <changelog>
     <unreleased>
+        <added>
+                <change author="claude">
+            **The grade buttons name their own keys.** Space, and 1 through 4,
+            have always worked; they were written down only in a tooltip,
+            which a touch screen never shows and a hand on the keyboard never
+            asks for. Each button now carries its key on its face, on devices
+            that have a keyboard to press it with. In the two-button mode the
+            keys shown are 1 and 3 -- the two that actually reach those
+            buttons.
+            </change>
+            </added>
         <fixed>
                 <change author="claude">
             **A banner no longer pushes the grade buttons off the screen.**
