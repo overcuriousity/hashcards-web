@@ -463,7 +463,7 @@ input[type="checkbox"] { accent-color: var(--color-accent); }
    Every document page is one measure, centred. Named for each page rather
    than given a shared class because the markup names them that way; the
    declaration is one list so the measure cannot drift between them. */
-.landing, .browse, .bookmarks, .edit-page, .stats-page, .editor {
+.landing, .browse, .bookmarks, .edit-page, .stats-page, .editor, .offline-page {
   max-width: 56rem;
   margin: 0 auto;
   padding: 3rem 1.5rem 4rem;

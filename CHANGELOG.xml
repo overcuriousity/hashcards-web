@@ -10,6 +10,16 @@
             keys shown are 1 and 3 -- the two that actually reach those
             buttons.
             </change>
+                <change author="claude">
+            **The app says it is offline instead of showing a browser error.**
+            A service worker keeps this build's stylesheet, fonts, maths and
+            highlighting -- the files whose paths already name their contents
+            -- and stands in with a short page of its own when a page cannot
+            be fetched. Nothing belonging to a user is stored: no page, no
+            card, no media, and never a write. It needs HTTPS (or localhost)
+            to run at all, so an instance served over plain HTTP on a LAN is
+            unaffected either way.
+            </change>
             </added>
         <fixed>
                 <change author="claude">

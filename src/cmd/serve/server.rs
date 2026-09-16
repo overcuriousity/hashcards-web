@@ -28,6 +28,10 @@ use crate::cmd::drill::katex::legacy_katex_css_handler;
 use crate::cmd::drill::katex::legacy_katex_font_handler;
 use crate::cmd::drill::katex::legacy_katex_js_handler;
 use crate::cmd::drill::katex::legacy_katex_mhchem_js_handler;
+use crate::cmd::drill::sw::OFFLINE_URL;
+use crate::cmd::drill::sw::SW_URL;
+use crate::cmd::drill::sw::offline_handler;
+use crate::cmd::drill::sw::sw_handler;
 use crate::cmd::drill::template::STYLE_CSS;
 use crate::cmd::drill::template::STYLE_REV;
 use crate::cmd::drill::template::icon_192_handler;
@@ -361,6 +365,11 @@ pub async fn start_serve(config: ResolvedServeConfig) -> Fallible<()> {
         .route("/icons/icon-192.png", get(icon_192_handler))
         .route("/icons/icon-512.png", get(icon_512_handler))
         .route("/script.js", get(script_handler))
+        // The worker and the page it exists to serve. Both sit outside the
+        // auth gate: a gated `/offline` would be precached as a redirect to
+        // the login page, which is the one thing it must never be.
+        .route(SW_URL, get(sw_handler))
+        .route(OFFLINE_URL, get(offline_handler))
         // Every asset below is served `immutable` under a revision that
         // names this build's copy of it, and the handlers accept *any*
         // revision: a client working from HTML older than the running build
