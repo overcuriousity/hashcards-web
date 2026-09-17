@@ -22,7 +22,7 @@ openidconnect = "4"
 parking_lot = "0.12"
 percent-encoding = "2.3.2"
 pulldown-cmark = "0.13.3"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tempfile = "3.27.0"
