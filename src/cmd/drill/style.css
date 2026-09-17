@@ -1052,6 +1052,23 @@ fieldset label {
 .deck-due.muted { font-weight: 400; color: var(--color-fg-muted); }
 .deck-total { color: var(--color-fg-muted); }
 
+/* A topic's own Drill button: the Start button's job for one row, so it is
+   quiet until the row is hovered or it is focused -- twenty of them at full
+   strength would out-shout the one button that drills the collection. */
+.row-drill {
+  font-size: var(--text-xs); min-height: 26px; padding: 0 0.5rem;
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.deck-row:hover .row-drill, .row-drill:focus-visible { opacity: 1; }
+
+/* Present only to be the form's implicit submit; never seen, never tabbed
+   to. `display: none` would disqualify it from that job. */
+.default-submit {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; border: 0; margin: -1px; overflow: hidden; clip-path: inset(50%);
+}
+
 .edit-link {
   font-size: var(--text-xs); color: var(--color-fg-muted);
   text-decoration: none; white-space: nowrap; margin-left: 0.25rem;

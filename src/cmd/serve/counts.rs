@@ -49,6 +49,29 @@ pub struct CollectionCounts {
     pub due_uncapped: usize,
 }
 
+/// Which of the selected topics' cards a session queues.
+///
+/// Every scheduled path in the app asks for `DueToday`; a card the schedule
+/// has placed in the future is not offered. `Ahead` is the one deliberate
+/// exception: the user pointed at a topic and asked to review it now, so the
+/// whole topic is queued, and neither sibling burial nor the daily limits
+/// filter it — both exist to shape what the schedule hands out unasked, and
+/// nothing here was unasked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueScope {
+    /// Cards whose due date has arrived, or which were never reviewed.
+    DueToday,
+    /// Every card in the selected topics, due or not.
+    Ahead,
+}
+
+impl QueueScope {
+    /// Whether this scope leaves the schedule to decide.
+    pub fn is_scheduled(self) -> bool {
+        matches!(self, QueueScope::DueToday)
+    }
+}
+
 /// Everything a resolved collection says about which due cards actually
 /// reach a queue: whether to bury siblings, and how many cards it will hand
 /// out today.

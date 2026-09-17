@@ -2,6 +2,19 @@
     <unreleased>
         <added>
                 <change author="claude">
+            **Every topic has its own Drill button.** A targeted review used
+            to mean *Select none*, one tick and **Start**; a topic row now
+            carries a Drill of its own. A topic asked for by name is drilled
+            whole, whatever its schedule says -- so a topic with nothing due
+            can be reviewed ahead of time, which nothing in the app could do
+            before. Sibling burying and the daily limits do not apply to it:
+            both exist to shape what the schedule hands out unasked, and a
+            topic pressed by name was asked for. The reviews count normally
+            and reschedule the cards as any other review would. The
+            collection's **Start** button is unchanged and still drills only
+            what is due.
+            </change>
+                <change author="claude">
             **The grade buttons name their own keys.** Space, and 1 through 4,
             have always worked; they were written down only in a tooltip,
             which a touch screen never shows and a hand on the keyboard never

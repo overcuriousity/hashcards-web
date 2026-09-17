@@ -44,6 +44,7 @@ use crate::cmd::serve::browse::build_deck_tree;
 use crate::cmd::serve::browse::render_browse_page;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::counts::Burial;
+use crate::cmd::serve::counts::QueueScope;
 use crate::cmd::serve::counts::QueuePolicy;
 use crate::cmd::serve::counts::budget_for;
 use crate::cmd::serve::decks::ResolvedCustomDeck;
@@ -351,6 +352,10 @@ pub struct StartDrillForm {
     /// no topic checkboxes at all. It is what tells an empty `decks` apart
     /// from a topic picker with everything unticked.
     pub all_topics: bool,
+    /// Set by a topic row's own Drill button, which names that one topic and
+    /// overrides the checkboxes posted alongside it. A topic asked for by
+    /// name is drilled whole, ahead of schedule.
+    pub only: Option<String>,
 }
 
 /// Custom `Deserialize` for `StartDrillForm`.
@@ -376,9 +381,11 @@ impl<'de> serde::Deserialize<'de> for StartDrillForm {
                 let mut decks = Vec::new();
                 let mut limit: Option<usize> = None;
                 let mut all_topics = false;
+                let mut only: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "decks" => decks.push(map.next_value::<String>()?),
+                        "only" => only = Some(map.next_value::<String>()?),
                         "all_topics" => {
                             let _ = map.next_value::<String>()?;
                             all_topics = true;
@@ -400,6 +407,7 @@ impl<'de> serde::Deserialize<'de> for StartDrillForm {
                     decks,
                     limit,
                     all_topics,
+                    only,
                 })
             }
         }
@@ -417,13 +425,21 @@ pub async fn collection_start_handler(
     let state2 = state.clone();
     let slug2 = slug.clone();
     let owner = current_user.map(|u| u.email);
+    // A topic's own Drill button names that topic and nothing else: the
+    // checkboxes posted with it describe the scheduled queue, which is not
+    // what was pressed.
+    let (decks, scope) = match form.only {
+        Some(topic) => (vec![topic], QueueScope::Ahead),
+        None => (form.decks, QueueScope::DueToday),
+    };
     match run_blocking(move || {
         collection_start_inner(
             &state2,
             &slug2,
-            form.decks,
+            decks,
             form.limit,
             form.all_topics,
+            scope,
             owner.as_deref(),
         )
     })
@@ -443,6 +459,7 @@ fn collection_start_inner(
     selected_decks: Vec<String>,
     limit: Option<usize>,
     all_topics: bool,
+    scope: QueueScope,
     owner: Option<&str>,
 ) -> Fallible<()> {
     // The slug must be the caller's own before anything else happens —
@@ -482,6 +499,7 @@ fn collection_start_inner(
                 decks: selected_decks,
             }],
             limit,
+            scope,
         )?,
         DrillTarget::Deck(deck) => {
             let sources = deck_sources(state, &deck, owner);
@@ -492,13 +510,29 @@ fn collection_start_inner(
                     deck.name
                 ));
             }
-            create_session_from_sources(state, sources, limit)?
+            create_session_from_sources(state, sources, limit, scope)?
         }
     };
     if let Some(s) = session {
         state.sessions.lock().insert(key, Arc::new(Mutex::new(s)));
     }
     Ok(())
+}
+
+/// Whether a deck is one of the wanted ones.
+///
+/// A selection names a deck or a folder of them: the browse page's topic
+/// checkboxes only ever name leaves, but its per-topic Drill button can name
+/// a parent row, which is no deck of its own but the head of a path. Matching
+/// on the `/`-separated prefix covers both, and a leaf can never be the
+/// prefix of another deck's path without being that folder.
+fn deck_selected(deck: &str, wanted: &[String]) -> bool {
+    wanted.iter().any(|w| {
+        deck == w
+            || deck
+                .strip_prefix(w.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// One collection contributing to a drill session, and which of its decks
@@ -518,6 +552,7 @@ pub(super) fn create_session_from_sources(
     state: &AppState,
     sources: Vec<SessionSourceSpec>,
     limit: Option<usize>,
+    scope: QueueScope,
 ) -> Fallible<Option<DrillSession>> {
     if sources.is_empty() {
         return Ok(None);
@@ -584,20 +619,23 @@ pub(super) fn create_session_from_sources(
         }
 
         // Filter by selected decks.
-        let deck_filter: HashSet<&str> = spec.decks.iter().map(|s| s.as_str()).collect();
-        let cards: Vec<Card> = if deck_filter.is_empty() {
+        let cards: Vec<Card> = if spec.decks.is_empty() {
             collection.cards
         } else {
             collection
                 .cards
                 .into_iter()
-                .filter(|card| deck_filter.contains(card.deck_name().as_str()))
+                .filter(|card| deck_selected(card.deck_name(), &spec.decks))
                 .collect()
         };
 
-        // Find cards due today
-        let due_today: HashSet<CardHash> = collection.db.due_today(today)?;
-        for card in cards.into_iter().filter(|c| due_today.contains(&c.hash())) {
+        // What the scope offers: the schedule's answer, or the whole
+        // selection when the user asked for it by name.
+        let queued: HashSet<CardHash> = match scope {
+            QueueScope::DueToday => collection.db.due_today(today)?,
+            QueueScope::Ahead => cards.iter().map(|c| c.hash()).collect(),
+        };
+        for card in cards.into_iter().filter(|c| queued.contains(&c.hash())) {
             // Cards are content addressed, so the same fact written into two
             // collections has one hash. Drill it once, routed to the first
             // collection that offered it; the other collection's own copy
@@ -645,18 +683,23 @@ pub(super) fn create_session_from_sources(
         }
     }
 
-    let mut burial = Burial::new(bury);
-    due_cards.retain(|card| burial.admits(card));
-    // Then each source's daily limit, over what burial left. Every counter
-    // that describes this session applies the same two filters in the same
-    // order.
-    due_cards.retain(|card| match routes.get(&card.hash()) {
-        Some(index) => match budgets.get_mut(*index) {
-            Some((budget, new_cards)) => budget.admits(new_cards.contains(&card.hash())),
+    // Burial and the daily limits shape what the schedule hands out; a
+    // review asked for ahead of schedule is not the schedule handing
+    // anything out, and trimming it would drop cards the user pointed at.
+    if scope.is_scheduled() {
+        let mut burial = Burial::new(bury);
+        due_cards.retain(|card| burial.admits(card));
+        // Then each source's daily limit, over what burial left. Every counter
+        // that describes this session applies the same two filters in the same
+        // order.
+        due_cards.retain(|card| match routes.get(&card.hash()) {
+            Some(index) => match budgets.get_mut(*index) {
+                Some((budget, new_cards)) => budget.admits(new_cards.contains(&card.hash())),
+                None => true,
+            },
             None => true,
-        },
-        None => true,
-    });
+        });
+    }
 
     if due_cards.is_empty() {
         // The session rows opened above would otherwise linger as dangling
@@ -780,11 +823,13 @@ pub(super) fn deck_card_counts(
         let (budget, new_cards) = budgets.last_mut().ok_or_else(|| {
             ErrorReport::new("a budget was pushed for this source and is not there")
         })?;
-        let wanted: HashSet<&str> = spec.decks.iter().map(|d| d.as_str()).collect();
+        // The same match the session builder makes. A count filtered
+        // differently from the queue is the bug that arrangement exists to
+        // prevent.
         for card in collection
             .cards
             .iter()
-            .filter(|c| wanted.contains(c.deck_name().as_str()))
+            .filter(|c| deck_selected(c.deck_name(), &spec.decks))
         {
             card_total += 1;
             if due.contains(&card.hash()) && queued.insert(card.hash()) && burial.admits(card) {
@@ -1101,6 +1146,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use super::QueueScope;
     use super::SessionSourceSpec;
     use super::collection_get_inner;
     use super::create_session_from_sources;
@@ -1284,6 +1330,7 @@ mod tests {
                 decks: Vec::new(),
             }],
             None,
+            QueueScope::DueToday,
         )?
         .ok_or_else(|| ErrorReport::new("expected alice's new card to be due"))?;
         state.sessions.lock().insert(
@@ -1385,7 +1432,7 @@ mod tests {
         let sources = deck_sources(&state, &deck, None);
         assert_eq!(sources.len(), 2, "both collections must contribute");
 
-        let session = create_session_from_sources(&state, sources, None)?
+        let session = create_session_from_sources(&state, sources, None, QueueScope::DueToday)?
             .ok_or_else(|| ErrorReport::new("expected due cards from both collections"))?;
         let mut session = session;
         assert_eq!(
@@ -1462,6 +1509,7 @@ mod tests {
                 decks: Vec::new(),
             }],
             None,
+            QueueScope::DueToday,
         )?
         .ok_or_else(|| ErrorReport::new("expected the new card to be due"))?;
 
@@ -1523,7 +1571,7 @@ mod tests {
                 decks: vec!["Shared".to_string()],
             },
         ];
-        let session = create_session_from_sources(&state, sources, None)?
+        let session = create_session_from_sources(&state, sources, None, QueueScope::DueToday)?
             .ok_or_else(|| ErrorReport::new("expected the shared card to be due"))?;
         assert_eq!(
             session.mutable.cards.len(),
@@ -1559,6 +1607,145 @@ mod tests {
         std::fs::create_dir_all(&folder)?;
         collection_id(&folder)?;
         assert!(find_collection(&state, "Spanish", None).is_some());
+        Ok(())
+    }
+
+    /// A topic asked for by name is drilled whole, however its cards are
+    /// scheduled. Every other path in the app queues `due_today` alone, so
+    /// a topic whose cards are all scheduled ahead could not be reviewed at
+    /// all — which is exactly what a targeted review is for.
+    #[test]
+    fn a_topic_asked_for_by_name_is_drilled_ahead_of_schedule() -> Fallible<()> {
+        use crate::cmd::serve::handlers::find_collection;
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().canonicalize()?;
+        card_collection(&data_dir, None, "Deck", "Q: One\nA: 1\n")?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(data_dir.clone());
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not discovered"))?;
+
+        // Put the collection's one card a month out, so nothing is due.
+        schedule_everything_ahead(&state, &rc)?;
+        assert!(
+            create_session_from_sources(
+                &state,
+                vec![SessionSourceSpec {
+                    collection: rc.clone(),
+                    decks: Vec::new(),
+                }],
+                None,
+                QueueScope::DueToday,
+            )?
+            .is_none(),
+            "nothing is due, so the scheduled path must start no session"
+        );
+
+        let session = create_session_from_sources(
+            &state,
+            vec![SessionSourceSpec {
+                collection: rc,
+                decks: vec!["Deck".to_string()],
+            }],
+            None,
+            QueueScope::Ahead,
+        )?
+        .ok_or_else(|| ErrorReport::new("the topic held no cards"))?;
+        assert_eq!(
+            session.total_cards, 1,
+            "the whole topic is queued, due or not"
+        );
+        Ok(())
+    }
+
+    /// An ahead-of-schedule drill is not the schedule handing cards out, so
+    /// neither of the filters that shape a scheduled queue applies to it.
+    /// Burying would drop the sibling deletions of a cloze note the user
+    /// pointed at, and a spent daily limit would empty the session outright.
+    #[test]
+    fn an_ahead_drill_buries_nothing_and_spends_no_budget() -> Fallible<()> {
+        use crate::cmd::serve::cards::write_collection_overrides;
+        use crate::cmd::serve::handlers::find_collection;
+        use crate::types::limits::DailyLimits;
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().canonicalize()?;
+        // One note, two deletions: two cards, one family.
+        card_collection(&data_dir, None, "Deck", "C: Foo [bar] baz [quux].\n")?;
+        let state = crate::cmd::serve::state::test_support::state_with_data_dir(data_dir.clone());
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not discovered"))?;
+        // A limit small enough that a scheduled queue would hand out one
+        // card at most.
+        write_collection_overrides(
+            &rc.coll_dir,
+            None,
+            None,
+            DailyLimits {
+                reviews: Some(1),
+                new: Some(1),
+            },
+            None,
+        )?;
+        let rc = find_collection(&state, "Deck", None)
+            .ok_or_else(|| ErrorReport::new("the collection was not rediscovered"))?;
+
+        let session = create_session_from_sources(
+            &state,
+            vec![SessionSourceSpec {
+                collection: rc,
+                decks: vec!["Deck".to_string()],
+            }],
+            None,
+            QueueScope::Ahead,
+        )?
+        .ok_or_else(|| ErrorReport::new("the topic held no cards"))?;
+        assert_eq!(
+            session.total_cards, 2,
+            "both deletions were asked for by name: neither burial nor the \
+             daily limit may drop one"
+        );
+        Ok(())
+    }
+
+    /// A topic row's Drill button can name a parent row, which is the head
+    /// of a path rather than a deck of its own. Matching on the prefix is
+    /// what makes "drill this folder" mean its topics.
+    #[test]
+    fn a_selected_folder_covers_the_topics_under_it() {
+        let wanted = vec!["grammar".to_string()];
+        assert!(super::deck_selected("grammar", &wanted));
+        assert!(super::deck_selected("grammar/particles", &wanted));
+        assert!(
+            !super::deck_selected("grammarium", &wanted),
+            "a name that merely starts with the same letters is a different deck"
+        );
+        assert!(!super::deck_selected("vocab", &wanted));
+    }
+
+    /// Schedule every card in `rc` a month out, so nothing in it is due.
+    fn schedule_everything_ahead(state: &AppState, rc: &ResolvedCollection) -> Fallible<()> {
+        use crate::fsrs::Grade;
+        use crate::types::performance::Performance;
+        use crate::types::performance::update_performance;
+
+        let db = open_collection_db(state, rc)?;
+        let collection = crate::collection::Collection::open(rc.coll_dir.clone(), db)?;
+        let now = Timestamp::now();
+        for card in collection.cards.iter() {
+            collection.db.insert_card_if_new(card.hash(), now)?;
+            let mut performance = update_performance(
+                Performance::New,
+                Grade::Easy,
+                now,
+                Scheduling::default(),
+                &mut TinyRng::from_seed(7),
+            );
+            performance.due_date = now.date().add_days(30)?;
+            collection
+                .db
+                .update_card_performance(card.hash(), Performance::Reviewed(performance))?;
+        }
         Ok(())
     }
 
@@ -1609,6 +1796,7 @@ mod tests {
                 decks: Vec::new(),
             }],
             None,
+            QueueScope::DueToday,
         )?
         .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
 
@@ -1679,6 +1867,7 @@ mod tests {
                 decks: Vec::new(),
             }],
             None,
+            QueueScope::DueToday,
         )?
         .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
 
@@ -1726,7 +1915,7 @@ mod tests {
         assert_eq!(sources.len(), 2, "both collections must contribute");
         let (due, _, _) = super::deck_card_counts(&state, &sources)?;
 
-        let session = create_session_from_sources(&state, sources, None)?
+        let session = create_session_from_sources(&state, sources, None, QueueScope::DueToday)?
             .ok_or_else(|| ErrorReport::new("the session held no cards"))?;
         assert_eq!(
             due, session.total_cards,
@@ -1763,6 +1952,7 @@ mod tests {
                 decks: Vec::new(),
             }],
             None,
+            QueueScope::DueToday,
         );
         let message = match started {
             Ok(_) => return crate::error::fail("a failed merge must refuse to start a drill"),

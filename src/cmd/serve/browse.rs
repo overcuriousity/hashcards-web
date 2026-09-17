@@ -281,6 +281,12 @@ pub fn render_browse_page(
             } @else {
                 h2.section-title { "Topics" }
                 form action=(format!("/collection/{slug}/start")) method="post" {
+                    // A form submits its *first* submit button when Enter is
+                    // pressed, and each topic row now carries one. This
+                    // nameless button is that first one, so Enter still means
+                    // Start -- the scheduled queue -- rather than drilling
+                    // whichever topic happens to sit at the top.
+                    button.default-submit type="submit" tabindex="-1" aria-hidden="true" {}
                     div.deck-tree {
                         @for child in &tree.children {
                             (render_deck_node(child, 0, collection_name, edit_paths))
@@ -396,6 +402,15 @@ fn render_deck_node(
                     " / "
                     span.deck-total { (total) }
                 }
+                // Named by its own button rather than by the checkboxes,
+                // which describe the scheduled queue instead. A topic asked
+                // for this way is drilled whole, ahead of schedule.
+                button.btn.btn-sm.row-drill
+                    type="submit"
+                    name="only"
+                    value=(node.path)
+                    title=(format!("Review all {total} cards in {}, due or not", node.name))
+                { "Drill" }
                 @if let Some(url) = edit_url {
                     a.edit-link href=(url) { "Edit" }
                 }
@@ -588,6 +603,80 @@ mod tests {
         assert!(
             !html.contains(r#"class="deck-due" class="#),
             "one class attribute, not two: {html}"
+        );
+    }
+
+    /// Every topic row carries its own Drill button, naming that topic, so
+    /// a targeted review is one press rather than "Select none", one tick
+    /// and Start. It names the topic through `only`, not `decks`: the
+    /// checkboxes posted with it describe the scheduled queue.
+    #[test]
+    fn every_topic_row_offers_a_drill_button_of_its_own() {
+        let tree = DeckNode {
+            name: String::new(),
+            path: String::new(),
+            total_cards: 0,
+            due_today: 0,
+            children: vec![DeckNode {
+                name: "quiet".to_string(),
+                path: "quiet".to_string(),
+                // Nothing due: the row a scheduled Start cannot reach, and
+                // the reason the button is here.
+                total_cards: 4,
+                due_today: 0,
+                children: vec![],
+            }],
+        };
+        let browse = BrowseData {
+            tree,
+            duplicates: Vec::new(),
+            coll_dir: PathBuf::new(),
+            edit_paths: HashMap::new(),
+        };
+        let html = render_browse_page("Coll", "coll", &browse, 0, 0, None).into_string();
+        assert!(
+            html.contains(r#"name="only" value="quiet""#),
+            "the row must name its own topic: {html}"
+        );
+        assert!(
+            !html.contains(r#"class="btn btn-sm row-drill" type="submit" disabled"#),
+            "a topic with nothing due is exactly the one this button is for: {html}"
+        );
+    }
+
+    /// The topic rows' buttons all sit inside the Start form, and a form
+    /// submits its first submit button when Enter is pressed. Without a
+    /// nameless one ahead of them, Enter would drill whichever topic happens
+    /// to be at the top instead of starting the scheduled session.
+    #[test]
+    fn enter_still_starts_the_scheduled_session() {
+        let tree = DeckNode {
+            name: String::new(),
+            path: String::new(),
+            total_cards: 0,
+            due_today: 0,
+            children: vec![DeckNode {
+                name: "first".to_string(),
+                path: "first".to_string(),
+                total_cards: 3,
+                due_today: 3,
+                children: vec![],
+            }],
+        };
+        let browse = BrowseData {
+            tree,
+            duplicates: Vec::new(),
+            coll_dir: PathBuf::new(),
+            edit_paths: HashMap::new(),
+        };
+        let html = render_browse_page("Coll", "coll", &browse, 0, 0, None).into_string();
+        let default_submit = html
+            .find("default-submit")
+            .expect("the form needs an implicit-submit button");
+        let first_row_drill = html.find("row-drill").expect("a topic row carries a Drill");
+        assert!(
+            default_submit < first_row_drill,
+            "the nameless submit must come first: {html}"
         );
     }
 
