@@ -99,20 +99,23 @@ pub fn render_session_page(ctx: &RenderContext, mutable: &MutableState) -> Falli
     // header instead, where a mis-tap costs nothing.
     let answer_controls = if mutable.reveal {
         match ctx.answer_controls {
+            // `script.js` binds 1 through 4 in both modes, so here 1 and 3
+            // reach these two buttons and 2 and 4 land on nothing. The keys
+            // named are the keys that work.
             AnswerControls::Binary => html! {
-                input id="forgot" type="submit" name="action" value="Forgot" title="Mark card as forgotten.";
-                input id="good" type="submit" name="action" value="Good" title="Mark card as remembered.";
+                (action_button("forgot", "Forgot", "1", "Mark card as forgotten. Shortcut: 1."))
+                (action_button("good", "Good", "3", "Mark card as remembered. Shortcut: 3."))
             },
             AnswerControls::Full => html! {
-                input id="forgot" type="submit" name="action" value="Forgot" title="Mark card as forgotten. Shortcut: 1.";
-                input id="hard" type="submit" name="action" value="Hard" title="Mark card as difficult. Shortcut: 2.";
-                input id="good" type="submit" name="action" value="Good" title="Mark card as remembered well. Shortcut: 3.";
-                input id="easy" type="submit" name="action" value="Easy" title="Mark card as very easy. Shortcut: 4.";
+                (action_button("forgot", "Forgot", "1", "Mark card as forgotten. Shortcut: 1."))
+                (action_button("hard", "Hard", "2", "Mark card as difficult. Shortcut: 2."))
+                (action_button("good", "Good", "3", "Mark card as remembered well. Shortcut: 3."))
+                (action_button("easy", "Easy", "4", "Mark card as very easy. Shortcut: 4."))
             },
         }
     } else {
         html! {
-            input id="reveal" type="submit" name="action" value="Reveal" title="Show the answer. Shortcut: space.";
+            (action_button("reveal", "Reveal", "Space", "Show the answer. Shortcut: space."))
         }
     };
     // One form around the whole screen, so a header icon and a grade button
@@ -164,6 +167,26 @@ pub fn render_session_page(ctx: &RenderContext, mutable: &MutableState) -> Falli
         }
     };
     Ok(html)
+}
+
+/// A control in the grade bar: the word, and the key that presses it.
+///
+/// A `button` rather than an `input[type=submit]`, because an input's label
+/// *is* its `value` and the value is what the server dispatches on — the key
+/// could not be shown without changing what gets submitted. A button keeps
+/// the two apart. Every rule the old inputs matched names
+/// `.controls button:not(.end-link)` alongside them, so nothing about the
+/// look moves.
+///
+/// The hint is `aria-hidden`: a screen reader should hear "Good", not
+/// "Good 3", and the `title` already spells the shortcut out.
+fn action_button(id: &str, label: &str, key: &str, title: &str) -> Markup {
+    html! {
+        button id=(id) type="submit" name="action" value=(label) title=(title) {
+            (label)
+            span.key-hint aria-hidden="true" { (key) }
+        }
+    }
 }
 
 fn render_card(card: &Card, reveal: bool, config: &MarkdownRenderConfig) -> Fallible<Markup> {
@@ -792,5 +815,131 @@ mod tests {
         // Median of [1000, 2000, 9000] = 2.0 s.
         assert!(html.contains("2.0"), "median pace must be 2.0 s: {html}");
         Ok(())
+    }
+
+    /// Renders the controls strip of a session page in the given mode.
+    fn render_controls(controls: AnswerControls, reveal: bool) -> Fallible<String> {
+        let dir = crate::helper::create_tmp_directory()?;
+        std::fs::write(dir.join("deck.md"), "Q: Question?\nA: Answer.\n")?;
+        let db = Database::memory()?;
+        let now = Timestamp::now();
+        let card = Card::new(
+            "Deck".to_string(),
+            dir.join("deck.md"),
+            (1, 2),
+            CardContent::new_basic("Question?", "Answer."),
+        );
+        db.insert_card(card.hash(), now)?;
+        let session_id = db.create_session(now)?;
+        let mut mutable = MutableState::new(
+            SessionDbs::single(
+                db,
+                session_id,
+                Scheduling {
+                    jitter: Jitter::none(),
+                    ..Scheduling::default()
+                },
+            ),
+            Cache::new(),
+            vec![card],
+            TinyRng::from_seed(1),
+        );
+        mutable.reveal = reveal;
+        let mut ctx = make_ctx(&dir);
+        ctx.answer_controls = controls;
+        let html = render_session_page(&ctx, &mutable)?.into_string();
+        Ok(html
+            .split_once(r#"<div class="controls">"#)
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default())
+    }
+
+    /// The keys are bound whether or not anything says so, and a tooltip says
+    /// so only to a mouse. The grade bar names its own keys.
+    #[test]
+    fn test_grade_buttons_show_their_shortcut() -> Fallible<()> {
+        let controls = render_controls(AnswerControls::Full, true)?;
+        for (id, key) in [("forgot", "1"), ("hard", "2"), ("good", "3"), ("easy", "4")] {
+            let button = controls
+                .split_once(&format!(r#"id="{id}""#))
+                .map(|(_, rest)| {
+                    rest.split("</button>")
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .unwrap_or_else(|| panic!("no control with id `{id}`: {controls}"));
+            assert!(
+                button.contains(&format!(
+                    r#"<span class="key-hint" aria-hidden="true">{key}</span>"#
+                )),
+                "`{id}` does not name its key `{key}`: {button}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reveal is the key pressed most in a session and the one least likely
+    /// to be guessed, having no digit to suggest it.
+    #[test]
+    fn test_reveal_button_shows_its_shortcut() -> Fallible<()> {
+        let controls = render_controls(AnswerControls::Full, false)?;
+        assert!(
+            controls.contains(r#"<span class="key-hint" aria-hidden="true">Space</span>"#),
+            "Reveal does not name its key: {controls}"
+        );
+        Ok(())
+    }
+
+    /// `script.js` binds 1 through 4 in both modes, so in the binary mode 1
+    /// and 3 work and 2 and 4 land on nothing. The labels have to say what
+    /// actually happens, not what the four-button mode would do.
+    #[test]
+    fn test_binary_mode_names_the_keys_that_work() -> Fallible<()> {
+        let controls = render_controls(AnswerControls::Binary, true)?;
+        assert!(
+            controls.contains(r#"<span class="key-hint" aria-hidden="true">1</span>"#)
+                && controls.contains(r#"<span class="key-hint" aria-hidden="true">3</span>"#),
+            "binary mode must name 1 and 3: {controls}"
+        );
+        assert!(
+            !controls.contains(r#">2</span>"#) && !controls.contains(r#">4</span>"#),
+            "binary mode must not name keys that do nothing: {controls}"
+        );
+        Ok(())
+    }
+
+    /// The hint is decoration hung on the label; the accessible name must
+    /// stay the word, and the value the server dispatches on must not move.
+    #[test]
+    fn test_grade_buttons_keep_their_action_values() -> Fallible<()> {
+        let controls = render_controls(AnswerControls::Full, true)?;
+        for value in ["Forgot", "Hard", "Good", "Easy"] {
+            assert!(
+                controls.contains(&format!(r#"name="action" value="{value}""#)),
+                "`{value}` is no longer submitted as its action: {controls}"
+            );
+        }
+        let reveal = render_controls(AnswerControls::Full, false)?;
+        assert!(
+            reveal.contains(r#"name="action" value="Reveal""#),
+            "Reveal is no longer submitted as its action: {reveal}"
+        );
+        Ok(())
+    }
+
+    /// A phone has no keyboard and the bar is tight. The hints are for the
+    /// devices that can act on them.
+    #[test]
+    fn test_key_hints_are_hidden_without_a_keyboard() {
+        let css: &str = &crate::cmd::drill::template::STYLE_CSS;
+        assert!(
+            css.contains(".key-hint { display: none; }"),
+            "the key hint is not hidden by default"
+        );
+        assert!(
+            css.contains("@media (any-hover: hover) and (any-pointer: fine)"),
+            "the key hints are shown on devices that cannot use them"
+        );
     }
 }

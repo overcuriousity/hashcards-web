@@ -20,4 +20,5 @@ pub mod katex;
 pub mod post;
 pub mod render;
 pub mod state;
+pub mod sw;
 pub mod template;

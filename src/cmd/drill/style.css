@@ -287,14 +287,13 @@ code, pre, .mono { font-family: var(--font-mono); }
 /* ══ 3. Components ═════════════════════════════════════════════════════════ */
 
 /* ── Buttons ───────────────────────────────────────────────────────────────
-   `.btn` is the shape; the modifier is the voice. Submit inputs are included
-   because the drill's grade controls are `input[type=submit]` — a form that
-   must post the value of the button that was pressed, which a `<button>`
-   inside a `<form>` also does but which the existing markup does with
-   inputs. Styling both here keeps them one control. */
+   `.btn` is the shape; the modifier is the voice. The drill's grade controls
+   are included because they are buttons in a form rather than `.btn`s: they
+   post the value of whichever one was pressed, and that value is separate
+   from the word on the face, which is what lets the face also carry a key
+   hint. Styling both here keeps them one control. */
 .btn,
-.controls button:not(.end-link),
-.controls input[type="submit"] {
+.controls button:not(.end-link) {
   -webkit-appearance: none;
   appearance: none;
   display: inline-flex; align-items: center; justify-content: center; gap: 0.375rem;
@@ -308,15 +307,13 @@ code, pre, .mono { font-family: var(--font-mono); }
 }
 
 .btn:hover,
-.controls button:not(.end-link):hover,
-.controls input[type="submit"]:hover {
+.controls button:not(.end-link):hover {
   background: var(--color-bg-hover);
   border-color: var(--color-fg-muted);
 }
 
 .btn:disabled,
-.controls button:not(.end-link):disabled,
-.controls input[type="submit"]:disabled {
+.controls button:not(.end-link):disabled {
   opacity: 0.4; cursor: not-allowed; pointer-events: none;
 }
 
@@ -466,7 +463,7 @@ input[type="checkbox"] { accent-color: var(--color-accent); }
    Every document page is one measure, centred. Named for each page rather
    than given a shared class because the markup names them that way; the
    declaration is one list so the measure cannot drift between them. */
-.landing, .browse, .bookmarks, .edit-page, .stats-page, .editor {
+.landing, .browse, .bookmarks, .edit-page, .stats-page, .editor, .offline-page {
   max-width: 56rem;
   margin: 0 auto;
   padding: 3rem 1.5rem 4rem;
@@ -819,8 +816,30 @@ body:has(.root) .theme-toggle { display: none; }
   max-width: 56rem; margin: 0 auto;
 }
 .root .controls .grades > * { flex: 1; max-width: 12rem; }
-.root .controls button:not(.end-link),
-.root .controls input[type="submit"] { min-height: 44px; font-weight: 600; }
+.root .controls button:not(.end-link) { min-height: 44px; font-weight: 600; }
+
+/* The key that presses this button, on the face of it.
+   A tooltip tells a mouse and nothing else, so the keys went unfound by the
+   people they were for. Hidden by default and revealed only where a keyboard
+   is likely: a bare touch screen cannot press them and the bar has no room to
+   spare. The query asks after `any-` pointer rather than the primary one, so
+   a tablet with a keyboard attached — which reports a coarse primary pointer
+   and can press every key bound here — is not counted as a phone.
+   `aria-hidden` in the markup keeps it out of the accessible name. */
+.key-hint { display: none; }
+@media (any-hover: hover) and (any-pointer: fine) {
+  .key-hint {
+    display: inline-block;
+    min-width: 1.1em;
+    padding: 0.05em 0.3em;
+    border: 1px solid currentColor;
+    border-radius: var(--radius-sm);
+    opacity: 0.55;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    line-height: 1.3;
+  }
+}
 
 /* Ending early is a way out, not an answer. Styled as a line of text so it
    never reads as a fifth grade — which is why the grade-button rules above

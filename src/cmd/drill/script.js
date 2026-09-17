@@ -298,3 +298,24 @@ document.querySelectorAll('.editor-toolbar button[data-snippet]').forEach(functi
     }, selectInstead);
   });
 })();
+
+// Register the service worker.
+//
+// It caches the revisioned assets and stands in with an offline page when a
+// navigation cannot reach the server; everything else goes to the network as
+// before, so a browser that refuses to register one loses nothing.
+//
+// It will refuse outside a secure context, which for this app means plain
+// HTTP on anything but localhost — a supported way to run it on a LAN. That
+// is why the failure is silent: there is nothing the user could do about it
+// and nothing they lose by it.
+(function () {
+  if (!("serviceWorker" in navigator)) return;
+  window.addEventListener("load", function () {
+    try {
+      navigator.serviceWorker.register("/sw.js").catch(function () {});
+    } catch (e) {
+      // A browser that throws rather than rejecting. Same outcome.
+    }
+  });
+})();

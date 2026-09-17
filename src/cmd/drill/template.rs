@@ -343,6 +343,26 @@ mod tests {
         );
     }
 
+    /// A tablet with a keyboard attached reports a coarse *primary* pointer,
+    /// which is what `hover`/`pointer` describe — so the keys would be bound
+    /// and usable with the hints naming them hidden. `any-hover`/`any-pointer`
+    /// ask whether the device has such a pointer at all, which a phone still
+    /// does not.
+    #[test]
+    fn test_key_hints_show_wherever_a_keyboard_may_be_attached() {
+        let css: &str = &STYLE_CSS;
+        assert!(
+            !css.contains("@media (hover: hover) and (pointer: fine)"),
+            "the key hints are gated on the primary pointer, so a tablet \
+             with a keyboard never sees them"
+        );
+        let block = media_block("(any-hover: hover) and (any-pointer: fine)");
+        assert!(
+            block.contains(".key-hint"),
+            "the key hints are not what that query reveals: {block}"
+        );
+    }
+
     /// The block of a `@media` rule, found by the start of its query.
     fn media_block(query: &str) -> String {
         let css: &str = &STYLE_CSS;
