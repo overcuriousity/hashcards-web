@@ -821,10 +821,13 @@ body:has(.root) .theme-toggle { display: none; }
 /* The key that presses this button, on the face of it.
    A tooltip tells a mouse and nothing else, so the keys went unfound by the
    people they were for. Hidden by default and revealed only where a keyboard
-   is likely: a touch screen cannot press them and the bar has no room to
-   spare. `aria-hidden` in the markup keeps it out of the accessible name. */
+   is likely: a bare touch screen cannot press them and the bar has no room to
+   spare. The query asks after `any-` pointer rather than the primary one, so
+   a tablet with a keyboard attached — which reports a coarse primary pointer
+   and can press every key bound here — is not counted as a phone.
+   `aria-hidden` in the markup keeps it out of the accessible name. */
 .key-hint { display: none; }
-@media (hover: hover) and (pointer: fine) {
+@media (any-hover: hover) and (any-pointer: fine) {
   .key-hint {
     display: inline-block;
     min-width: 1.1em;

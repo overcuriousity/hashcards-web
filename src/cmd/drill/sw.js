@@ -122,7 +122,11 @@ self.addEventListener("fetch", function (event) {
         }
         return fetch(request).then(function (response) {
           if (response.ok) {
-            cache.put(request, response.clone());
+            // A worker may be terminated as soon as the response it is
+            // serving settles. The write is tied to the event so that it
+            // outlives this one: unawaited, it would be dropped and the
+            // asset would be missing on the load that needed it.
+            event.waitUntil(cache.put(request, response.clone()));
           }
           return response;
         });

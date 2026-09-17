@@ -934,11 +934,11 @@ mod tests {
     fn test_key_hints_are_hidden_without_a_keyboard() {
         let css: &str = &crate::cmd::drill::template::STYLE_CSS;
         assert!(
-            css.contains(".key-hint {"),
-            "the key hint has no rule of its own"
+            css.contains(".key-hint { display: none; }"),
+            "the key hint is not hidden by default"
         );
         assert!(
-            css.contains("@media (hover: hover) and (pointer: fine)"),
+            css.contains("@media (any-hover: hover) and (any-pointer: fine)"),
             "the key hints are shown on devices that cannot use them"
         );
     }

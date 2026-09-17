@@ -24,6 +24,7 @@ use maud::html;
 
 use crate::cmd::drill::template::STYLE_URL;
 use crate::cmd::drill::template::page_template;
+use crate::utils::CACHE_CONTROL_REVALIDATE;
 use crate::utils::revision;
 
 /// Where the worker is registered from, and the only path it can be served
@@ -122,22 +123,33 @@ pub async fn sw_handler() -> (StatusCode, [(HeaderName, &'static str); 2], &'sta
         StatusCode::OK,
         [
             (CONTENT_TYPE, "text/javascript"),
-            (CACHE_CONTROL, "no-cache"),
+            (CACHE_CONTROL, CACHE_CONTROL_REVALIDATE),
         ],
         SW_JS.as_str(),
     )
 }
 
-pub async fn offline_handler() -> Html<String> {
-    Html(offline_page().into_string())
+/// `Cache.addAll` fetches through the browser's own cache, and this is a
+/// fixed path. A copy retained across a build would be precached by the new
+/// worker while naming the previous build's stylesheet — which that worker
+/// does not hold, leaving the one page it exists to serve unstyled.
+pub async fn offline_handler() -> ([(HeaderName, &'static str); 1], Html<String>) {
+    (
+        [(CACHE_CONTROL, CACHE_CONTROL_REVALIDATE)],
+        Html(offline_page().into_string()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::http::header::CACHE_CONTROL;
+    use axum::response::IntoResponse;
+
     use super::OFFLINE_URL;
     use super::PRECACHE;
     use super::RUNTIME_PREFIXES;
     use super::SW_JS;
+    use super::offline_handler;
     use super::offline_page;
     use crate::cmd::drill::template::STYLE_URL;
 
@@ -226,6 +238,38 @@ mod tests {
                 "`{path}` is named in the worker; it must be left to the server"
             );
         }
+    }
+
+    /// A worker may be killed as soon as the response it is serving settles.
+    /// A `cache.put` still running then is dropped on the floor, and the
+    /// asset the user will need offline was never stored.
+    #[test]
+    fn test_runtime_cache_writes_outlive_the_response() {
+        assert!(
+            SW_JS.contains("event.waitUntil(cache.put("),
+            "a runtime cache write is not tied to the event's lifetime, so \
+             the worker may be terminated before it lands"
+        );
+    }
+
+    /// `Cache.addAll` fetches through the browser's own cache, and the
+    /// offline page is at a fixed path. A retained copy would be precached
+    /// by a new worker, and it names the *previous* build's stylesheet —
+    /// which that worker has no reason to hold.
+    #[tokio::test]
+    async fn test_offline_page_is_never_held_by_the_browser() {
+        let response = offline_handler().await.into_response();
+        let cache_control = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            cache_control, "no-cache",
+            "the offline page may be served from a browser cache, so a new \
+             worker can precache the previous build's copy"
+        );
     }
 
     /// It is shown exactly when the network is gone, so it must not need
