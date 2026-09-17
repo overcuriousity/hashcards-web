@@ -1,6 +1,9 @@
 <changelog>
     <unreleased>
-        <added>
+        </unreleased>
+    <releases>
+        <release version="0.5.4" date="2026-09-17">
+            <added>
                 <change author="claude">
             **The grade buttons name their own keys.** Space, and 1 through 4,
             have always worked; they were written down only in a tooltip,
@@ -21,8 +24,7 @@
             unaffected either way.
             </change>
             </added>
-        </unreleased>
-    <releases>
+        </release>
         <release version="0.5.3" date="2026-09-16">
             <fixed>
                 <change author="claude">
