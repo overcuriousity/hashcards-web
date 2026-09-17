@@ -7,10 +7,16 @@
             carries a Drill of its own. A topic asked for by name is drilled
             whole, whatever its schedule says -- so a topic with nothing due
             can be reviewed ahead of time, which nothing in the app could do
-            before. Sibling burying and the daily limits do not apply to it:
+            before. Sibling burying and the daily limits do not trim it:
             both exist to shape what the schedule hands out unasked, and a
-            topic pressed by name was asked for. The reviews count normally
-            and reschedule the cards as any other review would. The
+            topic pressed by name was asked for. The reviews themselves count
+            normally -- so a topic drilled ahead spends the day's allowance,
+            and may leave the scheduled queue short for the rest of the day.
+            A card whose due date had not arrived is *not* rescheduled by the
+            grade it is given: the review is recorded, and Undo works on it
+            as on any other, but looking at a card early says nothing about
+            when it will next be forgotten, and rescheduling it would push
+            its due date further out every time the button was pressed. The
             collection's **Start** button is unchanged and still drills only
             what is due.
             </change>

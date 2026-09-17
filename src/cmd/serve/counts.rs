@@ -57,6 +57,11 @@ pub struct CollectionCounts {
 /// whole topic is queued, and neither sibling burial nor the daily limits
 /// filter it — both exist to shape what the schedule hands out unasked, and
 /// nothing here was unasked.
+///
+/// The exemption is from the *filters*, not from the counters: an ahead
+/// review is an ordinary row, and the day's allowance is spent by it as by
+/// any other. A card pulled forward is also not rescheduled by the grade it
+/// is given — see `MutableState::ahead`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueScope {
     /// Cards whose due date has arrived, or which were never reviewed.
@@ -70,6 +75,32 @@ impl QueueScope {
     pub fn is_scheduled(self) -> bool {
         matches!(self, QueueScope::DueToday)
     }
+
+    /// How this scope's selection names its decks.
+    pub fn deck_match(self) -> DeckMatch {
+        match self {
+            QueueScope::DueToday => DeckMatch::Exact,
+            QueueScope::Ahead => DeckMatch::Prefix,
+        }
+    }
+}
+
+/// How the names in a selection are matched against a card's deck name.
+///
+/// Deck names are `/`-joined paths, so `grammar` and `grammar/particles` are
+/// two different decks that a prefix match cannot tell apart. A saved deck's
+/// members and the browse page's topic checkboxes are deck names picked from
+/// a list of leaves, and mean that leaf and nothing under it — matching them
+/// loosely would silently widen a deck the user built by ticking boxes. Only
+/// a topic row's own Drill button can name a parent row, which is no deck of
+/// its own but the head of a path, and only that selection matches on the
+/// prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeckMatch {
+    /// The name is a deck's own name.
+    Exact,
+    /// The name is a deck's own name, or the head of its path.
+    Prefix,
 }
 
 /// Everything a resolved collection says about which due cards actually

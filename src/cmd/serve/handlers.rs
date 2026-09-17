@@ -44,6 +44,7 @@ use crate::cmd::serve::browse::build_deck_tree;
 use crate::cmd::serve::browse::render_browse_page;
 use crate::cmd::serve::config::ResolvedCollection;
 use crate::cmd::serve::counts::Burial;
+use crate::cmd::serve::counts::DeckMatch;
 use crate::cmd::serve::counts::QueueScope;
 use crate::cmd::serve::counts::QueuePolicy;
 use crate::cmd::serve::counts::budget_for;
@@ -521,17 +522,19 @@ fn collection_start_inner(
 
 /// Whether a deck is one of the wanted ones.
 ///
-/// A selection names a deck or a folder of them: the browse page's topic
-/// checkboxes only ever name leaves, but its per-topic Drill button can name
-/// a parent row, which is no deck of its own but the head of a path. Matching
-/// on the `/`-separated prefix covers both, and a leaf can never be the
-/// prefix of another deck's path without being that folder.
-fn deck_selected(deck: &str, wanted: &[String]) -> bool {
+/// Under [`DeckMatch::Exact`] a name means that deck alone. Under
+/// [`DeckMatch::Prefix`] it may also be the head of a `/`-separated path,
+/// which is how a topic row's Drill button says "this folder's topics" —
+/// a parent row is no deck of its own. The two are kept apart because deck
+/// names are paths: `grammar` and `grammar/particles` coexist, and matching
+/// a ticked `grammar` loosely would drill and count a topic nobody ticked.
+fn deck_selected(deck: &str, wanted: &[String], matching: DeckMatch) -> bool {
     wanted.iter().any(|w| {
         deck == w
-            || deck
-                .strip_prefix(w.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
+            || (matching == DeckMatch::Prefix
+                && deck
+                    .strip_prefix(w.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
     })
 }
 
@@ -572,6 +575,10 @@ pub(super) fn create_session_from_sources(
     let mut session_dbs: Vec<SessionDb> = Vec::new();
     let mut routes: HashMap<CardHash, usize> = HashMap::new();
     let mut due_cards: Vec<Card> = Vec::new();
+    // The queued cards whose due date has not arrived: only an `Ahead` queue
+    // has any. They are graded like any other card, but grading one does not
+    // reschedule it -- see `MutableState::ahead`.
+    let mut ahead: HashSet<CardHash> = HashSet::new();
     // One budget per source, indexed as `routes` indexes them.
     let mut budgets: Vec<(DailyBudget, HashSet<CardHash>)> = Vec::new();
     // A deck draws on collections that may disagree about burying. One
@@ -625,17 +632,21 @@ pub(super) fn create_session_from_sources(
             collection
                 .cards
                 .into_iter()
-                .filter(|card| deck_selected(card.deck_name(), &spec.decks))
+                .filter(|card| deck_selected(card.deck_name(), &spec.decks, scope.deck_match()))
                 .collect()
         };
 
         // What the scope offers: the schedule's answer, or the whole
-        // selection when the user asked for it by name.
-        let queued: HashSet<CardHash> = match scope {
-            QueueScope::DueToday => collection.db.due_today(today)?,
-            QueueScope::Ahead => cards.iter().map(|c| c.hash()).collect(),
-        };
-        for card in cards.into_iter().filter(|c| queued.contains(&c.hash())) {
+        // selection when the user asked for it by name. `due` is read either
+        // way -- under `Ahead` to tell the cards that were already due from
+        // the ones being pulled forward, which are graded without being
+        // rescheduled.
+        let due: HashSet<CardHash> = collection.db.due_today(today)?;
+        let takes_everything = !scope.is_scheduled();
+        for card in cards
+            .into_iter()
+            .filter(|c| takes_everything || due.contains(&c.hash()))
+        {
             // Cards are content addressed, so the same fact written into two
             // collections has one hash. Drill it once, routed to the first
             // collection that offered it; the other collection's own copy
@@ -648,13 +659,20 @@ pub(super) fn create_session_from_sources(
             let performance = collection.db.get_card_performance(card.hash())?;
             cache.insert(card.hash(), performance)?;
             routes.insert(card.hash(), index);
+            if !due.contains(&card.hash()) {
+                ahead.insert(card.hash());
+            }
             due_cards.push(card);
         }
 
         // This collection's allowance for today. Per source, because a
         // limit is per collection: a deck spanning two collections spends
-        // each one's allowance separately.
-        budgets.push(budget_for(&collection.db, policy.limits, today)?);
+        // each one's allowance separately. Read only where it is spent: the
+        // allowance costs two queries and a full `new_cards()` set, and an
+        // ahead queue is never trimmed by it.
+        if scope.is_scheduled() {
+            budgets.push(budget_for(&collection.db, policy.limits, today)?);
+        }
         bury = bury && policy.bury_siblings;
 
         // Open this collection's session row immediately, so reviews can be
@@ -744,7 +762,7 @@ pub(super) fn create_session_from_sources(
         macros,
         session_started_at,
         answer_controls,
-        MutableState::new(dbs, cache, due_cards, rng),
+        MutableState::new(dbs, cache, due_cards, rng).queued_ahead(ahead),
     )))
 }
 
@@ -823,13 +841,14 @@ pub(super) fn deck_card_counts(
         let (budget, new_cards) = budgets.last_mut().ok_or_else(|| {
             ErrorReport::new("a budget was pushed for this source and is not there")
         })?;
-        // The same match the session builder makes. A count filtered
-        // differently from the queue is the bug that arrangement exists to
-        // prevent.
+        // The same match the session builder makes for these sources. A
+        // saved deck's members are deck names, so they are matched exactly:
+        // a count filtered differently from the queue is the bug that
+        // arrangement exists to prevent.
         for card in collection
             .cards
             .iter()
-            .filter(|c| deck_selected(c.deck_name(), &spec.decks))
+            .filter(|c| deck_selected(c.deck_name(), &spec.decks, DeckMatch::Exact))
         {
             card_total += 1;
             if due.contains(&card.hash()) && queued.insert(card.hash()) && burial.admits(card) {
@@ -1146,6 +1165,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use super::DeckMatch;
     use super::QueueScope;
     use super::SessionSourceSpec;
     use super::collection_get_inner;
@@ -1659,11 +1679,15 @@ mod tests {
     }
 
     /// An ahead-of-schedule drill is not the schedule handing cards out, so
-    /// neither of the filters that shape a scheduled queue applies to it.
+    /// neither of the filters that shape a scheduled queue *trims* it.
     /// Burying would drop the sibling deletions of a cloze note the user
     /// pointed at, and a spent daily limit would empty the session outright.
+    ///
+    /// Only the trimming is exempt. The reviews it writes are ordinary rows
+    /// and are counted by every later queue, so a topic drilled ahead does
+    /// spend the day's allowance.
     #[test]
-    fn an_ahead_drill_buries_nothing_and_spends_no_budget() -> Fallible<()> {
+    fn an_ahead_drill_is_trimmed_by_neither_burial_nor_the_limits() -> Fallible<()> {
         use crate::cmd::serve::cards::write_collection_overrides;
         use crate::cmd::serve::handlers::find_collection;
         use crate::types::limits::DailyLimits;
@@ -1714,13 +1738,36 @@ mod tests {
     #[test]
     fn a_selected_folder_covers_the_topics_under_it() {
         let wanted = vec!["grammar".to_string()];
-        assert!(super::deck_selected("grammar", &wanted));
-        assert!(super::deck_selected("grammar/particles", &wanted));
+        let m = DeckMatch::Prefix;
+        assert!(super::deck_selected("grammar", &wanted, m));
+        assert!(super::deck_selected("grammar/particles", &wanted, m));
         assert!(
-            !super::deck_selected("grammarium", &wanted),
+            !super::deck_selected("grammarium", &wanted, m),
             "a name that merely starts with the same letters is a different deck"
         );
-        assert!(!super::deck_selected("vocab", &wanted));
+        assert!(!super::deck_selected("vocab", &wanted, m));
+    }
+
+    /// Regression: a deck name is a path, and a saved deck's members are
+    /// leaves picked off the topic list. Matching them by prefix would drill
+    /// -- and count -- `grammar/particles` for a deck whose only member is
+    /// `grammar`, silently widening a selection the user made by ticking a
+    /// box. Only the Drill button's own selection may name a folder.
+    #[test]
+    fn a_ticked_topic_does_not_drag_in_the_topics_below_it() {
+        let wanted = vec!["grammar".to_string()];
+        let m = DeckMatch::Exact;
+        assert!(super::deck_selected("grammar", &wanted, m));
+        assert!(
+            !super::deck_selected("grammar/particles", &wanted, m),
+            "a ticked leaf means that leaf, not the folder of the same name"
+        );
+        assert_eq!(
+            QueueScope::DueToday.deck_match(),
+            DeckMatch::Exact,
+            "every scheduled selection is a list of leaves"
+        );
+        assert_eq!(QueueScope::Ahead.deck_match(), DeckMatch::Prefix);
     }
 
     /// Schedule every card in `rc` a month out, so nothing in it is due.

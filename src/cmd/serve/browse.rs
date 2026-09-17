@@ -285,8 +285,15 @@ pub fn render_browse_page(
                     // pressed, and each topic row now carries one. This
                     // nameless button is that first one, so Enter still means
                     // Start -- the scheduled queue -- rather than drilling
-                    // whichever topic happens to sit at the top.
-                    button.default-submit type="submit" tabindex="-1" aria-hidden="true" {}
+                    // whichever topic happens to sit at the top. Disabled
+                    // exactly when Start is: a disabled default button
+                    // submits nothing, which is what pressing Enter with
+                    // nothing due did before this row of buttons existed.
+                    button.default-submit
+                        type="submit"
+                        tabindex="-1"
+                        aria-hidden="true"
+                        disabled[total_due == 0] {}
                     div.deck-tree {
                         @for child in &tree.children {
                             (render_deck_node(child, 0, collection_name, edit_paths))
@@ -409,7 +416,11 @@ fn render_deck_node(
                     type="submit"
                     name="only"
                     value=(node.path)
-                    title=(format!("Review all {total} cards in {}, due or not", node.name))
+                    title=(format!(
+                        "Review all {total} cards in {}, due or not -- reviewing \
+                         one early does not change when it next comes back",
+                        node.name
+                    ))
                 { "Drill" }
                 @if let Some(url) = edit_url {
                     a.edit-link href=(url) { "Edit" }
@@ -639,8 +650,50 @@ mod tests {
             "the row must name its own topic: {html}"
         );
         assert!(
-            !html.contains(r#"class="btn btn-sm row-drill" type="submit" disabled"#),
-            "a topic with nothing due is exactly the one this button is for: {html}"
+            html.contains("due or not"),
+            "the button has to say it drills the whole topic: {html}"
+        );
+        assert!(
+            html.contains("does not change when it next comes back"),
+            "and that an early review leaves the schedule alone: {html}"
+        );
+    }
+
+    /// Regression: the nameless implicit-submit button is disabled exactly
+    /// when Start is. Left enabled, pressing Enter with nothing due would
+    /// post an empty selection and answer with "Select at least one topic."
+    /// -- a disabled Start used to mean Enter simply did nothing.
+    #[test]
+    fn enter_does_nothing_when_start_is_disabled() {
+        let tree = DeckNode {
+            name: String::new(),
+            path: String::new(),
+            total_cards: 0,
+            due_today: 0,
+            children: vec![DeckNode {
+                name: "quiet".to_string(),
+                path: "quiet".to_string(),
+                total_cards: 4,
+                due_today: 0,
+                children: vec![],
+            }],
+        };
+        let browse = BrowseData {
+            tree,
+            duplicates: Vec::new(),
+            coll_dir: PathBuf::new(),
+            edit_paths: HashMap::new(),
+        };
+        let html = render_browse_page("Coll", "coll", &browse, 0, 0, None).into_string();
+        let default_submit = html
+            .find("default-submit")
+            .expect("the form needs an implicit-submit button");
+        let tail = &html[default_submit..];
+        let end = tail.find('>').unwrap_or(tail.len());
+        assert!(
+            tail[..end].contains("disabled"),
+            "nothing is due, so the implicit submit must be disabled too: {}",
+            &tail[..end]
         );
     }
 
