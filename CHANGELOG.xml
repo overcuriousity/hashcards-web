@@ -1,6 +1,9 @@
 <changelog>
     <unreleased>
-        <added>
+        </unreleased>
+    <releases>
+        <release version="0.5.5" date="2026-09-17">
+            <added>
                 <change author="claude">
             **Every topic has its own Drill button.** A targeted review used
             to mean *Select none*, one tick and **Start**; a topic row now
@@ -21,8 +24,7 @@
             what is due.
             </change>
             </added>
-        </unreleased>
-    <releases>
+        </release>
         <release version="0.5.4" date="2026-09-17">
             <added>
                 <change author="claude">
