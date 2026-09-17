@@ -190,6 +190,17 @@ pub struct MutableState {
     pub card_shown_at: Option<Timestamp>,
     /// RNG for interval jitter, seeded once per session.
     pub rng: TinyRng,
+    /// The cards this session pulled forward: queued although their due date
+    /// had not arrived, because the user asked for their topic by name.
+    ///
+    /// Grading one records the review, so it shows in the history and Undo
+    /// works on it as on any other, but it leaves the card's schedule alone.
+    /// FSRS computes the next interval from the time elapsed since the last
+    /// review; a card reviewed the day it was scheduled a month out would be
+    /// rescheduled off an elapsed time of nearly zero, and pressing the same
+    /// topic's Drill twice would compound that. An early look at a card is
+    /// not evidence about when it will next be forgotten.
+    pub ahead: HashSet<CardHash>,
 }
 
 impl MutableState {
@@ -204,7 +215,20 @@ impl MutableState {
             finished_at: None,
             card_shown_at: None,
             rng,
+            ahead: HashSet::new(),
         }
+    }
+
+    /// The cards among this session's queue that are being reviewed ahead of
+    /// their due date. See [`MutableState::ahead`].
+    pub fn queued_ahead(mut self, ahead: HashSet<CardHash>) -> Self {
+        self.ahead = ahead;
+        self
+    }
+
+    /// Whether grading `hash` should leave its schedule alone.
+    pub fn is_ahead(&self, hash: CardHash) -> bool {
+        self.ahead.contains(&hash)
     }
 
     /// Record that the current card has just been served to the client.
@@ -221,11 +245,12 @@ impl MutableState {
 
     /// Re-key this session onto the cards an edit produced.
     ///
-    /// A live session holds card identity in four places: the queue (where
+    /// A live session holds card identity in five places: the queue (where
     /// the same card may appear twice, a Forgot or Hard grade having pushed
     /// it to the back while it is also in `reviews`), the undo stack, the
-    /// performance cache, and the per-card database routes. An edit renames
-    /// a hash, and it must move all four together or none.
+    /// performance cache, the per-card database routes, and the set of
+    /// cards being reviewed ahead of schedule. An edit renames a hash, and
+    /// it must move all five together or none.
     ///
     /// Deliberately infallible. It runs after the database transaction has
     /// committed and the file is on disk, so there is nothing left to roll
@@ -298,6 +323,16 @@ impl MutableState {
             self.cache.remove(*hash);
         }
         self.dbs.rekey_routes(&rename_hashes, &removed);
+
+        // And the pulled-forward set, which is card identity in a fifth
+        // place: an edited card that keeps its slot in the queue must keep
+        // its exemption from rescheduling too.
+        self.ahead = self
+            .ahead
+            .drain()
+            .filter(|hash| !removed.contains(hash))
+            .map(|hash| rename_hashes.get(&hash).copied().unwrap_or(hash))
+            .collect();
 
         // The rendered page carries the head card's answer. If the head is
         // the same card under a new hash, the reveal still describes what is

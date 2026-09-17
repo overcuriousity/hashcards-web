@@ -219,13 +219,20 @@ pub fn handle_action(
             };
             let prev_performance: Performance = mutable.cache.get(hash)?;
             let scheduling = mutable.dbs.scheduling_for(hash);
-            let performance: ReviewedPerformance = update_performance(
-                prev_performance,
-                grade,
-                reviewed_at,
-                scheduling,
-                &mut mutable.rng,
-            );
+            // A card pulled forward keeps the schedule it already had: the
+            // review is written, and the row carries the unchanged figures,
+            // so the history says the card was looked at without claiming
+            // the look moved its due date.
+            let performance: ReviewedPerformance = match ahead_performance(mutable, hash) {
+                Some(unchanged) => unchanged,
+                None => update_performance(
+                    prev_performance,
+                    grade,
+                    reviewed_at,
+                    scheduling,
+                    &mut mutable.rng,
+                ),
+            };
             let record = ReviewRecord {
                 card_hash: hash,
                 reviewed_at,
@@ -274,6 +281,22 @@ pub fn handle_action(
     }
 }
 
+/// The performance to write for a card being reviewed ahead of its due
+/// date: the one it already has, unchanged.
+///
+/// `None` for every ordinary review, and for a card that has somehow never
+/// been reviewed — a card with no schedule cannot be ahead of it, and one
+/// queued this way would otherwise be left permanently new.
+fn ahead_performance(mutable: &MutableState, hash: CardHash) -> Option<ReviewedPerformance> {
+    if !mutable.is_ahead(hash) {
+        return None;
+    }
+    match mutable.cache.get(hash).ok()? {
+        Performance::Reviewed(performance) => Some(performance),
+        Performance::New => None,
+    }
+}
+
 fn finish_session(mutable: &mut MutableState) -> Fallible<()> {
     log::debug!("Session completed");
     let session_ended_at = Timestamp::now();
@@ -289,6 +312,7 @@ mod tests {
     use crate::cmd::drill::state::MutableState;
     use crate::cmd::drill::state::SessionDbs;
     use crate::db::Database;
+    use std::collections::HashSet;
     use crate::rng::TinyRng;
     use crate::types::card::CardContent;
     use crate::types::performance::Jitter;
@@ -317,6 +341,7 @@ mod tests {
             finished_at: None,
             card_shown_at: None,
             rng: TinyRng::from_seed(0),
+            ahead: HashSet::new(),
         }
     }
 
@@ -355,7 +380,91 @@ mod tests {
             finished_at: None,
             card_shown_at: None,
             rng: TinyRng::from_seed(1),
+            ahead: HashSet::new(),
         }
+    }
+
+    /// Regression: a card pulled forward by a topic's Drill button keeps the
+    /// schedule it already had. FSRS derives the next interval from the time
+    /// elapsed since the last review, so rescheduling a card looked at the
+    /// day it was filed a month out would recompute it off an elapsed time of
+    /// nearly zero and push its due date further out -- and pressing the same
+    /// topic's Drill again would push it again.
+    #[test]
+    fn grading_a_card_pulled_forward_leaves_its_schedule_alone() -> Fallible<()> {
+        use crate::types::performance::ReviewedPerformance;
+
+        let card = make_card("pulled forward");
+        let mut mutable = make_state_with_cards(vec![card.clone()]);
+        // A card reviewed three weeks ago and filed a month out, so ten
+        // days of its interval are still to run: exactly the card a topic's
+        // Drill button pulls forward.
+        let scheduled = ReviewedPerformance {
+            last_reviewed_at: Timestamp::now().minus_minutes(21 * 24 * 60),
+            stability: 30.0,
+            difficulty: 5.0,
+            interval_raw: 30.0,
+            interval_days: 30,
+            due_date: Timestamp::now().date().add_days(10)?,
+            review_count: 4,
+        };
+        let before = Performance::Reviewed(scheduled);
+        mutable.cache.update(card.hash(), before)?;
+        {
+            let entry = mutable.dbs.for_card(card.hash());
+            entry.db.update_card_performance(card.hash(), before)?;
+        }
+        mutable.ahead.insert(card.hash());
+
+        handle_action(&mut mutable, Action::Reveal, None, None)?;
+        handle_action(&mut mutable, Action::Good, None, None)?;
+
+        let after = mutable
+            .dbs
+            .for_card(card.hash())
+            .db
+            .get_card_performance(card.hash())?;
+        match after {
+            Performance::Reviewed(after) => {
+                assert_eq!(
+                    after.due_date, scheduled.due_date,
+                    "an early look must not move the due date"
+                );
+                assert_eq!(
+                    after.stability, scheduled.stability,
+                    "nor recompute the stability off an interval it did not serve"
+                );
+                assert_eq!(
+                    after.review_count, scheduled.review_count,
+                    "the card has not come round again: its review count stands"
+                );
+            }
+            Performance::New => return crate::error::fail("the card lost its schedule"),
+        }
+        // The review itself is written: it happened, it shows in the
+        // history, and Undo works on it as on any other.
+        assert_eq!(mutable.reviews.len(), 1, "the review is still recorded");
+        Ok(())
+    }
+
+    /// The same grade on a card that really is due schedules it as always.
+    /// The exemption is for the pulled-forward set and nothing else.
+    #[test]
+    fn grading_a_due_card_still_reschedules_it() -> Fallible<()> {
+        let card = make_card("ordinarily due");
+        let mut mutable = make_state_with_cards(vec![card.clone()]);
+        handle_action(&mut mutable, Action::Reveal, None, None)?;
+        handle_action(&mut mutable, Action::Good, None, None)?;
+        let after = mutable
+            .dbs
+            .for_card(card.hash())
+            .db
+            .get_card_performance(card.hash())?;
+        assert!(
+            matches!(after, Performance::Reviewed(_)),
+            "a due card is scheduled by the grade it was given"
+        );
+        Ok(())
     }
 
     #[test]
@@ -451,6 +560,7 @@ mod tests {
             finished_at: None,
             card_shown_at: Some(Timestamp::now()),
             rng: TinyRng::from_seed(1),
+            ahead: HashSet::new(),
         };
         let result = handle_action(&mut mutable, Action::Good, None, None);
         assert!(result.is_err(), "the injected DB failure must propagate");
@@ -616,6 +726,7 @@ mod tests {
             finished_at: None,
             card_shown_at: None,
             rng: TinyRng::from_seed(1),
+            ahead: HashSet::new(),
         };
         // Grade the only card: the session finishes and the DB row is closed.
         handle_action(&mut mutable, Action::Reveal, None, None).unwrap();

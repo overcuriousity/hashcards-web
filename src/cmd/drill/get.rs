@@ -506,6 +506,7 @@ mod tests {
             finished_at: Some(Timestamp::now()),
             card_shown_at: None,
             rng: TinyRng::from_seed(1),
+            ahead: HashSet::new(),
         };
         let ctx = RenderContext {
             directory: Path::new("."),
